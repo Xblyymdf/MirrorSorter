@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>洞鉴虚明 · 选择界面版本</title>
+<style>
+  :root{--accent:#fb7299;--bg:#0b0d10;--panel:#14171c;--line:#262c34;--fg:#e8eaed;--fg2:#98a2ae}
+  *{box-sizing:border-box}
+  body{margin:0;min-height:100vh;background:var(--bg);color:var(--fg);display:flex;
+    align-items:center;justify-content:center;padding:24px;
+    font:14px/1.6 -apple-system,"Segoe UI","Noto Sans CJK SC","Microsoft YaHei",sans-serif}
+  .box{max-width:720px;width:100%}
+  h1{font-size:19px;margin:0 0 6px;display:flex;align-items:center;gap:8px}
+  h1 span{color:var(--accent)}
+  p.tip{color:var(--fg2);font-size:13px;margin:0 0 18px}
+  .cards{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+  @media (max-width:600px){.cards{grid-template-columns:1fr}}
+  a.card{display:block;text-decoration:none;color:inherit;background:var(--panel);border:1px solid var(--line);
+    border-radius:14px;padding:16px 18px;transition:border-color .15s,transform .15s}
+  a.card:hover{border-color:var(--accent);transform:translateY(-2px)}
+  a.card b{display:block;font-size:15px;margin-bottom:6px}
+  a.card small{color:var(--fg2);font-size:12px;line-height:1.6;display:block}
+  .tag{display:inline-block;font-size:11px;border:1px solid var(--line);border-radius:5px;padding:0 6px;
+    color:var(--fg2);margin-left:6px;vertical-align:middle}
+  .tag.new{border-color:var(--accent);color:var(--accent)}
+</style>
+</head>
+<body>
+<div class="box">
+  <h1><span>洞鉴虚明</span> 界面版本</h1>
+  <p class="tip">两个界面共用同一个后端（同一份 data.db、同一套 /api/*）。可以各开一个标签页并排对比；
+     在一边做的操作（喜欢/屏蔽/设置/登录），另一边刷新后同样生效。</p>
+  <div class="cards">
+    <a class="card" href="/">
+      <b>旧版界面<span class="tag">原来的</span></b>
+      <small>单页三栏 + 中部大面板，标签页在浏览器里。
+        保留了原来的全部功能（悬浮球在 Windows 才有）。</small>
+    </a>
+    <a class="card" href="/new">
+      <b>新版界面<span class="tag new">重排后</span></b>
+      <small>按你摆的布局重排：顶栏常驻 · 左栏配置（可收起）· 中区信息流 · 右栏 AI 聊天（可收起）。
+        设置项已与旧版对齐，含快速文本分析、弹幕屏蔽、B站增强、单价估算。</small>
+    </a>
+  </div>
+</div>
+</body>
+</html>
