@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-洞鉴虚明 · 基础版 (v0.4.3dsk)
+洞鉴虚明 · 基础版 (v0.4.5dsk)
 ==========================
 本地运行的洞鉴虚明：读取 B站 内容 → 黑白名单/AI 分拣 → 推荐流 + 数据源状态 + AI 聊天。
 
@@ -65,7 +65,7 @@ if _PORT_ENV:
         PORTS = (int(_PORT_ENV),)
     except Exception:
         pass
-APP_VER = "v0.4.3dsk"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
+APP_VER = "v0.4.5dsk"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
 # 本机回环请求必须绕过系统代理: 用户开着 Clash/V2Ray/公司代理时, 环境里的 http_proxy 会把
 # 127.0.0.1 的请求转给代理服务器, 轻则 502, 重则心跳连续失败 -> 悬浮球探活 2 轮不过自我了断,
 # 表现为「球莫名消失/点定位没反应」。这里建一个禁用代理的 opener 专供本地调用; 外网 API 仍走
@@ -188,9 +188,15 @@ UPDATE_DIR = os.path.join(DATA_DIR, "update")
 _UPDATE_LOCK = threading.Lock()
 _UPDATE_LAST = {"info": None, "ts": 0.0}
 _UPDATE_STATE = {"phase": "idle", "received": 0, "total": 0, "path": "", "error": "",
-                 "version": "", "notes": ""}
+                 "version": "", "notes": "", "source": ""}
 _UPDATE_ALLOW_HOSTS = ("github.com", "objects.githubusercontent.com",
                        "github-releases.githubusercontent.com")
+# 国内直连 release-assets.githubusercontent.com 实测只有 30~40KB/s；公共镜像能到 MB/s。
+# 只有拿到官方 SHA256 才允许走镜像，下载完必须逐字节校验一致。
+_UPDATE_MIRRORS = ("https://ghfast.top/", "https://gh-proxy.com/")
+_UPDATE_CHUNK = 256 * 1024
+_UPDATE_SOCK_TIMEOUT = 20
+_UPDATE_ROUNDS = 2
 
 
 def _update_ver(v):
@@ -293,8 +299,123 @@ def update_progress():
     return st
 
 
+class _UpdateCorrupt(Exception):
+    pass
+
+
+def _update_sources(info):
+    """镜像优先、官方兜底；没有官方 SHA256 时只走官方地址。"""
+    url = str(info.get("url") or "")
+    sha = str(info.get("sha256") or "").strip()
+    srcs = []
+    if sha and _update_url_ok(url):
+        srcs = [m + url for m in _UPDATE_MIRRORS]
+    if url and url not in srcs:
+        srcs.append(url)
+    return srcs
+
+
+def _update_stream(src, part, got, total):
+    """把 src 的字节续写到 part，返回 (已下载, 总量)。服务器忽略 Range 时从头重下。"""
+    headers = {"User-Agent": "MirrorSorter/%s" % APP_VER}
+    if got:
+        headers["Range"] = "bytes=%d-" % got
+    req = urllib.request.Request(src, headers=headers)
+    with urllib.request.urlopen(req, timeout=_UPDATE_SOCK_TIMEOUT) as r:
+        status = int(getattr(r, "status", 0) or r.getcode() or 0)
+        if got and status != 206:
+            got = 0
+        if status == 206:
+            m = re.match(r"bytes\s+(\d+)-", str(r.headers.get("Content-Range") or ""))
+            if m and int(m.group(1)) != got:
+                raise ValueError("续传起点不一致")
+        clen = int(r.headers.get("Content-Length") or 0)
+        if clen:
+            total = max(total, got + clen)
+        with _UPDATE_LOCK:
+            _UPDATE_STATE.update({"total": total, "received": got,
+                                  "source": urllib.parse.urlparse(src).hostname or ""})
+        with open(part, "ab" if got else "wb") as f:
+            while True:
+                chunk = r.read(_UPDATE_CHUNK)
+                if not chunk:
+                    break
+                f.write(chunk)
+                got += len(chunk)
+                with _UPDATE_LOCK:
+                    _UPDATE_STATE["received"] = got
+    if not total:
+        total = got
+    return got, total
+
+
+def _update_download_worker(info):
+    part = ""
+    try:
+        os.makedirs(UPDATE_DIR, exist_ok=True)
+        safe = re.sub(r"[^0-9A-Za-z._-]", "", str(info.get("latest") or "latest")) or "latest"
+        final = os.path.join(UPDATE_DIR, "洞鉴虚明%s.exe" % safe)
+        part = final + ".download"
+        total = int(info.get("size") or 0)
+        got = os.path.getsize(part) if os.path.isfile(part) else 0
+        if total and got > total:
+            os.remove(part)
+            got = 0
+        with _UPDATE_LOCK:
+            _UPDATE_STATE["received"] = got
+        sources = _update_sources(info)
+        last_err = ""
+        if not total or got < total:
+            for _round in range(_UPDATE_ROUNDS):
+                if total and got >= total:
+                    break
+                for src in sources:
+                    try:
+                        got, total = _update_stream(src, part, got, total)
+                    except Exception as e:
+                        host = urllib.parse.urlparse(src).hostname or src
+                        last_err = "%s: %s" % (host, str(e)[:80])
+                        try:
+                            got = os.path.getsize(part)
+                        except OSError:
+                            got = 0
+                        continue
+                    if not total or got >= total:
+                        break
+                    last_err = "下载未完成（%d/%d 字节）" % (got, total)
+                if total and got >= total:
+                    break
+        if total and got < total:
+            raise ValueError(last_err or "下载未完成")
+        if got < 5 * 1024 * 1024:
+            raise _UpdateCorrupt("下载文件太小，可能不是完整的 exe")
+        with open(part, "rb") as f:
+            if f.read(2) != b"MZ":
+                raise _UpdateCorrupt("下载的文件不是 Windows exe")
+            f.seek(0)
+            h = hashlib.sha256()
+            for b in iter(lambda: f.read(1 << 20), b""):
+                h.update(b)
+        want = str(info.get("sha256") or "").lower()
+        if want and h.hexdigest().lower() != want:
+            raise _UpdateCorrupt("文件校验失败（SHA256 不一致）")
+        os.replace(part, final)
+        with _UPDATE_LOCK:
+            _UPDATE_STATE.update({"phase": "ready", "path": final,
+                                  "received": got, "total": got})
+    except Exception as e:
+        if part and isinstance(e, _UpdateCorrupt) and os.path.exists(part):
+            try:
+                os.remove(part)
+            except OSError:
+                pass
+        with _UPDATE_LOCK:
+            _UPDATE_STATE.update({"phase": "error", "error": str(e)[:200]})
+
+
 def update_download():
-    """后台下载最近一次检查到的 Release exe；页面轮询 progress 看进度。"""
+    """后台下载最近一次检查到的 Release exe；页面轮询 progress 看进度。
+    镜像 + 官方多源，Range 续传：关掉程序后再点更新会从已下载的位置接着下。"""
     if not (os.name == "nt" and getattr(sys, "frozen", False)):
         return {"ok": False, "error": "自动更新只在 Windows 桌面版 exe 里可用。"}
     with _UPDATE_LOCK:
@@ -307,54 +428,10 @@ def update_download():
             return {"ok": False, "error": "更新地址不是 GitHub 官方地址，已拒绝。"}
         _UPDATE_STATE.update({"phase": "downloading", "received": 0,
                               "total": int(info.get("size") or 0), "path": "",
-                              "error": "", "version": info.get("latest") or ""})
-
-    def _worker():
-        part = ""
-        try:
-            os.makedirs(UPDATE_DIR, exist_ok=True)
-            safe = re.sub(r"[^0-9A-Za-z._-]", "", str(info.get("latest") or "latest")) or "latest"
-            final = os.path.join(UPDATE_DIR, "洞鉴虚明%s.exe" % safe)
-            part = final + ".download"
-            req = urllib.request.Request(info["url"], headers={
-                "User-Agent": "MirrorSorter/%s" % APP_VER})
-            h = hashlib.sha256()
-            got = 0
-            with urllib.request.urlopen(req, timeout=40) as r, open(part, "wb") as f:
-                total = int(r.headers.get("Content-Length") or 0) or int(info.get("size") or 0)
-                with _UPDATE_LOCK:
-                    _UPDATE_STATE["total"] = total
-                while True:
-                    chunk = r.read(1 << 20)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    h.update(chunk)
-                    got += len(chunk)
-                    with _UPDATE_LOCK:
-                        _UPDATE_STATE["received"] = got
-            if got < 5 * 1024 * 1024:
-                raise ValueError("下载文件太小，可能不是完整的 exe")
-            with open(part, "rb") as f:
-                if f.read(2) != b"MZ":
-                    raise ValueError("下载的文件不是 Windows exe")
-            want = str(info.get("sha256") or "").lower()
-            if want and h.hexdigest().lower() != want:
-                raise ValueError("文件校验失败（SHA256 不一致）")
-            os.replace(part, final)
-            with _UPDATE_LOCK:
-                _UPDATE_STATE.update({"phase": "ready", "path": final,
-                                      "received": got, "total": got})
-        except Exception as e:
-            try:
-                if part and os.path.exists(part):
-                    os.remove(part)
-            except OSError:
-                pass
-            with _UPDATE_LOCK:
-                _UPDATE_STATE.update({"phase": "error", "error": str(e)[:200]})
-
-    threading.Thread(target=_worker, name="update-download", daemon=True).start()
+                              "error": "", "version": info.get("latest") or "",
+                              "source": ""})
+    threading.Thread(target=_update_download_worker, args=(info,),
+                     name="update-download", daemon=True).start()
     return {"ok": True}
 
 

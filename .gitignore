@@ -124,3 +124,10 @@ desktop/_vis/fasttext_demo/*.json
 !desktop/_verify_searchbtn_v043.js
 !desktop/_verify_layout_v043.py
 !desktop/_verify_exe_v043.py
+
+# v0.4.4dsk: 更新器镜像/续传单测与反解校验
+!desktop/_test_update_v044.py
+!desktop/_verify_exe_v044.py
+
+# v0.4.5dsk: 版本号同步 + 反解校验
+!desktop/_verify_exe_v045.py
