@@ -7,6 +7,8 @@ desktop/rules-tmp/
 desktop/shell-tmp/
 
 # ===== 构建产物 =====
+# 约定: 所有构建产物与探针临时件都集中在 desktop/build/ 下(dist/pybuild/spec/logs/probe),
+# 用 desktop/清理构建.bat 一键删干净。下面的 desktop/dist/ 等是旧布局, 保留兼容。
 desktop/build/
 desktop/dist/
 releases/
@@ -108,3 +110,8 @@ desktop/_vis/fasttext_demo/*.json
 # 版本无关(从 exe 文件名反推), 每版都能跑; 里面"打包内 userscript 与源码字节一致"
 # 这条对**任何**改过 extensions/ 的版本都成立, 是通用回归。
 !desktop/_verify_dmft_gate.py
+
+# v0.4.1dsk: 自动更新的回归资产(后端 78 项 + 前端 20 项)与打包反解校验。
+!desktop/_test_update_v041.py
+!desktop/_test_update_ui_v041.js
+!desktop/_verify_exe_v041.py

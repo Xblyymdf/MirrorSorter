@@ -13,7 +13,7 @@ import time
 import urllib.request
 
 PROJECT = os.path.dirname(os.path.abspath(__file__))
-TMP = os.path.join(PROJECT, "shell-tmp")
+TMP = os.path.join(PROJECT, "build", "probe", "shell-tmp")
 os.makedirs(TMP, exist_ok=True)
 
 PASS = FAIL = 0
@@ -43,7 +43,7 @@ def load(name, fname):
 app = load("app_shell_test", "app.py")
 check("app.run_server 可复用", callable(getattr(app, "run_server", None)))
 check("app.shutdown 统一收尾", callable(getattr(app, "shutdown", None)))
-check("app.APP_VER 版本常量(形如 v0.3.1.Ndsk)", bool(re.fullmatch(r"v\d+\.\d+\.\d+\.\d+dsk", app.APP_VER)),
+check("app.APP_VER 版本常量(形如 v0.4.0dsk / v0.3.1.Ndsk)", bool(re.fullmatch(r"v\d+\.\d+\.\d+(\.\d+)?dsk", app.APP_VER)),
       app.APP_VER)
 
 # ---------- 2. app_window 标签页管理与降级探测 ----------
@@ -272,11 +272,33 @@ check("补呈现: 校验是否真出图, 出图即收工; 还黑就继续补(不
       "def _represent(" in _sp_src
       and '_frame_flat(hb.get("h")) is False' in _sp_src
       and "represent TIMEOUT" in _sp_src)
-check("补呈现手段逐级加重(隐藏→显示→置顶 / 强制重绘 / 摘挂父容器)",
+check("补呈现手段最多两级(隐藏→显示→置顶 / 强制重绘) —— 摘挂父容器已废除",
+      # 用户报修: 播放视频点全屏 → 画布整块没视频、界面像卡死。
+      # 根因之一就是第 3 级 par.Controls.Remove/Add: reparent 会让 WebView2 的合成器停摆,
+      # 画面再也回不来。WebView2 不是普通 WinForms 控件, 不许用这招"逼排版"。
       "def _rep_level(i)" in _sp_src
-      and "return 1 if i < 2 else (2 if i < 4 else 3)" in _sp_src
+      and "return 1 if i < 2 else 2" in _sp_src
       and "cc.Visible = False" in _sp_src and "cc.Invalidate(True)" in _sp_src
-      and "par.Controls.Remove(cc)" in _sp_src)
+      and "par.Controls.Remove(cc)" not in _sp_src)
+check("全屏补呈现: 默认硬补一次、关掉 GDI 校验、留 MSX_FS_SOFT 逃生口",
+      "def _rep_tap(ui, ctrls, cc, key, hwnd_box, level, gentle=False)" in _sp_src
+      and "if not gentle:" in _sp_src
+      and 'key, "fullscreen", gentle=_fs_soft(),' in _sp_src
+      and "verify=False, taps=(0.4,)" in _sp_src
+      and "def _fs_soft()" in _sp_src and "MSX_FS_SOFT" in _sp_src
+      and "if not verify:" in _sp_src)
+# 用户报修(白屏第二轮): 主窗口被误判成悬浮窗 → 不最大化、不 Dock=Fill, 全屏只能靠页面自己铺满。
+# 根因是 `host is not box["form"]` —— pywebview 的 native 每次访问可能返回新包装对象。
+check("全屏: 主窗口/悬浮窗按 HWND 判(不能用 is, 否则主窗口被当成悬浮窗)",
+      "def _same_form(self, a, b)" in _sp_src
+      and 'is_float = not self._same_form(host, box.get("form"))' in _sp_src
+      and "is not box.get(\"form\")" not in _sp_src)
+check("全屏: 悬浮窗分支不用 WF.Point(Point 在 System.Drawing, 否则一进来就 AttributeError)",
+      "WF.Point(" not in _sp_src
+      and "from System.Drawing import Point as _Pt" in _sp_src)
+check("全屏: 进出都留诊断日志(fs enter / enter done / enter FAILED / exit)",
+      "fs enter key=" in _sp_src and "fs enter done key=" in _sp_src
+      and "fs enter FAILED key=" in _sp_src and "fs exit key=" in _sp_src)
 check("补呈现可取消(控件隐藏/换掉/销毁时停掉看门狗, 否则会被 toggle 出来)",
       "def _rep_cancel(cc)" in _sp_src and "_rep_cancel(c)" in _sp_src
       and "_rep_cancel(_Pool.ctrls.get(key))" in _sp_src)
@@ -432,6 +454,14 @@ check("index.html 无 target=_blank", 'target="_blank"' not in io.open(
     os.path.join(PROJECT, "web", "index.html"), encoding="utf-8").read())
 html = io.open(os.path.join(PROJECT, "web", "index.html"), encoding="utf-8").read()
 check("页脚版本与 app.APP_VER 一致", ("洞鉴虚明 " + app.APP_VER) in html, app.APP_VER)
+# ★ v0.4.0dsk: 右栏(AI 聊天)在屏幕右侧, 它的变宽方向和鼠标位移相反 ——
+#   往左拖要变宽、往右拖要变窄。原来两栏共用 w0+dx, 右栏就是反的。
+_split = js[js.find('const sp = e.target.closest(".splitter")'):
+           js.find('$("#toggleLeft").onclick')]
+check("分栏拖动: 右栏位移取反(左拖变宽/右拖变窄)",
+      'const sign = which === "left" ? 1 : -1;' in _split
+      and "w0 + sign * (ev.clientX - x0)" in _split
+      and "w0 + (ev.clientX - x0)" not in _split, "splitter drag")
 check("设置页: 字体大小三档(默认小)", 'id="fontRow"' in html and html.count("data-font=") == 3
       and 'data-font="small"' in html)
 check("设置页: 背景预设/自定义/深度滑条在强调色设置下方",
@@ -538,6 +568,13 @@ check("bug6 网页全屏隐藏标签栏/导航栏(网页事件→控件池→窗
       and "update.set_fullscreen = set_fullscreen" in _nb_src
       and "on_fs=on_fs" in _aw_src and 'chrome["nav"]' in _aw_src)
 
+# 全屏卡死(用户报修): 播放器常常连发好几次全屏状态事件, 每次都重排窗口/控件 → 抖动成"卡死"
+check("全屏事件按标签去重(同状态重复事件直接丢, 否则反复最大化/还原)",
+      "_fs_last = {}" in _sp_src
+      and "last = _Pool._fs_last.get(tab_key)" in _sp_src
+      and "if last is on:" in _sp_src
+      and "_Pool._fs_last[tab_key] = on" in _sp_src)
+
 # bug7 地址栏文字纯白/纯黑太刺眼 → 未悬停时 70% 不透明度
 check("bug7 地址栏文字未悬停时 70% 不透明度(悬停/编辑回满)",
       '"tb_hover": False' in _nb_src
@@ -619,7 +656,8 @@ check("视觉4 弹幕列表默认折叠(打开播放页即收起, 用户 m03496)
       and "▸" in _ownui_c)
 
 check("视觉5 悬浮窗内点全屏只铺满悬浮窗(不动宿主窗口状态, 用户 m03496)",
-      'is_float = host is not box.get("form")' in _sp_src
+      # is_float 的判定方式已改成按 HWND 比较(见上一条), 这里只看分支逻辑还在不在
+      'is_float = not self._same_form(host, box.get("form"))' in _sp_src
       and "if is_float:" in _sp_src
       and 'getattr(WF.DockStyle, "None")' in _sp_src
       and "c.Size = host.ClientSize" in _sp_src
@@ -778,8 +816,10 @@ check("文本分析7 设置页: 独立页签 + 独立总开关 + 三通道 + 标
 check("文本分析8 训练/评测脚本随源码留在 _vis(可复现), 但**不进**打包 datas",
       os.path.isfile(os.path.join(PROJECT, "_vis", "fasttext_demo", "build_corpus.py"))
       and os.path.isfile(os.path.join(PROJECT, "_vis", "fasttext_demo", "train_big.py"))
-      and "_vis" not in io.open(os.path.join(PROJECT, "洞鉴虚明%s.spec" % app.APP_VER),
-                                encoding="utf-8").read())
+      # spec 现在由 PyInstaller 生成到 build/spec（「清理构建.bat」会整目录删掉），
+      # 不适合再当断言目标；直接看构建脚本 —— 它列出的就是全部 --add-data，里面不能有 _vis
+      and "_vis" not in io.open(os.path.join(PROJECT, "构建exe.bat"),
+                                encoding="gbk").read())
 
 # ---------- 3b-2. 弹幕侧 fastText 与「弹幕屏蔽总开关」解耦(v0.3.1.46dsk) ----------
 # 背景(2026-10-10 实测): 用户实际配置 m_dm_on=0 + ft_on=1 + ft_dm=1, 期望"总开关关着、
@@ -913,7 +953,8 @@ check("止损14 三个账号级规则全关时后端直接返回(不逆推、不
 gbk = lambda f: io.open(os.path.join(PROJECT, f), encoding="gbk").read()  # noqa: E731
 check("启动.bat 走窗口壳", "app_window.py" in gbk("启动.bat"))
 check("服务模式 bat 保留旧路径", "app.py --auto-open" in gbk("启动-服务模式.bat"))
-check("构建exe.bat 打包窗口壳", bool(re.search(r"--name %APPNAME% app_window\.py", gbk("构建exe.bat"))))
+check("构建exe.bat 打包窗口壳",
+      '--name "%APPNAME%" "%ROOT%\\app_window.py"' in gbk("构建exe.bat"))
 
 # ---------- 5. --server 子进程探活(起真实服务, 不开窗口不开浏览器) ----------
 ports = app.PORTS
@@ -946,6 +987,14 @@ check("NSIS脚本: 卸载器与添加/删除程序登记",
       "WriteUninstaller" in _nsi and "CurrentVersion\\Uninstall\\${UNKEY}" in _nsi)
 check("NSIS脚本: 数据目录策略(卸载不删用户数据)",
       not re.search(r'RMDir[^\n]*LocalLow', _nsi) and 'RMDir /r "$INSTDIR"' in _nsi)
+# 实测踩过: 注释以反斜杠结尾 → NSIS 当续行符, 把下一行的 InstallDir 整条吃掉,
+# 安装目录静默掉回默认值(Program Files (x86))。makensis 只给一条 "6050" 警告, 极易漏。
+_bad_comments = [ln for ln in _nsi.splitlines()
+                 if ";" in ln and ln.split(";", 1)[1].rstrip().endswith("\\")]
+check("NSIS脚本: 注释不以反斜杠结尾(否则吃掉下一行指令)",
+      not _bad_comments, _bad_comments[:2])
+check("NSIS脚本: 有明确的 64 位安装目录",
+      'InstallDir "$PROGRAMFILES64\\${APPNAME}"' in _nsi)
 
 # ★ v0.3.1.46dsk: 构建安装包.bat 曾依赖 installer-app.spec, 而 .gitignore 第 80 行把
 #   desktop/*.spec 当"每次构建自动生成"的产物忽略掉 —— 那个 spec **从来不在库里**,
@@ -960,7 +1009,16 @@ _bat_pkg_cmds = [ln.strip() for ln in _bat_pkg.splitlines()
 
 
 def _adddata(s):
-    return set(re.findall(r'--add-data "([^"]+)"', s))
+    """把 --add-data 归一成 "载荷名;目标目录"。
+
+    两个构建脚本现在都传绝对路径（%ROOT%\\web;web），直接比字符串会永远不相等，
+    而这条断言真正要防的是"两条路径打进去的载荷不一致"。
+    """
+    out = set()
+    for spec in re.findall(r'--add-data "([^"]+)"', s):
+        src, _, dst = spec.replace("\\", "/").rpartition(";")
+        out.add((src.rsplit("/", 1)[-1] + ";" + dst))
+    return out
 
 
 check("安装包构建1 命令行不许依赖 .spec(它被 .gitignore 忽略, 换机器/清理后就没有)",
@@ -968,10 +1026,12 @@ check("安装包构建1 命令行不许依赖 .spec(它被 .gitignore 忽略, �
       and "--onedir" in _bat_pkg and "--onefile" not in _bat_pkg)
 
 check("安装包构建2 不能裸用 python(机器上的 python 可能解析到没装 PyInstaller 的那个)",
-      'set "PYCMD="' in _bat_pkg and "C:\\Python314\\python.exe" in _bat_pkg
+      # 路径分隔符两种写法都行（cmd 认 / ，脚本里用的是 C:/Python314/...）
+      'set "PYCMD="' in _bat_pkg
+      and ("C:\\Python314\\python.exe" in _bat_pkg or "C:/Python314/python.exe" in _bat_pkg)
       and "where py >nul 2>nul" in _bat_pkg
       # 版本号那步也要走同一个解释器, 否则又会踩到裸 python
-      and "%PYCMD% -c \"import re,io;t=io.open(r'web/index.html'" in _bat_pkg)
+      and '%PYCMD% -c "import re,io;' in _bat_pkg)
 
 check("安装包构建3 PyInstaller 先查再用(已装就别硬联网升级 —— 断网时也能构建)",
       '%PYCMD% -c "import PyInstaller" >nul 2>nul' in _bat_pkg
@@ -990,12 +1050,17 @@ check("安装包构建4 两条打包路径参数必须等价(不同步会产出�
       and "--onedir" in _bat_pkg and "--onefile" in _bat_exe)
 
 import glob
-_exes = [p for p in glob.glob(os.path.join(PROJECT, "dist", "*.exe")) if os.path.isfile(p)]
+# v0.3.1.66dsk 起构建产物统一进 desktop/build/dist/(可整目录删除)。
+# 这里两处都看: 老路径 dist/ 兼容历史检出, 新路径 build/dist/ 才是现在的产物位置
+# —— 只看 dist/ 会让这两条检查永远 SKIP, 等于没检查。
+_exes = []
+for _d in (os.path.join(PROJECT, "build", "dist"), os.path.join(PROJECT, "dist")):
+    _exes += [p for p in glob.glob(os.path.join(_d, "*.exe")) if os.path.isfile(p)]
 _pkgs = [p for p in _exes if "安装包" in os.path.basename(p)]
-# dist/ 是构建产物(已 gitignore)。全新检出/清理后尚未打包时不该判 FAIL ——
+# build/dist/ 是构建产物(已 gitignore)。全新检出/清理后尚未打包时不该判 FAIL ——
 # 这些检查的语义是"打好的包是对的", 不是"必须已经打过包"。
 if not _exes:
-    print("SKIP  打包产物已构建  (dist/ 未构建: 清理后未重新打包, 属预期)")
+    print("SKIP  打包产物已构建  (build/dist 未构建: 清理后未重新打包, 属预期)")
 else:
     check("打包产物已构建(PyInstaller onefile exe)",
           os.path.getsize(_exes[-1]) > 20 * 1024 * 1024, _exes[-1])

@@ -10,7 +10,7 @@ import time
 import atexit
 import shutil
 PROJECT = os.path.dirname(os.path.abspath(__file__))
-TMP = os.path.join(PROJECT, "test-tmp")
+TMP = os.path.join(PROJECT, "build", "probe", "test-tmp")
 if os.path.isdir(TMP):
     shutil.rmtree(TMP, ignore_errors=True)
 os.makedirs(TMP, exist_ok=True)

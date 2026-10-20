@@ -25,6 +25,17 @@ _FLOAT_MIN = (420, 300)            # 最小尺寸
 _BTN_DOCK, _BTN_CLOSE = "dock", "close"
 _BTN_MIN, _BTN_MAX = "min", "max"   # bug4: 迷你标题栏补「最小化」「全屏(最大化)」两枚按钮
 
+# v0.3.1.51 自测缝: 缩放读光标位置这一步可被注入(只给 --e2e-float-resize 用)。
+# 为什么要这一道缝: 自测是在**真桌面**上跑的, 它靠 SetCursorPos 摆光标再投鼠标消息;
+# 可真人/别的程序一动鼠标, 光标就被抢走, 位移量全乱 —— 于是"拖得动"和"测不准"混在
+# 一起没法判。注入一个假光标位置后, 断言算的仍是产品代码自己算的 Bounds, 与真鼠标无关。
+_CURSOR_PROBE = [None]      # None = 用真鼠标; 否则是 fn() -> (x, y)
+
+
+def set_cursor_probe(fn):
+    """自测钩子: fn 返回 (x, y) 时缩放以它当光标屏幕坐标; 传 None 恢复真实鼠标。"""
+    _CURSOR_PROBE[0] = fn
+
 
 def install_floats(win, api, pages, bg_getter=None, accent_getter=None, tabstrip_h=None):
     """在窗口壳里安装悬浮窗管理器。须在 GUI 就绪后调用(内部已 marshal)。
@@ -85,13 +96,133 @@ def install_floats(win, api, pages, bg_getter=None, accent_getter=None, tabstrip
             import traceback
             traceback.print_exc()
 
-    def _nc_drag(form, ht):
-        """进入系统模态循环(移动 HTCAPTION / 缩放 HTLEFT...)。"""
-        import ctypes
+    # ---------------- 自绘缩放(v0.3.1.51) ----------------
+    # 用户报修: 「信息以新窗口形式播放」弹出的悬浮窗**拉不动边**, 尺寸锁死。
+    # 根因: 旧实现只在左/右/下挂了三块 4px 热区, 按下后发 WM_NCLBUTTONDOWN(HTLEFT/HTRIGHT/
+    # HTBOTTOM) 想让系统接管缩放。但 FormBorderStyle=None 的窗体**没有 WS_THICKFRAME**,
+    # DefWindowProc 收到这条消息直接忽略 → 系统缩放模态循环永远不启动, 热区点了等于没点。
+    # 修法: 纯自绘 —— 四个边 + 四个角共 8 块热区, 按下时记下光标屏幕坐标与起始 Bounds,
+    # 移动时按位移直接 SetBounds(带最小尺寸夹取), 松手结束。全按逻辑像素算, 不动非客户区,
+    # 因此不会凭空长出 WS_THICKFRAME 那圈会让 WebView2 内容内缩/露白边的边框。
+    _RS_CURSORS = {
+        "n": WinForms.Cursors.SizeNS, "s": WinForms.Cursors.SizeNS,
+        "w": WinForms.Cursors.SizeWE, "e": WinForms.Cursors.SizeWE,
+        "nw": WinForms.Cursors.SizeNWSE, "se": WinForms.Cursors.SizeNWSE,
+        "ne": WinForms.Cursors.SizeNESW, "sw": WinForms.Cursors.SizeNESW,
+    }
+    _RESIZE_HIT = 4          # 边缘热区逻辑宽度(与旧版一致)
+    _RESIZE_CORNER = 10      # 四角热区逻辑宽度(比边宽, 斜着拉好抓)
+
+    def _cursor_pos():
+        """光标屏幕坐标: 默认真实鼠标; 自测注入假位置时走假位置(见模块级 set_cursor_probe)。"""
+        fn = _CURSOR_PROBE[0]
+        if fn is not None:
+            try:
+                x, y = fn()
+                return Point(int(x), int(y))
+            except Exception:
+                pass
+        return WinForms.Cursor.Position
+
+    def _min_size():
+        """最小尺寸(与 form.MinimumSize 同源, 手动夹取时不依赖 .NET 是否替我们夹)。"""
+        return (max(240, int(_FLOAT_MIN[0] * scale)),
+                max(180, int(_FLOAT_MIN[1] * scale)))
+
+    def _begin_resize(win, key, src=None):
+        """开始缩放: 记录起点, 让 src(热区/标题栏)捕获鼠标。返回是否真的进入缩放。"""
+        form = win["form"]
+        if key not in _RS_CURSORS:
+            return False
         try:
-            u32 = ctypes.windll.user32
-            u32.ReleaseCapture()
-            u32.SendMessageW(form.Handle.ToInt32(), 0xA1, ht, 0)
+            if form.WindowState == WinForms.FormWindowState.Minimized:
+                return False
+            if _is_max(win):
+                # 全屏态拉边: 先还原成上次的浮动尺寸, 再从还原后的框继续拉(与系统窗口一致)
+                form.WindowState = WinForms.FormWindowState.Normal
+                nb = win.get("norm")
+                if nb is not None:
+                    form.Bounds = nb
+                _layout_zones(win)
+            cur = _cursor_pos()
+            b = form.Bounds
+            win["rs"] = {"k": key, "sx": cur.X, "sy": cur.Y,
+                         "x": b.X, "y": b.Y, "w": b.Width, "h": b.Height}
+            if src is not None:
+                src.Capture = True
+            return True
+        except Exception:
+            win["rs"] = None
+            return False
+
+    def _step_resize(win):
+        """按光标位移改窗体矩形(每次 MouseMove 调); 返回是否正在缩放。"""
+        rs = win.get("rs")
+        if not rs:
+            return False
+        try:
+            form = win["form"]
+            cur = _cursor_pos()
+            dx, dy = cur.X - rs["sx"], cur.Y - rs["sy"]
+            k = rs["k"]
+            x, y, w, h = rs["x"], rs["y"], rs["w"], rs["h"]
+            if "w" in k:                       # 左/左上/左下: 左边缘跟着走, 右边缘钉住
+                x += dx
+                w -= dx
+            if "e" in k:                       # 右/右上/右下
+                w += dx
+            if "n" in k:                       # 上/左上/右上: 上边缘跟着走, 下边缘钉住
+                y += dy
+                h -= dy
+            if "s" in k:                       # 下/左下/右下
+                h += dy
+            mw, mh = _min_size()
+            if w < mw:                         # 夹到最小尺寸时把"钉住的那条边"重新算回去, 窗口不抖
+                w = mw
+                if "w" in k:
+                    x = rs["x"] + rs["w"] - mw
+            if h < mh:
+                h = mh
+                if "n" in k:
+                    y = rs["y"] + rs["h"] - mh
+            form.Bounds = Rectangle(x, y, w, h)   # 内容由 WebView2 自适配, 缩放结束会补呈现(见 _wire_repaint)
+        except Exception:
+            pass
+        return True
+
+    def _end_resize(win, src=None):
+        """结束缩放: 清状态、放鼠标捕获。返回刚才是/否在缩放。"""
+        if not win.get("rs"):
+            return False
+        win["rs"] = None
+        try:
+            if src is not None:
+                src.Capture = False
+        except Exception:
+            pass
+        return True
+
+    def _layout_zones(win):
+        """8 块缩放热区跟着窗体尺寸走(自己算位置, 不用 Dock/Anchor: 区域要互不重叠)。"""
+        form = win["form"]
+        zones = win.get("zones") or {}
+        if not zones:
+            return
+        try:
+            t = int(_RESIZE_HIT * scale)
+            c = int(_RESIZE_CORNER * scale)      # 角区从两边的交叉处铺开, 覆盖边热区的两端
+            cw, ch = form.ClientSize.Width, form.ClientSize.Height
+            box = {
+                "n": (c, 0, max(1, cw - 2 * c), t),
+                "s": (c, ch - t, max(1, cw - 2 * c), t),
+                "w": (0, c, t, max(1, ch - 2 * c)),
+                "e": (cw - t, c, t, max(1, ch - 2 * c)),
+                "nw": (0, 0, c, c), "ne": (cw - c, 0, c, c),
+                "sw": (0, ch - c, c, c), "se": (cw - c, ch - c, c, c),
+            }
+            for k, p in zones.items():
+                x, y, w, h = box.get(k) or (0, 0, 1, 1)
+                p.Bounds = Rectangle(int(x), int(y), max(1, int(w)), max(1, int(h)))
         except Exception:
             pass
 
@@ -136,12 +267,15 @@ def install_floats(win, api, pages, bg_getter=None, accent_getter=None, tabstrip
             return False
 
     def _toggle_max(win):
-        """全屏(最大化) ↔ 还原。无边框窗体靠 MaximizedBounds=屏幕工作区 铺满。"""
+        """全屏(最大化) ↔ 还原。无边框窗体靠 MaximizedBounds=屏幕工作区 铺满。
+        最大化前记下浮动尺寸: 全屏态下拉边缩放时先还原回这个框, 再继续拉(与系统窗口一致)。"""
         try:
             form = win["form"]
-            form.WindowState = (WinForms.FormWindowState.Normal
-                                if form.WindowState == WinForms.FormWindowState.Maximized
-                                else WinForms.FormWindowState.Maximized)
+            if form.WindowState == WinForms.FormWindowState.Maximized:
+                form.WindowState = WinForms.FormWindowState.Normal
+            else:
+                win["norm"] = form.Bounds
+                form.WindowState = WinForms.FormWindowState.Maximized
             win["hover"] = None
             win["bar"].Invalidate()
         except Exception:
@@ -347,13 +481,16 @@ def install_floats(win, api, pages, bg_getter=None, accent_getter=None, tabstrip
 
         win = {"form": form, "bar": bar, "title": title or "页面",
                "hover": None, "chrome": [bar], "closing": False,
-               "dragging": False, "dx": 0, "dy": 0, "drop_hint": False}
+               "dragging": False, "dx": 0, "dy": 0, "drop_hint": False,
+               "zones": {}, "rs": None, "norm": None, "rep_timer": None}
         wins[tid] = win
 
         bar.Paint += lambda _s, e: _paint(win, e)
         bar.Resize += lambda _s, _e: bar.Invalidate()
 
         def on_move(_s, args):
+            if _step_resize(win):    # 正在拉边缩放: 与热区共用同一套位移计算
+                return
             if win.get("dragging"):
                 # 自绘拖动: 需要拿到"松手落点"判断是否拖进了主窗口标签栏(见 on_up),
                 # 所以不用 HTCAPTION 系统模态循环(那条路我们收不到落点)。
@@ -382,7 +519,8 @@ def install_floats(win, api, pages, bg_getter=None, accent_getter=None, tabstrip
             if _is_max(win):
                 return          # 全屏态不允许自绘拖动(拖了会把窗口挪出屏幕/破坏最大化)
             if args.Y <= int(4 * scale):
-                _nc_drag(form, 12)   # HTTOP: 标题栏上缘 4px = 顶边缩放带
+                # 标题栏上缘 4px = 顶边缩放带(两侧覆盖不到的残段走这里, 与热区同一套自绘缩放)
+                _begin_resize(win, "n", bar)
                 return
             try:
                 cur = WinForms.Cursor.Position
@@ -394,6 +532,8 @@ def install_floats(win, api, pages, bg_getter=None, accent_getter=None, tabstrip
                 win["dragging"] = False
 
         def on_up(_s, _a):
+            if _end_resize(win, bar):    # 收尾缩放(松手位置/去抖补呈现由 Resize 事件负责)
+                return
             if not win.get("dragging"):
                 return
             win["dragging"] = False
@@ -455,42 +595,45 @@ def install_floats(win, api, pages, bg_getter=None, accent_getter=None, tabstrip
         return form
 
     def _build_edges(win):
-        """无边框边缘缩放热区(WebView2 铺满客户区, THICKFRAME 收不到鼠标)。"""
+        """无边框缩放热区(8 向): 四边 + 四角, 全部走自绘缩放(见上方 _begin_resize)。
+
+        旧实现只有左/右/下三条 4px 带, 且按下后发 WM_NCLBUTTONDOWN 等系统接管 —— 无边框窗体
+        没有 WS_THICKFRAME, 那条消息被忽略, 于是"拉边没反应"(用户报修)。这里补齐:
+        n / s / w / e 四条边 + nw / ne / sw / se 四个角; 位置由 _layout_zones 随窗口尺寸重算。
+        """
         form = win["form"]
         try:
-            ew = int(4 * scale)
-            cw, ch = form.ClientSize.Width, form.ClientSize.Height
-
-            def edge(ht, loc, size, anchor, cursor):
+            zones = {}
+            for key, cur in _RS_CURSORS.items():
                 p = WinForms.Panel()
-                # bug10: 热区压在页面边缘 4px 上 —— 固定用窗体深色底(不再跟随标签栏配色,
-                # 浅色主题下会变成一圈浅色边框, 用户报"播放界面有白色边框")
+                # bug10: 热区压在页面边缘 —— 固定用窗体深色底(不随主题变浅, 否则浅色主题下
+                # 会变成一圈浅色边框, 用户报"播放界面有白色边框")
                 p.BackColor = _EDGE
-                p.Location = loc
-                p.Size = size
-                p.Anchor = anchor
-                p.Cursor = cursor
+                p.Cursor = cur
 
-                def down(_s, a):
+                def down(_s, a, _k=key):
                     if a.Button == WinForms.MouseButtons.Left:
-                        _nc_drag(form, ht)
+                        _begin_resize(win, _k, _s)
+
+                def move(_s, a):
+                    _step_resize(win)
+
+                def up(_s, a):
+                    _end_resize(win, _s)
+
                 p.MouseDown += down
+                p.MouseMove += move
+                p.MouseUp += up
                 form.Controls.Add(p)
                 p.BringToFront()
                 win["chrome"].append(p)
-
-            # 右/下热区外扩 2px: 高 DPI 下逻辑→物理像素有舍入差, 精确贴边会露 1px 白线
-            edge(10, Point(0, 0), Size(ew, ch),
-                 WinForms.AnchorStyles.Top | WinForms.AnchorStyles.Bottom |
-                 WinForms.AnchorStyles.Left, WinForms.Cursors.SizeWE)
-            edge(11, Point(cw - ew - 2, 0), Size(ew + 2, ch),
-                 WinForms.AnchorStyles.Top | WinForms.AnchorStyles.Bottom |
-                 WinForms.AnchorStyles.Right, WinForms.Cursors.SizeWE)
-            edge(15, Point(0, ch - ew - 2), Size(cw + 2, ew + 2),
-                 WinForms.AnchorStyles.Bottom | WinForms.AnchorStyles.Left |
-                 WinForms.AnchorStyles.Right, WinForms.Cursors.SizeNS)
+                zones[key] = p
+            win["zones"] = zones
+            _layout_zones(win)
+            form.Resize += lambda _s, _a: _layout_zones(win)
         except Exception:
-            pass
+            import traceback
+            traceback.print_exc()
 
     # ---------------- 对外 API ----------------
     def open(tab, pages_=None):

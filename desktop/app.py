@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-洞鉴虚明 · 基础版 (v0.3.1.30dsk)
+洞鉴虚明 · 基础版 (v0.4.1dsk)
 ==========================
 本地运行的洞鉴虚明：读取 B站 内容 → 黑白名单/AI 分拣 → 推荐流 + 数据源状态 + AI 聊天。
 
@@ -40,6 +40,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
@@ -63,7 +64,7 @@ if _PORT_ENV:
         PORTS = (int(_PORT_ENV),)
     except Exception:
         pass
-APP_VER = "v0.3.1.46dsk"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
+APP_VER = "v0.4.1dsk"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
 # 本机回环请求必须绕过系统代理: 用户开着 Clash/V2Ray/公司代理时, 环境里的 http_proxy 会把
 # 127.0.0.1 的请求转给代理服务器, 轻则 502, 重则心跳连续失败 -> 悬浮球探活 2 轮不过自我了断,
 # 表现为「球莫名消失/点定位没反应」。这里建一个禁用代理的 opener 专供本地调用; 外网 API 仍走
@@ -107,7 +108,7 @@ _IO_STATE_KEYS = {"fetch_error", "fetch_last", "last_feed", "last_types", "score
 # v0.3.1.39: ai_key 以前不在这个集合里 ⇒ 用户勾了「只导出设置」也照样把 aiKey 写进
 # 导出文本, 分享出去就等于泄露自己的 AI 密钥(用户明确要求: aiKey、登陆账号这类账号
 # 内容必须不出现在导出文件里)。同类项一并归入: 各平台 Cookie/账号画像/关注列表。
-_IO_CRED_KEYS = {"bili_cookie", "tb_cookie", "tb_user", "tb_avatar", "xhh_cookie",
+_IO_CRED_KEYS = {"bili_cookie", "tb_cookie", "tb_verify_cookie", "tb_user", "tb_avatar", "xhh_cookie",
                  "xhh_heybox_id", "xhh_pkey", "xhh_user", "xhh_avatar",
                  "acct_nickname", "acct_profile", "bili_follow_mids", "bili_follow_names",
                  "ai_key"}
@@ -174,6 +175,265 @@ if getattr(sys, "frozen", False):   # 一次性迁移: exe旁旧库 → 用户�
                 shutil.move(_src, _dst)
             except Exception:
                 pass
+
+
+# ---------------------------------------------------------------- 自动更新 (v0.4.1dsk)
+# 更新包放 GitHub Releases（tag 形如 v0.4.1dsk，附件是对应 exe）。应用只读公开 API
+# 的 releases/latest，选带 .exe 附件的版本；78MB 的二进制不进 git 历史。
+# 源码运行也允许"检查"，但下载/替换只在 Windows 的 PyInstaller exe 里开放。
+UPDATE_REPO = os.environ.get("MIRRORSORTER_UPDATE_REPO") or "Xblyymdf/MirrorSorter"
+UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
+UPDATE_DIR = os.path.join(DATA_DIR, "update")
+_UPDATE_LOCK = threading.Lock()
+_UPDATE_LAST = {"info": None, "ts": 0.0}
+_UPDATE_STATE = {"phase": "idle", "received": 0, "total": 0, "path": "", "error": "",
+                 "version": "", "notes": ""}
+_UPDATE_ALLOW_HOSTS = ("github.com", "objects.githubusercontent.com",
+                       "github-releases.githubusercontent.com")
+
+
+def _update_ver(v):
+    """v0.4.1dsk → (0, 4, 1)。只比较数字段，dsk 后缀不参与比较。"""
+    m = re.match(r"^[vV]?(\d+(?:\.\d+)*)", str(v or "").strip())
+    return tuple(int(x) for x in m.group(1).split(".")) if m else ()
+
+
+def _update_newer(latest, current):
+    a, b = _update_ver(latest), _update_ver(current)
+    if not a or not b:
+        return False
+    n = max(len(a), len(b))
+    return a + (0,) * (n - len(a)) > b + (0,) * (n - len(b))
+
+
+def _update_url_ok(url):
+    """只允许 GitHub 官方的 https 附件地址，避免被伪造的 API 响应带去任意下载源。"""
+    try:
+        p = urllib.parse.urlparse(str(url or ""))
+        host = (p.hostname or "").lower()
+        return p.scheme == "https" and (host in _UPDATE_ALLOW_HOSTS
+                                        or host.endswith(".githubusercontent.com"))
+    except Exception:
+        return False
+
+
+def _update_fetch_json(url, timeout=12):
+    req = urllib.request.Request(url, headers={
+        "User-Agent": "MirrorSorter/%s" % APP_VER,
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    })
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def update_check():
+    """读 GitHub Releases 最新版。只读网络，不改任何本地文件。"""
+    with _UPDATE_LOCK:
+        _UPDATE_LAST["info"] = None
+    cur = APP_VER.lstrip("v")
+    try:
+        data = _update_fetch_json(UPDATE_API)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            msg = "仓库还没有发布可用的版本（没有 Release）。"
+        elif e.code in (403, 429):
+            msg = "GitHub 接口被限流，请稍后再试。"
+        else:
+            msg = "检查更新失败：HTTP %s" % e.code
+        return {"ok": False, "current": cur, "error": msg}
+    except Exception as e:
+        return {"ok": False, "current": cur,
+                "error": "检查更新失败：%s" % str(e)[:140]}
+    tag = str(data.get("tag_name") or data.get("name") or "").strip()
+    exe = None
+    # 只认独立运行的 exe；安装包/安装器即使也是 .exe 也不能拿来覆盖自身
+    _bad = ("安装包", "installer", "setup", "install")
+    _cands = []
+    for a in (data.get("assets") or []):
+        name = str(a.get("name") or "")
+        url = str(a.get("browser_download_url") or "")
+        if not name.lower().endswith(".exe") or not _update_url_ok(url):
+            continue
+        _cands.append((0 if any(k in name.lower() for k in _bad) else 1, a))
+    if _cands:
+        _cands.sort(key=lambda x: x[0], reverse=True)
+        exe = _cands[0][1]
+    if exe is None:
+        return {"ok": False, "current": cur, "latest": tag.lstrip("v"),
+                "error": "最新版本没有附带 exe 安装包。"}
+    latest = tag or str(exe.get("name") or "")
+    digest = str(exe.get("digest") or "")
+    info = {
+        "ok": True,
+        "supported": (os.name == "nt" and bool(getattr(sys, "frozen", False))),
+        "current": cur,
+        "latest": (latest.lstrip("v") or latest),
+        "has_update": _update_newer(latest, APP_VER),
+        "name": str(exe.get("name") or ""),
+        "size": int(exe.get("size") or 0),
+        "notes": str(data.get("body") or "")[:4000],
+        "page": str(data.get("html_url") or ""),
+        "published": str(data.get("published_at") or ""),
+        "url": str(exe.get("browser_download_url") or ""),
+        "sha256": digest[7:] if digest.lower().startswith("sha256:") else "",
+    }
+    if info["has_update"]:
+        with _UPDATE_LOCK:
+            _UPDATE_LAST["info"] = dict(info)
+            _UPDATE_LAST["ts"] = time.time()
+    return info
+
+
+def update_progress():
+    with _UPDATE_LOCK:
+        st = dict(_UPDATE_STATE)
+    st["ok"] = True
+    return st
+
+
+def update_download():
+    """后台下载最近一次检查到的 Release exe；页面轮询 progress 看进度。"""
+    if not (os.name == "nt" and getattr(sys, "frozen", False)):
+        return {"ok": False, "error": "自动更新只在 Windows 桌面版 exe 里可用。"}
+    with _UPDATE_LOCK:
+        info = dict(_UPDATE_LAST["info"] or {})
+        if not info or not info.get("url"):
+            return {"ok": False, "error": "请先检测更新。"}
+        if _UPDATE_STATE.get("phase") == "downloading":
+            return {"ok": False, "error": "已经在下载了。"}
+        if not _update_url_ok(info["url"]):
+            return {"ok": False, "error": "更新地址不是 GitHub 官方地址，已拒绝。"}
+        _UPDATE_STATE.update({"phase": "downloading", "received": 0,
+                              "total": int(info.get("size") or 0), "path": "",
+                              "error": "", "version": info.get("latest") or ""})
+
+    def _worker():
+        part = ""
+        try:
+            os.makedirs(UPDATE_DIR, exist_ok=True)
+            safe = re.sub(r"[^0-9A-Za-z._-]", "", str(info.get("latest") or "latest")) or "latest"
+            final = os.path.join(UPDATE_DIR, "洞鉴虚明%s.exe" % safe)
+            part = final + ".download"
+            req = urllib.request.Request(info["url"], headers={
+                "User-Agent": "MirrorSorter/%s" % APP_VER})
+            h = hashlib.sha256()
+            got = 0
+            with urllib.request.urlopen(req, timeout=40) as r, open(part, "wb") as f:
+                total = int(r.headers.get("Content-Length") or 0) or int(info.get("size") or 0)
+                with _UPDATE_LOCK:
+                    _UPDATE_STATE["total"] = total
+                while True:
+                    chunk = r.read(1 << 20)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    h.update(chunk)
+                    got += len(chunk)
+                    with _UPDATE_LOCK:
+                        _UPDATE_STATE["received"] = got
+            if got < 5 * 1024 * 1024:
+                raise ValueError("下载文件太小，可能不是完整的 exe")
+            with open(part, "rb") as f:
+                if f.read(2) != b"MZ":
+                    raise ValueError("下载的文件不是 Windows exe")
+            want = str(info.get("sha256") or "").lower()
+            if want and h.hexdigest().lower() != want:
+                raise ValueError("文件校验失败（SHA256 不一致）")
+            os.replace(part, final)
+            with _UPDATE_LOCK:
+                _UPDATE_STATE.update({"phase": "ready", "path": final,
+                                      "received": got, "total": got})
+        except Exception as e:
+            try:
+                if part and os.path.exists(part):
+                    os.remove(part)
+            except OSError:
+                pass
+            with _UPDATE_LOCK:
+                _UPDATE_STATE.update({"phase": "error", "error": str(e)[:200]})
+
+    threading.Thread(target=_worker, name="update-download", daemon=True).start()
+    return {"ok": True}
+
+
+def _update_bat_quote(p):
+    """batch 的 set "K=V" 行里 % 要写成 %%；换行/控制字符直接拒绝。"""
+    s = str(p)
+    if any(ch in s for ch in "\r\n\0"):
+        raise ValueError("路径里含换行/控制字符")
+    return s.replace("%", "%%")
+
+
+def update_script_text(old_exe, new_exe):
+    """生成替换脚本：旧 exe 被占用时每秒重试（最长约 3 分钟），换好后从原目录重启。
+    保留旧文件名 —— 用户的快捷方式/任务栏固定都指向这个路径，升级不能换名。"""
+    old_exe = os.path.abspath(old_exe)
+    new_exe = os.path.abspath(new_exe)
+    old_dir = os.path.dirname(old_exe)
+    return "\r\n".join([
+        "@echo off",
+        "setlocal",
+        'set "OLD=%s"' % _update_bat_quote(old_exe),
+        'set "NEW=%s"' % _update_bat_quote(new_exe),
+        'set "OLD_DIR=%s"' % _update_bat_quote(old_dir),
+        'if exist "%OLD%" copy /y "%OLD%" "%OLD%.bak" >/dev/null 2>nul',
+        "for /l %%i in (1,1,180) do (",
+        '  move /y "%NEW%" "%OLD%" >nul 2>nul && goto replaced',
+        "  >nul 2>nul ping -n 2 127.0.0.1",
+        ")",
+        "goto failed",
+        ":replaced",
+        'cd /d "%OLD_DIR%"',
+        'start "" "%OLD%"',
+        'del "%~f0" >nul 2>nul',
+        "exit /b 0",
+        ":failed",
+        'del "%~f0" >nul 2>nul',
+        "exit /b 1",
+        "",
+    ])
+
+
+def update_prepare_install(new_exe):
+    """校验下载文件并写好替换脚本。返回 {ok, script, old} / {ok:false,error}。
+    真正的关窗与拉起 cmd 在 app_window.ShellApi.install_update 里做。"""
+    if os.name != "nt" or not getattr(sys, "frozen", False):
+        return {"ok": False, "error": "自动更新只在 Windows 桌面版 exe 里可用"}
+    new_exe = os.path.abspath(str(new_exe or ""))
+    updir = os.path.abspath(UPDATE_DIR)
+    try:
+        if os.path.normcase(os.path.commonpath([new_exe, updir])) != os.path.normcase(updir):
+            return {"ok": False, "error": "更新文件不在更新目录里"}
+    except ValueError:
+        return {"ok": False, "error": "更新文件路径无效"}
+    if not new_exe.lower().endswith(".exe") or not os.path.isfile(new_exe):
+        return {"ok": False, "error": "更新文件不存在"}
+    if os.path.getsize(new_exe) < 5 * 1024 * 1024:
+        return {"ok": False, "error": "更新文件不完整"}
+    try:
+        with open(new_exe, "rb") as f:
+            if f.read(2) != b"MZ":
+                return {"ok": False, "error": "更新文件不是 exe"}
+    except OSError as e:
+        return {"ok": False, "error": "读取更新文件失败：%s" % str(e)[:100]}
+    old_exe = os.path.abspath(sys.executable)
+    old_dir = os.path.dirname(old_exe)
+    probe = os.path.join(old_dir, ".msx_upd_probe")
+    try:
+        with open(probe, "wb") as f:
+            f.write(b"1")
+        os.remove(probe)
+    except OSError:
+        return {"ok": False, "error": "程序目录不可写，请把 exe 放到用户目录（如桌面/下载）后再试"}
+    try:
+        script = os.path.join(updir, "apply_update.cmd")
+        with open(script, "w", encoding="gbk", newline="") as f:
+            f.write(update_script_text(old_exe, new_exe))
+    except Exception as e:
+        return {"ok": False, "error": "写入更新脚本失败：%s" % str(e)[:120]}
+    return {"ok": True, "script": script, "old": old_exe}
+
 
 
 def web_path(name):
@@ -297,6 +557,18 @@ def db():
                 conn.execute("INSERT INTO settings(k,v) VALUES('feed_version','2')")
         except Exception:
             pass
+        try:   # v0.3.1.52: B站直播默认权重 25 → 5(一次性迁移)
+            # 老存档里 live_weight 只会是旧默认 25(上个版本三档按钮里挑出来的也是它),
+            # 用户这次明确要求直播占 5 —— 已经是别的值(用户自己调过)就不动。
+            if conn.execute("SELECT v FROM settings WHERE k='live_weight_mig52'").fetchone() is None:
+                row = conn.execute("SELECT v FROM settings WHERE k='live_weight'").fetchone()
+                if row is not None and str(row[0]) == "25":
+                    conn.execute("INSERT INTO settings(k,v) VALUES('live_weight','5') "
+                                 "ON CONFLICT(k) DO UPDATE SET v='5'")
+                conn.execute("INSERT INTO settings(k,v) VALUES('live_weight_mig52','1') "
+                             "ON CONFLICT(k) DO UPDATE SET v='1'")
+        except Exception:
+            pass
         if conn.execute("SELECT COUNT(*) FROM conv").fetchone()[0] == 0:
             try:   # 多线程首建连接可能同时插入, 冲突忽略
                 conn.execute("INSERT INTO conv(id,title,ts,updated) VALUES(1,'默认对话',?,?)",
@@ -384,10 +656,18 @@ DEFAULTS = {
     "tb_weight": "25",        # 贴吧平台权重%(0/25/50/75/90), 与 bili_weight 互比
     "bili_weight": "90",      # B站平台权重%(0/25/50/75/90)
     "tb_cookie": "",          # 贴吧登录凭证(BDUSS/STOKEN 等), 空=匿名会话
+    # v0.3.1.55: 百度安全验证(403)走人工滑块后写回的 cookie。与 tb_cookie 合并成
+    # 请求头发出 —— 只带登录 cookie 时, 验证窗口里过掉的那道 WAF 会话带不过去。
+    "tb_verify_cookie": "",   # 验证窗口拿到的 baidu.com cookie(只用于贴吧请求)
     "tb_user": "",            # 贴吧登录昵称(展示用)
     "tb_avatar": "",          # 贴吧头像URL(登录时从页面抓取)
     "tb_allow_help": "1",     # 贴吧: 允许求助帖(0=过滤"求助/求教/请问"类提问帖)
     "xhh_weight": "15",       # 小黑盒平台权重%(0/25/50/75/100)
+    # v0.3.1.51: B站直播作为独立内容源(进信息流, 也有自己的直播页)。
+    # v0.3.1.52: 用户要求把直播占比下调到 5%(它只是信息流里的补充, 不该和 B站 抢版面)。
+    "live_weight": "5",      # B站直播平台权重%(0-100, 相对另外几个平台的权重)
+    "live_last_fetch": "0",   # 直播源最近一次抓取时间戳(状态卡/内容源状态用)
+    "live_error": "",         # 直播源最近一次抓取错误(空=正常)
     "xhh_cookie": "",         # 小黑盒设备tokenid(x_xhh_tokenid, 扫码登录后保存)
     "xhh_pkey": "",           # 小黑盒登录会话token(pkey, 网页版真实凭证)
     "xhh_heybox_id": "",      # 小黑盒用户ID(heybox_id/userid)
@@ -1083,14 +1363,33 @@ def search_pushdown():
     return push
 
 
+# B站直搜最近一次失败的原因(进程内诊断用): 搜索"没有B站视频"时先看这里
+_search_fail = {"n": 0, "ts": 0.0, "err": ""}
+
+
+def _note_search_fail(keyword, page, err):
+    try:
+        _search_fail["n"] += 1
+        _search_fail["ts"] = time.time()
+        _search_fail["err"] = "kw=%s page=%s %s" % (str(keyword)[:30], page, str(err)[:140])
+    except Exception:
+        pass
+
+
 def search_items(keyword, page=1, limit=30, order=None, duration=None, pub_begin=None):
     """WBI签名搜索(实测免登录可用, 可翻页)。失败返回[]。
+    接口返回非 0 码(风控 -412 / WBI 签名失效)时不再当成"这词没结果": 先重试一次,
+    两次都失败才算空 —— 否则上层看到空页就收工, 搜索结果里会一条B站视频都没有。
     order/duration: 筛选条件下推(见 search_pushdown), 不传则行为与旧版一致。
     pub_begin: 只收该时间戳之后发布的内容(秒级), 服务端下推偏好时间窗 —— 后端时间窗是硬约束,
     能下推就下推, 抓回来的才多是窗内新内容; 若下推后整页为空(小众词无近期供给)则回退免窗重取,
     最终仍由 pref_age_cut 在本地兜底过滤。"""
 
     def _once(extra):
+        # v0.3.1.66(用户要求: 降低风控概率): 搜索是 fan-out 最猛的一条(偏好词/快速开屏 8 路并发),
+        # 过闸门把同一瞬间的点击摊开; 太密就放弃这一次(上层按空页处理, 下一轮还会来查)。
+        if not _net_guard("bili", 0.25, 150, wait=1.5):
+            raise RuntimeError("本地限速(未发出)")
         params = {"search_type": "video", "keyword": keyword,
                   "page": str(page), "page_size": str(limit)}
         if order:
@@ -1105,20 +1404,35 @@ def search_items(keyword, page=1, limit=30, order=None, duration=None, pub_begin
             headers=dict(HEADERS, Cookie=account_cookie()) if account_cookie() else HEADERS)
         d = json.loads(urllib.request.urlopen(req, timeout=12).read().decode("utf-8"))
         if d.get("code") != 0:
-            return []
+            try:
+                _code = int(d.get("code"))
+            except Exception:
+                _code = 0
+            # -352/-412/-509 都是"站方觉得你不对劲"(风控/签名校验/超频), 412 是 412 状态码。
+            # 撞上就挂惩罚期: 搜索间隔翻倍、额度减半, 别在风控边上反复试探。
+            if _code in (-352, -412, -403, -509, 412):
+                _net_penalty("bili", 900, 2.0)
+            raise RuntimeError("code=%s %s" % (d.get("code"), str(d.get("message") or "")[:40]))
         res = (d.get("data") or {}).get("result") or []
         return [normalize_search(it) for it in res[:limit] if it.get("bvid")]
 
-    try:
-        if pub_begin:
-            got = _once({"pubtime_begin_s": str(int(pub_begin))})
-            if got:
-                return got
-            got = _once(None)      # 窗内无供给 → 回退免窗重取(本地仍会按窗过滤)
-            return got
-        return _once(None)
-    except Exception:
-        return []
+    last = None
+    for attempt in (1, 2):
+        try:
+            if pub_begin:
+                got = _once({"pubtime_begin_s": str(int(pub_begin))})
+                if got:
+                    return got
+                return _once(None)   # 窗内无供给 → 回退免窗重取(本地仍会按窗过滤)
+            return _once(None)
+        except Exception as e:
+            last = e
+            if attempt == 1:
+                # v0.3.1.66: 原来 0.6 秒就重打, 正好撞在风控窗口上; 改成 1.2~3.0 秒随机,
+                # 像人手动重试, 也给正在被限的接口一点恢复时间。
+                time.sleep(1.2 + random.uniform(0, 1.8))
+    _note_search_fail(keyword, page, last)
+    return []
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -1133,7 +1447,11 @@ _TAG_X = ThreadPoolExecutor(max_workers=3)     # 标签补全池(独立, 3并发
 
 
 def _safe_json(url, timeout=10):
-    """带错误收集的GET JSON。返回 (data, error)。"""
+    """带错误收集的GET JSON。返回 (data, error)。
+    v0.3.1.66: 榜单页是一次性并发好几页, 也过同一道闸门 —— 太密就放弃这一页(下一轮再抓),
+    不要为了"这一屏多几条"把出口 IP 送上风控名单。"""
+    if not _net_guard("bili", 0.3, 100, wait=1.0):
+        return None, "本地限速(未发出)"
     try:
         req = urllib.request.Request(url, headers=HEADERS)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -1214,14 +1532,306 @@ _tb_fetch_total = 0         # 本次会话贴吧累计条目(状态面板用)
 _CDP_PORT = 0               # 浏览器调试端口(0=未启动)
 _CDP_PROC = None            # 浏览器子进程
 _CDP_LOGIN = {"ts": 0, "status": "idle", "message": ""}
+# 百度安全验证通过后的"浏览器抓取"通道(v0.3.1.57):
+# 用户拖完滑块后, 同一窗口里的会话才是被百度认的; 用 urllib 带着同样的 Cookie 再去打,
+# 服务端照样 403(实测: 浏览器里页面正常、urllib 同 URL 403) —— 所以贴吧请求改走这个窗口,
+# 用 CDP 导航 + 读 DOM 拿 HTML, 不再自己拼请求。
+_TB_BR = {"ws": "", "ok": False, "ts": 0}
+_TB_BR_LOCK = threading.Lock()
 _CDP_HOST_KEYS = ("BDUSS", "STOKEN", "TIEBA_UID", "BAIDUID", "BAIDUID_BFESS",
                   "TIEBA_UID_BFESS", "H_WISE_SIDS", "H_PS_PSSID", "Hm_lvt")
+# 浏览器通道要跨进程记住(v0.3.1.59): 应用一重启, _CDP_PROC / _CDP_PORT / _TB_BR 全没了,
+# 而用户桌面上那个已经拖过滑块的窗口还在 —— 旧实现从此再也接不上它, 贴吧请求全部回落
+# urllib, 于是"验证完了还是抓不到"。落盘调试端口就够了, 用的时候按需把窗口接回来。
+_TB_BR_FILE = os.path.join(DATA_DIR, "tb_browser.json")
+_TB_BR_IDLE_CLOSE = 1800    # 通道闲置多久才自动关窗(秒)
+
+
+def _tb_br_save():
+    """把浏览器通道的调试端口落盘, 供应用重启后接回同一个窗口。"""
+    try:
+        with open(_TB_BR_FILE, "w", encoding="utf-8") as f:
+            json.dump({"port": int(_CDP_PORT or 0), "ws": _TB_BR.get("ws") or "",
+                       "ok": bool(_TB_BR.get("ok")), "ts": int(_TB_BR.get("ts") or 0)}, f)
+    except Exception:
+        pass
+
+
+def _tb_br_forget():
+    """窗口没了 / 通道失效: 清掉内存与落盘状态, 免得下次去连一个死端口。"""
+    _TB_BR.update(ws="", ok=False)
+    try:
+        os.remove(_TB_BR_FILE)
+    except Exception:
+        pass
+
+
+def _port_alive(port):
+    """这个调试端口后面还有浏览器吗。"""
+    if not port:
+        return False
+    try:
+        with local_open("http://127.0.0.1:%d/json/version" % int(port), timeout=2) as resp:
+            return bool(resp.read())
+    except Exception:
+        return False
+
+
+def _read_devtools_port(path):
+    try:
+        with open(path) as f:
+            return int((f.readline() or "").strip() or 0)
+    except Exception:
+        return 0
+
+
+def _cdp_alive():
+    """浏览器窗口还活着吗 —— 问调试端口, 不看 _CDP_PROC(应用重启后它就没有了)。
+    旧代码只看 Popen 对象, 于是重启后的第一次轮询就报 closed, 前端立刻收手。"""
+    return _port_alive(_CDP_PORT)
+
+
+def _cdp_close_remote():
+    """窗口不是本进程开的(应用重启后接回来的), Popen 杀不到 —— 走 CDP 把页面关掉,
+    Chrome 关掉最后一个页面就会自己退出。"""
+    if not _CDP_PORT:
+        return False
+    try:
+        with local_open("http://127.0.0.1:%d/json/list" % int(_CDP_PORT), timeout=3) as resp:
+            targets = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return False
+    closed = False
+    for t in targets or []:
+        if t.get("type") != "page" or not t.get("id"):
+            continue
+        try:
+            with local_open("http://127.0.0.1:%d/json/close/%s" % (int(_CDP_PORT), t["id"]),
+                            timeout=3) as resp:
+                resp.read()
+            closed = True
+        except Exception:
+            pass
+    return closed
+
+
+_TB_BR_RELAUNCH = {"ts": 0}   # 自动重开验证窗口的退避(10 分钟内只试一次)
+
+
+def _tb_br_restore(relaunch=True):
+    """把上一次的浏览器窗口接回来(应用重启 / 通道被清之后)。返回通道是否已可用。
+
+    v0.3.1.65: 用户验证完之后随手把那个窗口关了 —— 之后每一次抓取都回落到 urllib,
+    于是又是 403、又是"验证完还是抓不到"。现在如果落盘状态是"验证通过"、但端口连不上,
+    就用**同一个 profile**(会话/cookie 都在里面)自动把窗口重新拉起来并接回通道;
+    10 分钟退避一次, 免得用户真不想要窗口时被反复弹窗。"""
+    global _CDP_PORT
+    if _TB_BR.get("ws") and _TB_BR.get("ok"):
+        return True
+    info = {}
+    try:
+        with open(_TB_BR_FILE, encoding="utf-8") as f:
+            info = json.load(f) or {}
+    except Exception:
+        info = {}
+    port = int(_CDP_PORT or 0) or int(info.get("port") or 0)
+    if port:
+        _CDP_PORT = port
+        if _cdp_alive():
+            ws = _cdp_page_ws()
+            if ws:
+                _TB_BR.update(ws=ws, ok=bool(info.get("ok")), ts=int(info.get("ts") or 0))
+                return bool(_TB_BR.get("ok"))
+            return bool(_TB_BR.get("ok"))
+    if not relaunch or not info.get("ok"):
+        if port:
+            _tb_br_forget()     # 窗口真的没了: 状态作废, 下次点"验证"重新开
+        return False
+    now = time.time()
+    if now - int(_TB_BR_RELAUNCH.get("ts") or 0) < 600:
+        return False
+    _TB_BR_RELAUNCH["ts"] = now
+    _proc, port2, err = _cdp_launch(_tb_verify_url())
+    if err or not port2:
+        return False
+    _CDP_PORT = port2
+    ws = _cdp_page_ws()
+    if not ws:
+        return False
+    _TB_BR.update(ws=ws, ok=True, ts=int(now))
+    _tb_br_save()
+    _tb_log("验证窗口被关掉了 —— 已用同一个浏览器配置自动重新拉起(会话还在窗口里)")
+    return True
+
+
+def _tb_br_channel():
+    """贴吧抓取可用的浏览器通道 ws; 没有(未验证 / 窗口已关)返回 ""。"""
+    if _TB_BR.get("ok") and _TB_BR.get("ws") and _cdp_alive():
+        return _TB_BR["ws"]
+    _tb_br_restore()
+    return (_TB_BR.get("ws") or "") if _TB_BR.get("ok") else ""
+
+
+def _tb_br_heal(old_ws=""):
+    """当前 ws 指向的标签页失效(被关 / 崩溃)时换一个还活着的页; 一个都没有就作废通道。
+
+    不修这个会出现"浏览器还在、贴吧永远抓不到": 关掉那个标签页后 ws 成了死地址,
+    每次 eval 都失败, 但 _tb_br_channel() 又从落盘文件里把同一个死 ws 读回来 ——
+    用户重开窗口都没用, 只能重启应用。"""
+    ws = _cdp_page_ws()
+    if ws and ws != old_ws:
+        _TB_BR["ws"] = ws
+        if _TB_BR.get("ok"):
+            _tb_br_save()
+        return ws
+    if not ws:
+        _tb_br_forget()
+        _TB_BR["ws"] = ""
+        _TB_BR["ok"] = False
+    return ""
+
+
+# ---------------- 出站请求闸门 (v0.3.1.55) ----------------
+# 为什么要有: 用户实测一分钟内就被百度安全验证拦了。查下来是我们自己打得太密 ——
+# 顶栏未读角标每 60 秒刷一次 /api/messages, 那一次要打 4 个贴吧请求(登录态 1 + 未读页 2
+# + 又查一次登录态 1), 光挂在那儿不动就是 240 次/小时; 再叠上每次补池 3 次、改设置立刻
+# force_rebuild 又 3 次 —— 这不是人在刷站, 是定时器在刷站。
+# 治理放在请求层: 同站点"单飞 + 最小间隔 + 每分钟上限", 超限就这一次不发(调用方按空结果
+# 处理, 下次自然再试), 绝不排队堆积。真正的解析/筛选逻辑一行没动。
+_NET_LOCK = threading.Lock()
+_NET = {"last": {}, "minute": {}, "min": 0, "total": {}, "penalty": {}, "pace": {}}
+# 测试要多次连打同一站点(还会 mock urlopen), 闸门会让它们互相限流 —— 给个总开关;
+# 生产默认开。关掉时 net_stats 仍照常计数, 便于断言"到底发了几个请求"。
+_NET_GUARD_ON = os.environ.get("MIRRORSORTER_NET_GUARD", "1") != "0"
+
+
+def _net_penalty(host, secs=600.0, factor=2.0):
+    """被抓过(403/安全验证/-352)之后给这个站点挂一段冷却惩罚。
+    v0.3.1.66(用户要求: 降低触发风控的概率): 旧版 403 之后只是干等 10 分钟, 然后照原节奏继续打,
+    解封后常常立刻又被抓 —— 因为期间"平时那点请求量"本来就是站在风控线上的。
+    惩罚期内: 最小间隔 ×factor、每分钟额度 ÷factor, 让重试一开始就比正常慢;
+    已经挂着更长的惩罚就不缩短。"""
+    if not _NET_GUARD_ON:
+        return
+    until = time.time() + max(30.0, float(secs))
+    with _NET_LOCK:
+        cur = _NET["penalty"].get(host)
+        if cur and cur[0] >= until:
+            return
+        _NET["penalty"][host] = [until, max(1.1, float(factor))]
+
+
+def _net_pace(host, gap=0.25):
+    """打散同一瞬间的一堆请求: 距上次不到 gap 就睡够再发, **永不拒绝**。
+    给"不能因为限流而失败"的调用用(登录态/未读数/收藏这类: 被拒绝会直接把功能表现成没登录)。
+    v0.3.1.66: 8 个线程同时开火, 从站方看是一个 IP 一秒打十下 —— 这就是风控样本。"""
+    if not _NET_GUARD_ON:
+        return
+    want = gap * random.uniform(1.0, 1.6)
+    with _NET_LOCK:
+        now = time.time()
+        wait = (_NET["pace"].get(host) or 0.0) - now
+        if wait <= 0:
+            _NET["pace"][host] = now + want
+            return
+        _NET["pace"][host] = now + wait + want   # 排队: 后面的再等这么多
+    time.sleep(min(2.5, wait))
+
+
+def _net_guard(host, min_gap=1.0, per_min=8, wait=0.0):
+    """返回 True 表示这次可以发; False 表示太密了, 直接放弃本次请求。
+    wait>0 时允许先睡一小会儿(最多 wait 秒)再发 —— 补池走这条路, 免得把"太密"变成假报错。
+    v0.3.1.66: ①间隔加向上抖动(每个请求的间距不一样, 但绝不比设定值更密);
+    ②惩罚期内按 _net_penalty 的倍率放慢。"""
+    now = time.time()
+    if not _NET_GUARD_ON:
+        with _NET_LOCK:
+            _NET["total"][host] = _NET["total"].get(host, 0) + 1
+        return True
+    deadline = now + max(0.0, float(wait))
+    while True:
+        minute = int(now // 60)
+        with _NET_LOCK:
+            if _NET["min"] != minute:
+                _NET["min"] = minute
+                _NET["minute"] = {}
+            factor = 1.0
+            pen = _NET["penalty"].get(host)
+            if pen:
+                if pen[0] > now:
+                    factor = float(pen[1] or 2.0)
+                else:
+                    _NET["penalty"].pop(host, None)      # 惩罚期过了, 回归正常节奏
+            need = min_gap * factor * random.uniform(1.0, 1.45)
+            quota = per_min if factor <= 1.0 else max(1, int(round(per_min / factor)))
+            gap = now - (_NET["last"].get(host) or 0)
+            if gap >= need:
+                if _NET["minute"].get(host, 0) < quota:
+                    _NET["last"][host] = now
+                    _NET["minute"][host] = _NET["minute"].get(host, 0) + 1
+                    _NET["total"][host] = _NET["total"].get(host, 0) + 1
+                    return True
+                return False      # 一分钟额度用完: 等下一个分钟窗口, 不排队
+        if now >= deadline:
+            return False
+        time.sleep(min(0.25, max(0.05, need - gap)))
+        now = time.time()
+
+
+def net_stats():
+    """最近一分钟各站点实际发出的请求数(诊断"是不是在刷站"用)。"""
+    with _NET_LOCK:
+        minute = int(time.time() // 60)
+        fresh = minute == _NET["min"]
+        now = time.time()
+        return {"minute": {h: n for h, n in (_NET["minute"] if fresh else {}).items()},
+                "total": dict(_NET["total"]),
+                # 还在惩罚期的站点 → 剩余秒数(诊断用: 一看就知道"现在慢是为什么")
+                "penalty": {h: int(v[0] - now) for h, v in _NET["penalty"].items() if v[0] > now}}
+
+
+# 最近真正吐给信息流的 200 条按平台计数(v0.3.1.57): 用于核对"档位 5% 是否真按 5% 出"。
+# 只记展示层的结果, 不改任何选材逻辑。
+_mix_lock = threading.Lock()
+_mix_recent = collections.deque(maxlen=200)
+
+
+def mix_stats():
+    """最近 200 条的真实平台配比: {"total": n, "by": {平台: 条数}, "share": {平台: 百分比}}。"""
+    with _mix_lock:
+        by = dict(collections.Counter(_mix_recent))
+        n = sum(by.values())
+    share = {k: round(100.0 * v / n, 1) for k, v in by.items()} if n else {}
+    return {"total": n, "by": by, "share": share,
+            "weights": platform_weights()}
+
 _tb_avatar_cache = {"ts": 0, "data": None, "ctype": "image/jpeg"}
 _xhh_avatar_cache = {"ts": 0, "data": None, "ctype": "image/jpeg"}
+# v0.3.1.55: 登录态/未读的短缓存 —— 界面轮询不该每次都去百度翻页(见 tb_login_check)。
+_tb_login_cache = {"ts": 0, "data": None}
+_tb_unread = {"ts": 0, "data": None}
 
 
 def tb_cookie():
     return sget("tb_cookie") or ""
+
+
+def tb_verify_cookie():
+    """百度安全验证通过后写回的 cookie 串(v0.3.1.55)。
+    只用来过 WAF: 同一个出口 IP + 同一套 BAIDUID, 抓取就能继续。"""
+    return sget("tb_verify_cookie") or ""
+
+
+def _tb_cookie_header():
+    """拼请求用的 Cookie 头: 登录 cookie + 验证 cookie, 同名以后者为准。
+    以前只发 tb_cookie, 所以验证窗口拿到的会话根本没被带上(改前就是这个坑)。"""
+    merged = {}
+    for part in (tb_cookie(), tb_verify_cookie()):
+        for chunk in part.split(";"):
+            k, sep, v = chunk.strip().partition("=")
+            if sep and k:
+                merged[k] = v
+    return "; ".join("%s=%s" % (k, v) for k, v in merged.items())
 
 
 def tb_users():
@@ -1239,6 +1849,32 @@ def tb_set_bars(bars):
     sset("tb_bars", "\n".join(b.strip() for b in bars if b.strip()))
 
 
+def user_configured():
+    """本机是不是已经配好了至少一条内容来源。
+
+    "配好"只认三件事：填过吧列表 / 登录过任一平台 / 真抓过内容。
+    只看 prefs_note 不算 —— 偏好写了但一条来源都没有，信息流照样是空的。
+    """
+    try:
+        if tb_users():
+            return True
+        if sget("bili_cookie") or sget("xhh_heybox_id"):
+            return True
+        if int(sget("fetch_last") or 0) > 0:
+            return True
+    except Exception:
+        # 判定失败当成"已配置"：宁可少弹一次引导，也别在启动路径上抛异常
+        return True
+    return False
+
+
+def intro_needed():
+    """要不要弹首次引导：没做过引导，且本机什么都还没配。"""
+    if sget("intro_done") == "1":
+        return False
+    return not user_configured()
+
+
 def tieba_bar_allowed(it):
     """贴吧候选只允许来自用户配置的吧; 未配置吧列表时不限制。"""
     bars = [b.lower() for b in tb_users()]
@@ -1253,7 +1889,7 @@ def tb_weight():
         w = int(sget("tb_weight") or 25)
     except Exception:
         w = 25
-    return w if w in {0, 25, 50, 75, 100} else 25
+    return w if 0 <= w <= 100 else 25
 
 
 def bili_weight():
@@ -1261,7 +1897,7 @@ def bili_weight():
         w = int(sget("bili_weight") or 90)
     except Exception:
         w = 90
-    return w if w in {0, 25, 50, 75, 100} else 90
+    return w if 0 <= w <= 100 else 90
 
 
 def _tb_session_jar():
@@ -1276,7 +1912,14 @@ def _tb_session_jar():
 
 
 def _tb_seed(jar):
-    """匿名会话: 访问 forumpage 种下 BAIDUID(实测 /f?kw= 无cookie必403)。"""
+    """匿名会话: 访问 forumpage 种下 BAIDUID(实测 /f?kw= 无cookie必403)。
+    v0.3.1.59: jar 里已经有 BAIDUID 就直接返回 —— 之前每次抓取都白多打一个
+    forumpage, 请求量翻倍, 也是喂大风控的帮手。"""
+    try:
+        if any(c.name == "BAIDUID" for c in jar):
+            return True
+    except Exception:
+        pass
     try:
         opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
         req = urllib.request.Request(
@@ -1289,22 +1932,104 @@ def _tb_seed(jar):
         return False
 
 
+def _tb_err_text(e, page=""):
+    """403 有两种: 登录态过期(带 cookie 时) 和 百度安全验证 / WAF 拦 IP。
+    后者换个说法, 否则用户会一直以为是没登录/没配 cookie。"""
+    if not page:
+        try:
+            page = e.read().decode("utf-8", "ignore")[:4000]
+        except Exception:
+            page = ""
+    try:
+        if "安全验证" in page or "wappass" in page or "unusualTraffic" in page:
+            return "百度安全验证(403)"
+    except Exception:
+        pass
+    return "HTTP %d" % e.code
+
+
+def _tb_log(msg):
+    """贴吧抓取流水账（DATA_DIR\\tieba.log）。
+
+    用户问过"日志里是怎么显示的" —— 之前贴吧这一路什么都不留，出问题只能靠猜。
+    现在每次请求写一行（走浏览器通道还是 urllib、状态码/字节数/错误），
+    只留最近 ~300KB：这是排障日志，不是审计系统。
+    """
+    try:
+        p = os.path.join(DATA_DIR, "tieba.log")
+        if os.path.exists(p) and os.path.getsize(p) > 300000:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
+        with open(p, "a", encoding="utf-8") as f:
+            f.write("%s %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+    except Exception:
+        pass
+
+
+_TB_VIA = {"last": ""}   # 这一次到底走了哪条通路(br=验证窗口, url=直连), 只用于日志
+
+
 def _tb_fetch(url, referer="https://tieba.baidu.com/", timeout=12):
-    """贴吧 GET: 登录cookie优先; 匿名走"种BAIDUID→请求"通路, 403/302/空壳自动重试1次。
+    html, err = _tb_fetch_raw(url, referer, timeout)
+    _tb_log("GET %s -> %s" % (url[:140],
+                              ("OK %d 字节%s" % (len(html), "（浏览器通道）" if _TB_VIA.get("last") == "br" else ""))
+                              if html else ("失败: %s" % err)))
+    return html, err
+
+
+def _tb_risk(err):
+    """贴吧出现风控证据(403/安全验证/429)时挂一段惩罚期(v0.3.1.66, 降低风控概率)。
+    被拦之后马上照原节奏继续打, 常常还没出验证就又踩进去; 惩罚期把后续请求的间隔翻倍、
+    每分钟额度减半, 给出口 IP 一点"像人"的喘息, 解封后也不至于立刻又被抓。"""
+    s = str(err or "")
+    if ("403" in s) or ("安全验证" in s) or ("429" in s):
+        _net_penalty("tieba", 1200, 2.0)
+
+
+def _tb_fetch_raw(url, referer="https://tieba.baidu.com/", timeout=12):
+    """贴吧 GET: 登录cookie(含人工验证拿到的会话)优先; 匿名走"种BAIDUID→请求"通路,
+    403/302/空壳自动重试1次。
     登录cookie失效时(302→登录页/403)自动降级匿名重试, 不把"登录过期"当采集故障。
-    403 时快速失败(不再无谓重试) —— 限流会由 fetch_tieba_pool 的冷却机制兜底。"""
-    cookie = tb_cookie()
-    for attempt in range(2):   # 0=登录cookie 1=匿名重试(限流时不重试)
+    403 时快速失败(不再无谓重试) —— 限流会由 fetch_tieba_pool 的冷却机制兜底。
+    v0.3.1.55: 进门先过出站闸门(同站点最小间隔 + 每分钟上限), 免得补池/刷新/验证
+    三条路各自打一份, 叠起来看着像刷站。"""
+    if not _net_guard("tieba", 1.8, 8, wait=2.0):
+        return None, "本地限流(未发出)"
+    # 过了滑块的会话只在浏览器里有效(urllib 带同样 Cookie 仍 403) → 有那扇窗就先走它。
+    # v0.3.1.59: _tb_br_channel() 会在应用重启后按落盘端口把窗口接回来;
+    # 浏览器自己都被拦(403)时直接失败 —— 再用 urllib 补打一遍只会让这个出口 IP
+    # 更难从验证里出来, 也是"每 60 秒一条 403"的来源。
+    if _tb_br_channel():
+        html, berr = _tb_browser_html(url, timeout=15)
+        if html:
+            _TB_VIA["last"] = "br"
+            return html, None
+        # v0.3.1.65: 通道还在就**不再用 urllib 补打**。补打必 403, 既把 tb_error 写成
+        # "百度安全验证"(前端于是显示"需重新验证", 可窗口明明是好的), 又继续给出口 IP 加压。
+        # 这一页没拿到就是这一页的事: 交给调用方按失败处理, 下一轮还走同一个窗口。
+        if _cdp_alive():
+            return None, berr or "浏览器通道读取失败"
+        _tb_br_forget()          # 窗口真没了: 通道作废, 回落 urllib
+    _TB_VIA["last"] = "url"
+    cookie = _tb_cookie_header()
+    for attempt in range(2):   # 0=带cookie 1=匿名重试(限流时不重试)
         if attempt == 0 and cookie:
             try:
                 req = urllib.request.Request(url, headers=dict(
                     TB_HEADERS, Referer=referer, Cookie=cookie))
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
                     body = resp.read().decode("utf-8", "ignore")
+                if "安全验证" in body[:4000]:
+                    _tb_risk("百度安全验证(403)")
+                    return None, "百度安全验证(403)"   # 200 的拦截页也不能当数据吞掉
                 if "j_thread_list" in body or "data-field" in body:
                     return body, None
             except urllib.error.HTTPError as e:
                 if e.code in (302, 403, 401):
+                    if e.code == 403:
+                        _tb_risk("HTTP 403")
                     continue   # 登录态失效 → 降级匿名
                 return None, "HTTP %d" % e.code
             except Exception as e:
@@ -1317,10 +2042,18 @@ def _tb_fetch(url, referer="https://tieba.baidu.com/", timeout=12):
             req = urllib.request.Request(url, headers=dict(TB_HEADERS, Referer=referer))
             with opener.open(req, timeout=timeout) as resp:
                 body = resp.read().decode("utf-8", "ignore")
+            if "安全验证" in body[:4000]:
+                return None, "百度安全验证(403)"   # 200 也可能是拦截页, 别当空壳页吞掉
             if "j_thread_list" in body or "data-field" in body:
                 return body, None
         except urllib.error.HTTPError as e:
-            return None, "HTTP %d" % e.code   # 匿名403=限流, 快速失败(不重试)
+            try:
+                page = e.read().decode("utf-8", "ignore")[:4000]
+            except Exception:
+                page = ""
+            _e = _tb_err_text(e, page)
+            _tb_risk(_e)
+            return None, _e   # 匿名403=限流/安全验证, 快速失败(不重试)
         except Exception as e:
             return None, str(e)[:80]
         return body, None   # 空壳页: 这次就这样(下次轮换新会话)
@@ -1439,25 +2172,62 @@ def fetch_tieba_bar(fname, page=0):
 
 
 _tb_cooldown_until = 0   # 贴吧全403冷却截止时间戳(避免每次构建都白等重试链)
+_tb_retry_lock = threading.Lock()
+_tb_retry_at = 0         # 上次手动放行重试的时间戳(最短间隔 60 秒)
+# 贴吧补池的最小间隔(v0.3.1.59): 信息流补池是"滚动就补", 滚动一分钟能补十几次;
+# 贴吧按这个频率打, 一分钟就是二三十个请求 —— 触发风控只是时间问题。贴吧本来就不需要
+# 那么新, 100 秒一轮足够, 而且和本地闸门(每分钟 10 个)互不冲突。
+_TB_POOL_MIN_GAP = 120
+_tb_pool_last_ts = 0.0
+
+
+def _tb_allow_retry():
+    """用户按「刷新」时放行一次贴吧重试: 清掉 403 冷却。
+    冷却 10 分钟是给自动构建用的, 用户主动点刷新还要干等就太反直觉了;
+    但连点会加重百度风控, 所以 60 秒内只放行一次。"""
+    global _tb_cooldown_until, _tb_retry_at, _tb_pool_last_ts
+    now = time.time()
+    if now - _tb_retry_at < 60:
+        return False
+    with _tb_retry_lock:
+        if now - _tb_retry_at < 60:
+            return False
+        _tb_retry_at = now
+        _tb_cooldown_until = 0
+        _tb_pool_last_ts = 0   # 手动放行: 贴吧最小间隔也一并放掉
+    return True
 
 
 def fetch_tieba_pool(quick=False):
     """吧池轮换采集: 每轮取1-2个吧(并行), 每吧1页。返回 (items, errors)。
     403冷却: 一旦全部403进入冷却期, 期间直接空返回(不再拖慢内容池构建)。"""
     global _tb_last_err, _tb_last_fetch, _tb_fetch_total, _tb_cooldown_until
+    global _tb_pool_last_ts
     bars = tb_users()
     if not bars:
         return [], []
     if time.time() < _tb_cooldown_until:
         return [], []   # 冷却中: 快速返回, 不浪费构建时间
+    now_ts = time.time()
+    # v0.3.1.66: 间隔也加抖动。固定 100 秒整点一到就抓, 从站方看是"表一样准时"的脚本特征;
+    # 现在落在 120~162 秒之间, 只是晚一点, 不影响内容新旧。
+    if now_ts - _tb_pool_last_ts < _TB_POOL_MIN_GAP * random.uniform(1.0, 1.35):
+        return [], []   # 距上次贴吧抓取太近: 这次不抓(不是失败, 不写 tb_error)
+    _tb_pool_last_ts = now_ts
     items, errors, seen = [], [], set()
     per = 1 if quick else 2
     idx = int(sget("tb_cursor") or 0)
     picked = [bars[(idx + i) % len(bars)] for i in range(min(per, len(bars)))]
     sset("tb_cursor", (idx + per) % len(bars))
-    # 并行抓取(每吧独立会话, 无跨吧依赖); 每吧随机页, 偏向前几页但引入乱序
+    # 每吧随机页, 偏向前几页但引入乱序。
+    # v0.3.1.66: 两个吧改**顺序**抓, 中间插 0.9~2.2 秒随机间隔 —— 并行时是同一秒从同一个
+    # 出口打两个吧, 正是最容易触发百度风控的那种"多点齐发"形状; 一轮多花不到两秒。
     allow_help_fetch = sget("tb_allow_help") != "0"
-    results = _FX.map(lambda fname: fetch_tieba_bar(fname, random.choice([0, 0, 1, 2])), picked)
+    results = []
+    for _bi, _fname in enumerate(picked):
+        if _bi:
+            time.sleep(random.uniform(0.9, 2.2))
+        results.append(fetch_tieba_bar(_fname, random.choice([0, 0, 1, 2])))
     for fname, (its, err) in zip(picked, results):
         if its:
             for it in its:
@@ -1469,6 +2239,10 @@ def fetch_tieba_pool(quick=False):
                 seen.add(it["key"])
                 items.append(it)
         else:
+            # v0.3.1.55: 被本地闸门拦下的那次不算"抓取失败"(它根本没发出去),
+            # 否则界面上会冒出一片假报错, 掩盖真正的 403/网络原因。
+            if err == "本地限流(未发出)":
+                continue
             errors.append("%s: %s" % (fname, err or "空"))
     if items:
         _tb_last_fetch = int(time.time())
@@ -1478,12 +2252,14 @@ def fetch_tieba_pool(quick=False):
         _tb_last_err = ""
         _tb_cooldown_until = 0
     elif errors and all("403" in e or "402" in e or "429" in e for e in errors):
-        # 全部限流 → 长冷却(60分钟): 贴吧对服务器IP风控属持续封锁, 频繁重试只会加重;
-        # 期间跳过贴吧采集(不拖慢内容池), 用户可在贴吧账号页手动"重试采集"
-        n_errs = len(errors)
-        _tb_last_err = "贴吧服务端被风控(403), 长冷却中(60分钟)…"
+        # 全部限流 → 冷却 10 分钟后再试。早先是 60 分钟: 百度风控往往是短时的,
+        # 一小时的"抓取失败"用户只会以为功能坏了(还以为是登录过期), 而同一出口 IP
+        # 重试的边际风险很低 —— 真正的持续封锁(实测本机连 8 次全 403)靠放宽冷却解决不了。
+        # 用户仍可点顶栏「刷新」手动放行一次重试(_tb_allow_retry)。
+        _tb_last_err = "贴吧被百度安全验证拦截(403), 10 分钟后自动重试"
         sset("tb_error", _tb_last_err)
-        _tb_cooldown_until = int(time.time()) + 3600
+        _tb_cooldown_until = int(time.time()) + 600
+        _net_penalty("tieba", 1800, 2.5)   # 解封后也慢一点: 一解封就照原速打, 往往几分钟内再被抓
         return [], errors
     elif errors:
         _tb_last_err = "; ".join(errors)[:300]
@@ -1495,9 +2271,22 @@ def fetch_tieba_pool(quick=False):
 
 
 def _tb_search_fetch(url, referer="https://tieba.baidu.com/", timeout=12):
-    """贴吧 wap JSON 接口 GET: 登录cookie优先, 匿名走"种BAIDUID→请求"。
+    """贴吧 wap JSON 接口 GET: 登录cookie(含人工验证会话)优先, 匿名走"种BAIDUID→请求"。
     与 _tb_fetch 不同: 纯JSON响应, 不做 j_thread_list 内容标记校验。"""
-    cookie = tb_cookie()
+    if not _net_guard("tieba", 1.8, 8, wait=2.0):
+        return None, "本地限流(未发出)"
+    # 过了滑块的会话只在浏览器里有效(urllib 带同样 Cookie 仍 403) → 有那扇窗就先走它。
+    # 注意这里要的是**文本**: 这个接口返回 JSON, 浏览器会把它渲染进 <pre>,
+    # 拿 outerHTML 去 json.loads 永远失败(旧实现就是这样, 搜索一直是空的)。
+    if _tb_br_channel():
+        txt, berr = _tb_browser_text(url, timeout=15)
+        if txt:
+            return txt, None
+        if berr == "百度安全验证(403)":
+            return None, berr
+        if not _cdp_alive():
+            _tb_br_forget()
+    cookie = _tb_cookie_header()
     if cookie:
         try:
             req = urllib.request.Request(url, headers=dict(
@@ -1515,6 +2304,28 @@ def _tb_search_fetch(url, referer="https://tieba.baidu.com/", timeout=12):
             return resp.read().decode("utf-8", "ignore"), None
     except Exception as e:
         return None, str(e)[:80]
+
+
+def _tb_json_body(body):
+    """把 JSON 接口的响应洗成纯 JSON 文本。
+
+    浏览器通道拿回来的是**渲染后的 HTML**(浏览器会把 JSON 放进 <pre>),
+    也可能前面挂着 <!DOCTYPE html> 之类。直接 json.loads 必失败 —— 贴吧搜索
+    因此长期返回空列表。这里按"原文 / <pre> 内容 / 第一个 { 或 [ 之后"依次尝试。"""
+    s = (body or "").strip()
+    if not s:
+        return ""
+    if s[0] in "{[":
+        return s
+    m = re.search(r"<pre[^>]*>(.*?)</pre>", s, re.S | re.I)
+    if m:
+        s = html.unescape(m.group(1)).strip()
+        if s[:1] in "{[":
+            return s
+    i = min([p for p in (s.find("{"), s.find("[")) if p >= 0] or [-1])
+    if i >= 0:
+        return s[i:]
+    return ""
 
 
 def _tb_int(v):
@@ -1547,8 +2358,9 @@ def tb_search_items(q, rn=20, fname=""):
     if not body:
         return []
     try:
-        d = json.loads(body)
+        d = json.loads(_tb_json_body(body))
     except Exception:
+        _tb_log("搜索响应不是 JSON(前 80 字): %s" % (body[:80].replace("\n", " "),))
         return []
     if d.get("no") != 0:
         return []
@@ -1771,21 +2583,36 @@ def xhh_thread_content(link_id):
 
 def tb_login_check():
     """贴吧登录态: dc/common/tbs → is_login。返回 dict(含昵称/头像)。
-    判定前提: 必须含 BDUSS(半截cookie如有STOKEN无BDUSS视为未登录)。"""
+    判定前提: 必须含 BDUSS(半截cookie如有STOKEN无BDUSS视为未登录)。
+    v0.3.1.55: 结果缓存 5 分钟 —— 这个函数原来被未读角标每 60 秒调两次(未读里又调一次),
+    一次界面轮询就是 4 个贴吧请求, 挂着不动一天几千次, 正是招风控的那种节奏。"""
+    now = time.time()
+    if _tb_login_cache["data"] is not None and now - _tb_login_cache["ts"] < 300:
+        return dict(_tb_login_cache["data"])
     nickname, avatar = sget("tb_user") or "", sget("tb_avatar") or ""
     cookie = tb_cookie()
     if not cookie or "BDUSS=" not in cookie:
-        return {"logged_in": False, "nickname": nickname, "avatar": avatar}
+        out = {"logged_in": False, "nickname": nickname, "avatar": avatar}
+        _tb_login_cache.update(ts=now, data=out)
+        return dict(out)
+    if not _net_guard("tieba", 2.0, 10):
+        # 太密: 这次不查, 沿用上次结论(没有就按"有 cookie 就算登录")
+        prev = _tb_login_cache["data"]
+        return dict(prev) if prev else {"logged_in": True, "nickname": nickname or "已登录",
+                                        "avatar": avatar}
     try:
         req = urllib.request.Request("https://tieba.baidu.com/dc/common/tbs",
                                      headers=dict(TB_HEADERS, Cookie=cookie))
         d = json.loads(urllib.request.urlopen(req, timeout=8).read().decode("utf-8"))
         if d.get("is_login") == 1:
-            return {"logged_in": True, "nickname": nickname or "已登录",
-                    "avatar": avatar, "tbs": d.get("tbs", "")}
-        return {"logged_in": False, "nickname": "", "avatar": ""}
+            out = {"logged_in": True, "nickname": nickname or "已登录",
+                   "avatar": avatar, "tbs": d.get("tbs", "")}
+        else:
+            out = {"logged_in": False, "nickname": "", "avatar": ""}
     except Exception:
-        return {"logged_in": bool(cookie), "nickname": nickname, "avatar": avatar}
+        out = {"logged_in": bool(cookie), "nickname": nickname, "avatar": avatar}
+    _tb_login_cache.update(ts=time.time(), data=out)
+    return dict(out)
 
 
 def tb_profile_from_cookie():
@@ -1809,8 +2636,49 @@ def tb_profile_from_cookie():
         return "", ""
 
 
+# ---- 消息角标「看过」快照 (v0.3.1.66, 用户要求: 点完消息按钮红点立刻消失) ----
+# 语义纯本地: 记下用户点开消息页那一刻各平台的未读数, 前端角标只画"这之后新增的量"。
+# 不去打各平台的"标记已读"接口 —— 那些接口没有稳定契约, 而且多打一次就多一次风控样本。
+# 存法: settings 表里一条 JSON, 形如 {"bili": 3, "tieba": 0, "xhh": 12}。
+_MSG_PLATFORMS = ("bili", "tieba", "xhh")
+
+
+def msg_seen():
+    """读已读快照; 坏数据一律当 0(宁可多显示一个红点, 也不能因为脏数据把提示吞掉)。"""
+    try:
+        d = json.loads(sget("msg_seen") or "{}")
+    except Exception:
+        d = {}
+    if not isinstance(d, dict):
+        d = {}
+    out = {}
+    for k in _MSG_PLATFORMS:
+        try:
+            out[k] = max(0, int(d.get(k) or 0))
+        except Exception:
+            out[k] = 0
+    return out
+
+
+def msg_seen_save(snap):
+    """把前端上报的未读数存成快照。只收三个平台的非负整数, 其它键忽略。"""
+    clean = {}
+    for k in _MSG_PLATFORMS:
+        try:
+            clean[k] = max(0, int((snap or {}).get(k) or 0))
+        except Exception:
+            clean[k] = 0
+    sset("msg_seen", json.dumps(clean))
+    return clean
+
+
 def tb_unread_messages():
-    """读取贴吧“回复我 + @我”的真实未读数，无法确认时返回None。"""
+    """读取贴吧“回复我 + @我”的真实未读数，无法确认时返回None。
+    v0.3.1.55: 缓存 5 分钟 + 出门前过闸门。未读角标是"看一眼"的信息, 不值得每 60 秒
+    去百度翻两页 HTML —— 那正是把人打成"刷站"的那类流量。"""
+    now = time.time()
+    if _tb_unread["ts"] and now - _tb_unread["ts"] < 300:
+        return _tb_unread["data"]
     state = tb_login_check()
     if not state.get("logged_in"):
         return None
@@ -1819,6 +2687,8 @@ def tb_unread_messages():
     try:
         for page, key in (("https://tieba.baidu.com/mo/q/replyme", "replyme"),
                           ("https://tieba.baidu.com/mo/q/atme", "atme")):
+            if not _net_guard("tieba", 2.0, 10):
+                return _tb_unread["data"]
             req = urllib.request.Request(page, headers=dict(TB_HEADERS,
                                          Referer="https://tieba.baidu.com/", Cookie=cookie))
             raw = urllib.request.urlopen(req, timeout=10).read().decode("utf-8", "ignore")
@@ -1828,7 +2698,8 @@ def tb_unread_messages():
             if not match:
                 return None
             total += int(match.group(1))
-        return max(0, total)
+        _tb_unread.update(ts=now, data=max(0, total))
+        return _tb_unread["data"]
     except Exception:
         return None
 
@@ -1841,6 +2712,8 @@ def tb_mylike():
     bars, seen = [], set()
     for pn in range(1, 4):
         url = "https://tieba.baidu.com/f/like/mylike?ie=utf-8&pn=%d" % pn
+        if not _net_guard("tieba", 1.5, 10, wait=2.0):
+            return bars or None, "本地限流(未发出)"
         try:
             req = urllib.request.Request(url, headers=dict(TB_HEADERS, Cookie=cookie))
             body = urllib.request.urlopen(req, timeout=10).read().decode("utf-8", "ignore")
@@ -1896,6 +2769,79 @@ def _tb_find_browser():
     return ""
 
 
+def _cdp_launch(url, profile_name="_tb_login_profile", fresh=False):
+    """启动一个带远程调试端口的独立浏览器窗口(独立 profile)。
+    返回 (proc, port, err): port 就绪才算成功; 失败时 err 是给用户看的原因。
+    v0.3.1.55 从 tb_login_start 里抽出来 —— 登录和「百度安全验证」共用同一套启动逻辑。
+    v0.3.1.57: **不再每次把 profile 整份删掉**, 只清残留的单例锁文件。
+    原因: 百度滑块验证通过后写下的会话就在 profile 里, 删了等于每次都要重新拖一遍;
+    实测"浏览器里能看贴吧、程序里 403"正是会话没被留住的后果。
+    只有真起不来(profile 损坏)时才退回"整份删掉重来"。
+    v0.3.1.59: 连"整份删掉"也不做了 —— 删掉的正是过了滑块的会话。现在:
+    ① 上次的窗口还开着(端口文件连得上)就直接复用它;
+    ② 新进程被 Chrome 单例顶回来时, 再等一下端口文件, 连得上就复用;
+    ③ 确实起不来才把 profile 改名备份(**不删**)再来一次。"""
+    browser = _tb_find_browser()
+    if not browser:
+        return None, 0, "没找到可用的 Chromium 浏览器(Chrome/Edge)"
+    profile = os.path.join(DATA_DIR, profile_name)
+    port_file = os.path.join(profile, "DevToolsActivePort")
+    # 上次的窗口可能还开着(单例机制会把这个 profile 交给它): 端口文件连得上就复用
+    stale = _read_devtools_port(port_file)
+    if stale and _port_alive(stale):
+        return None, stale, ""
+    for _n in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        try:
+            os.remove(os.path.join(profile, _n))
+        except Exception:
+            pass
+    os.makedirs(profile, exist_ok=True)
+    try:
+        proc = subprocess.Popen([
+            browser, "--remote-debugging-port=0",
+            "--user-data-dir=%s" % profile,
+            "--no-first-run", "--no-default-browser-check",
+            # 关键: 跳过Edge首启同步确认页(edge://sync-confirmation-dialog会拦截一切导航,
+            # 导致登录后贴吧页面无法加载、头像抓取失败)
+            "--disable-features=msEdgeFirstRunExperience,msEdgeSidebarV2,msEdgeWalletCheckout",
+            "--disable-sync", "--disable-background-networking", "--disable-component-update",
+            "--disable-gpu",
+            url,
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        return None, 0, "启动失败: %s" % str(e)[:100]
+    # 读 DevToolsActivePort 文件拿到实际端口(port=0 自动分配)
+    port = 0
+    for _ in range(60):
+        if os.path.exists(port_file):
+            try:
+                with open(port_file) as f:
+                    port = int(f.readline().strip())
+                break
+            except Exception:
+                pass
+        if proc.poll() is not None:
+            # 新进程被顶回来了: 多半是已有窗口占着这个 profile。它可能刚写完端口文件,
+            # 再等 10 秒看一次 —— 连得上就直接用那个窗口(会话就在里面)。
+            for _ in range(20):
+                p2 = _read_devtools_port(port_file)
+                if p2 and _port_alive(p2):
+                    return None, p2, ""
+                time.sleep(0.5)
+            if fresh:
+                return proc, 0, "浏览器进程退出"
+            # 真起不来: profile 可能损坏。整份**改名备份**(不删, 里面可能有过滑块的会话)再试一次
+            try:
+                os.rename(profile, "%s.bak-%s" % (profile, time.strftime("%Y%m%d%H%M%S")))
+            except Exception:
+                pass
+            return _cdp_launch(url, profile_name, fresh=True)
+        time.sleep(0.5)
+    if not port:
+        return proc, 0, "调试端口未就绪(10s)"
+    return proc, port, ""
+
+
 def tb_login_start():
     """启动浏览器窗口(独立profile, 打开贴吧登录页)。"""
     global _CDP_PROC, _CDP_PORT, _CDP_LOGIN
@@ -1912,58 +2858,24 @@ def tb_login_start():
         except Exception as e:
             return {"ok": False, "error": "未找到支持自动登录的 Chromium 浏览器，且无法打开默认浏览器: %s" % str(e)[:80]}
     profile = os.path.join(DATA_DIR, "_tb_login_profile")
-    if os.path.exists(profile):
-        # 残留profile(上次进程未杀干净)会让Edge启动即退 → 每次全新
-        try:
-            shutil.rmtree(profile, ignore_errors=True)
-        except Exception:
-            pass
-    os.makedirs(profile, exist_ok=True)
-    try:
-        _CDP_PROC = subprocess.Popen([
-            browser, "--remote-debugging-port=0",
-            "--user-data-dir=%s" % profile,
-            "--no-first-run", "--no-default-browser-check",
-            # 关键: 跳过Edge首启同步确认页(edge://sync-confirmation-dialog会拦截一切导航,
-            # 导致登录后贴吧页面无法加载、头像抓取失败)
-            "--disable-features=msEdgeFirstRunExperience,msEdgeSidebarV2,msEdgeWalletCheckout",
-            "--disable-sync", "--disable-background-networking", "--disable-component-update",
-            "--disable-gpu",
-            "https://passport.baidu.com/v2/?login",
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception as e:
-        _CDP_PROC = None
-        return {"ok": False, "error": "启动失败: %s" % str(e)[:100]}
-    _CDP_PORT = 0
-    _CDP_LOGIN = {"ts": int(time.time()), "status": "starting", "message": "浏览器启动中…"}
-    # 读 DevToolsActivePort 文件拿到实际端口(port=0 自动分配)
-    port_file = os.path.join(profile, "DevToolsActivePort")
-    for _ in range(60):
-        if os.path.exists(port_file):
-            try:
-                with open(port_file) as f:
-                    _CDP_PORT = int(f.readline().strip())
-                break
-            except Exception:
-                pass
-        if _CDP_PROC.poll() is not None:
-            _CDP_LOGIN.update(status="error", message="浏览器启动失败")
-            return {"ok": False, "error": "浏览器进程退出"}
-        time.sleep(0.5)
-    if not _CDP_PORT:
-        return {"ok": False, "error": "调试端口未就绪(10s)"}
-    _CDP_LOGIN.update(status="waiting", message="请在窗口中完成登录(短信/扫码/第三方均可)")
-    return {"ok": True, "message": "登录窗口已打开"}
+    proc, port, err = _cdp_launch("https://passport.baidu.com/v2/?login")
+    if err:
+        _CDP_PROC = proc
+        _CDP_LOGIN.update(status="error", message=err)
+        return {"ok": False, "error": err}
+    # proc 为 None 表示复用的是已开着的窗口(见 _cdp_launch), 不能当成"窗口没开"
+    _CDP_PROC, _CDP_PORT = proc, port
+    _CDP_LOGIN = {"ts": int(time.time()), "status": "waiting",
+                  "message": "请在窗口中完成登录(短信/扫码/第三方均可)"}
+    return {"ok": True, "message": "登录窗口已打开" if proc else "已复用打开的浏览器窗口"}
 
 
 def tb_login_poll():
     """轮询 CDP 取 cookie; 抓到 BDUSS 即保存、顺路抓昵称/头像、关闭窗口。"""
     global _CDP_PROC, _CDP_PORT, _CDP_LOGIN
-    if not _CDP_PROC or _CDP_PROC.poll() is not None:
+    if not _cdp_alive():
         _CDP_LOGIN.update(status="closed", message="窗口已关闭")
         return dict(_CDP_LOGIN)
-    if not _CDP_PORT:
-        return _CDP_LOGIN
     if time.time() - _CDP_LOGIN["ts"] > 600:
         tb_login_stop()
         return {"status": "expired", "message": "登录超时(10分钟), 请重试"}
@@ -2016,10 +2928,283 @@ def tb_login_stop():
                     _CDP_PROC.kill()
                 except Exception:
                     pass
+    elif _cdp_alive():
+        # 窗口不是本进程开的(应用重启后接回来的): Popen 杀不到, 走 CDP 关页面
+        _cdp_close_remote()
     _CDP_PROC = None
     _CDP_PORT = 0
+    _tb_br_forget()                  # 窗口没了, 浏览器抓取通道(含落盘状态)跟着失效
     _CDP_LOGIN.update(status="stopped", message="窗口已关闭")
     return {"ok": True}
+
+
+def _tb_br_idle_watch():
+    """通道闲置太久才关窗。
+
+    旧实现是"验证通过 3 分钟就关", 而贴吧补池是持续发生的: 3 分钟一到窗口被关,
+    后面每一次请求都回落到 urllib → 又 403, 用户看到的就是"验证完还是抓不到"。
+    现在按"多久没用到这个通道"收工(_tb_browser_html 每次成功都会刷新 ts)。"""
+    try:
+        if not _TB_BR.get("ok"):
+            return
+        idle = time.time() - int(_TB_BR.get("ts") or 0)
+        if idle < _TB_BR_IDLE_CLOSE:
+            threading.Timer(max(60, _TB_BR_IDLE_CLOSE - idle), _tb_br_idle_watch).start()
+            return
+        _tb_log("浏览器通道闲置 %d 分钟, 自动关窗(下次验证会重新打开)" % (idle // 60))
+        tb_login_stop()
+        _CDP_VERIFY.update(status="stopped", message="验证窗口闲置太久, 已自动关闭")
+    except Exception:
+        pass
+
+
+# ---------------- 百度安全验证(403)的人工滑块通道 (v0.3.1.55) ----------------
+# 现场: tieba 列表页返回 403 + "百度安全验证"(BIOC 滑块页)。这是出口 IP 级的 WAF,
+# 请求头怎么伪装都没用(实测 8/8 全 403)。能过它的只有"真人在真浏览器里拖一下滑块"。
+# 做法: 把登录窗口那套 CDP 浏览器导航到**被拦的那个吧列表页**, 用户在窗口里完成验证,
+# 然后从浏览器里把 baidu.com 的 cookie 原样抄进 tb_verify_cookie —— 同一出口 IP +
+# 同一套 cookie, 抓取就能接着跑。用户不用复制粘贴、不用重启。
+_CDP_VERIFY = {"ts": 0, "status": "idle", "message": "", "url": ""}
+
+
+def _tb_verify_url():
+    """验证页地址: 用吧池第一个吧(和抓取走同一个入口), 没配吧就开国际吧。"""
+    bars = tb_users()
+    if bars:
+        return "https://tieba.baidu.com/f?kw=%s&pn=0" % urllib.parse.quote(bars[0])
+    return "https://tieba.baidu.com/f?kw=%E5%9B%BD%E9%99%85&pn=0"
+
+
+def tb_verify_page_ok(html_text):
+    """这段响应是真列表页还是验证页/空壳?"""
+    if not html_text:
+        return False
+    head = html_text[:6000]
+    if "安全验证" in head or "wappass" in head:
+        return False
+    return ("j_thread_list" in html_text) or ("data-field" in html_text)
+
+
+def _tb_browser_read(url, expr, timeout=15):
+    """用验证窗口取一次页面: 导航 → 等加载完 → 在页面里求值 expr。返回 (value, err)。
+
+    v0.3.1.57 起这是"过了滑块"之后**唯一**能真拿到贴吧内容的通路:
+    实测同一个窗口里页面正常、拿同一份 Cookie 用 urllib 再打同一个 URL 依旧 403
+    (百度按浏览器指纹判, 不只看 Cookie)。所以别再"抄 cookie 出来自己请求"了。"""
+    ws = _tb_br_channel() or _TB_BR.get("ws") or _cdp_page_ws()
+    if not ws:
+        return "", "没有可用的浏览器窗口"
+    if not _TB_BR_LOCK.acquire(timeout=timeout):
+        return "", "浏览器通道忙"
+    try:
+        try:
+            _cdp_eval(ws, "location.href=%s" % json.dumps(url), timeout=8)
+        except Exception as e:
+            _tb_br_heal(ws)     # ws 可能指向已经关掉的标签页: 换一个活着的页, 没有就作废通道
+            return "", "导航失败: %s" % str(e)[:60]
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(0.4)
+            try:
+                st = _cdp_eval(ws, "document.readyState", timeout=4)
+            except Exception:
+                st = ""
+            if st == "complete":
+                time.sleep(0.5)   # 留一拍给前端渲染列表
+                break
+        try:
+            val = _cdp_eval(ws, expr, timeout=10)
+        except Exception:
+            val = ""
+        if not isinstance(val, str) or not val:
+            _tb_br_heal(ws)
+            return "", "读不到页面内容"
+        _TB_BR["ts"] = int(time.time())
+        return val, ""
+    finally:
+        _TB_BR_LOCK.release()
+
+
+def _tb_browser_html(url, timeout=15):
+    """取一整页 HTML(列表页用)。返回 (html, err); 验证页换算成 403。"""
+    html, err = _tb_browser_read(url, "document.documentElement.outerHTML", timeout=timeout)
+    if err:
+        return "", err
+    head = html[:6000]
+    if "安全验证" in head or "wappass" in head:
+        return "", "百度安全验证(403)"
+    return html, ""
+
+
+def _tb_browser_text(url, timeout=15):
+    """取一个"文本"响应(JSON 接口用): 浏览器渲染 JSON 时 <pre> 里就是原文,
+    innerText 拿到的正好是它。旧实现拿 outerHTML 去 json.loads, 永远解析失败 ——
+    贴吧搜索因此一直是空的。"""
+    txt, err = _tb_browser_read(url, "(document.body ? document.body.innerText : '')",
+                                timeout=timeout)
+    if err:
+        return "", err
+    head = txt[:2000]
+    if "安全验证" in head or "wappass" in head:
+        return "", "百度安全验证(403)"
+    return txt, ""
+
+
+def _tb_verify_probe(cookie_str):
+    """拿**浏览器自己**看一眼真实吧列表页: 页面里真是帖子列表才算过。
+    cookie_str 只用于落盘(给别的路径参考), 判定一律走浏览器 ——
+    换成 urllib 带 cookie 去试, 实测永远 403, 用户就会觉得"拖完还是没反应"。
+
+    先看当前这一页, 不导航: 用户通常就是在这个窗口里拖完滑块、页面自己刷新成列表页,
+    这时再导航一次既白打一个请求, 也可能把刚过的验证又踢回去。"""
+    url = _tb_verify_url()
+    ws = _TB_BR.get("ws") or _cdp_page_ws()
+    if ws:
+        try:
+            html = _cdp_eval(ws, "document.documentElement.outerHTML", timeout=10)
+        except Exception:
+            html = ""
+        if isinstance(html, str) and tb_verify_page_ok(html):
+            _TB_BR["ts"] = int(time.time())
+            return True, url, 200
+    html, err = _tb_browser_html(url)
+    if err:
+        return False, url, (403 if "安全验证" in err else 0)
+    return tb_verify_page_ok(html), url, 200
+
+
+def _cdp_page_ws(prefer="tieba.baidu.com"):
+    """当前浏览器窗口的页面调试地址(没有就返回 "").
+
+    v0.3.1.65: 优先挑 URL 里含 tieba.baidu.com 的那个标签页。
+    旧实现取 /json/list 里的**第一个** page —— 用户多半会在窗口里顺手新开一个标签页去看,
+    或者在验证页旁边再开一页; 第一个 target 往往正是那个停在验证页/新标签页的死页,
+    于是 _tb_browser_read 一直读错页: 界面上"验证完了还是抓不到", 日志里全是读不到内容。
+    找不到贴吧页时仍退回第一个 page(刚开窗、还没导航到贴吧时就是这种情形)。"""
+    if not _CDP_PORT:
+        return ""
+    try:
+        with local_open("http://127.0.0.1:%d/json/list" % _CDP_PORT, timeout=3) as resp:
+            targets = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return ""
+    pages = [t for t in targets or [] if t.get("type") == "page"]
+    if not pages:
+        return ""
+    if prefer:
+        hit = next((t for t in pages if prefer in (t.get("url") or "")), None)
+        if hit and hit.get("webSocketDebuggerUrl"):
+            return hit["webSocketDebuggerUrl"]
+    return pages[0].get("webSocketDebuggerUrl") or ""
+
+
+def tb_verify_start():
+    """打开(或复用)浏览器窗口到验证页, 交给用户拖滑块。"""
+    global _CDP_PROC, _CDP_PORT
+    url = _tb_verify_url()
+    # 先试着接回上一次的窗口(应用重启后 _CDP_PORT 是 0, 但窗口还在桌面上, 端口落在
+    # tb_browser.json 里)。接得上就别再开一个: 同一个 profile 再开一个会被 Chrome 的
+    # 单例机制挡回来, 新进程立刻退出, 用户看到的就是"点验证没反应"。
+    _tb_br_restore()
+    ws = _cdp_page_ws()
+    if ws:
+        try:
+            _cdp_eval(ws, "location.href=%s" % json.dumps(url))
+            _TB_BR.update(ws=ws, ts=int(time.time()))
+            _tb_br_save()
+            _CDP_VERIFY.update(ts=int(time.time()), status="waiting", url=url,
+                               message="请在浏览器窗口里拖动滑块完成验证")
+            return {"ok": True, "reused": True, "url": url,
+                    "message": "已在浏览器窗口打开验证页, 请拖动滑块完成验证"}
+        except Exception:
+            pass
+    proc, port, err = _cdp_launch(url)
+    if err:
+        _CDP_PROC = proc
+        _CDP_VERIFY.update(ts=int(time.time()), status="error", message=err, url=url)
+        return {"ok": False, "error": err}
+    _CDP_PROC, _CDP_PORT = proc, port
+    _TB_BR.update(ws=_cdp_page_ws(), ts=int(time.time()))
+    _tb_br_save()
+    _CDP_VERIFY.update(ts=int(time.time()), status="waiting", url=url,
+                       message="请在浏览器窗口里拖动滑块完成验证")
+    return {"ok": True, "url": url, "message": "验证窗口已打开, 请拖动滑块完成验证"}
+
+
+def tb_verify_poll():
+    """轮询: 浏览器里一旦出现可用的 baidu cookie, 就用它真打一次列表页 ——
+    过得去才写进 tb_verify_cookie、清掉 403 冷却。窗口**不关**: 之后的抓取走它。"""
+    global _CDP_VERIFY, _tb_cooldown_until, _tb_retry_at
+    # 窗口活没活, 问调试端口, 不看 Popen: 应用一重启 Popen 就没了, 而桌面上那个
+    # 已经拖着滑块的窗口还在 —— 旧代码在这里直接判 closed, 前端随即收手。
+    _tb_br_restore()
+    if not _cdp_alive() and not (_CDP_PROC and _CDP_PROC.poll() is None):
+        _tb_br_forget()
+        _CDP_VERIFY.update(status="closed", message="验证窗口已关闭")
+        return dict(_CDP_VERIFY)
+    if time.time() - (_CDP_VERIFY.get("ts") or 0) > 600:
+        # 超时只标状态, 不再杀窗口: 用户可能正拖着滑块, 关掉只会更让人摸不着头脑;
+        # 窗口留着, 再点一次"验证"会直接复用。
+        _CDP_VERIFY.update(status="expired", message="验证超时(10分钟), 请重新点验证")
+        return dict(_CDP_VERIFY)
+    ws = _cdp_page_ws()
+    if not ws:
+        return dict(_CDP_VERIFY, status="waiting", message="等待验证页加载…")
+    # 先在本地看一眼页面还在不在验证页上 —— 滑块没拖完就每 2 秒去敲一次百度,
+    # 等于替 WAF 加压, 也容易把已经判过的会话又惹毛。这里只在页面离开验证页后才探。
+    try:
+        txt = _cdp_eval(ws, "(document.body ? document.body.innerText : '').slice(0,600)") or ""
+    except Exception:
+        txt = ""
+    if "安全验证" in txt or "滑块" in txt or "拖动" in txt:
+        return dict(_CDP_VERIFY, status="waiting",
+                    message="窗口里还停着验证页 —— 请拖动滑块, 松手后会自动继续")
+    try:
+        cookies = _cdp_get_cookies(ws) or []
+    except Exception:
+        cookies = []
+    got = {}
+    for c in cookies:
+        dom = c.get("domain") or ""
+        if "baidu.com" in dom and c.get("name"):
+            got[c["name"]] = c["value"]
+    if not got.get("BAIDUID"):
+        return dict(_CDP_VERIFY, status="waiting", message="等待验证页加载…")
+    # 两次真探测之间至少隔 5 秒
+    if time.time() - (_CDP_VERIFY.get("probe_ts") or 0) < 5:
+        return dict(_CDP_VERIFY, status="waiting", message="正在确认验证结果…")
+    _CDP_VERIFY["probe_ts"] = time.time()
+    cookie_str = "; ".join("%s=%s" % (k, v) for k, v in got.items())
+    ok, _url, code = _tb_verify_probe(cookie_str)
+    if ok:
+        sset("tb_verify_cookie", cookie_str)
+        _tb_cooldown_until = 0
+        _tb_retry_at = 0
+        # 窗口**别关**: 接下去的贴吧请求就走这个窗口 —— 它才是被百度认的会话。
+        _TB_BR.update(ws=ws, ok=True, ts=int(time.time()))
+        _tb_br_save()          # 落盘: 应用重启后还能接回这个已验证的窗口
+        try:
+            kick_build(quick=True, pending=True)
+        except Exception:
+            pass
+        try:   # 闲置 30 分钟才关窗(旧实现 3 分钟就关, 之后所有请求又回落 403)
+            threading.Timer(60, _tb_br_idle_watch).start()
+        except Exception:
+            pass
+        _CDP_VERIFY.update(status="ok",
+                           message="验证通过, 正在重新抓取贴吧(窗口先别关, 抓完会自动关)")
+        _tb_log("验证通过: 浏览器会话可用, 贴吧请求改走验证窗口")
+        return {"status": "ok", "message": "验证通过, 正在重新抓取贴吧(窗口先别关, 抓完会自动关)",
+                "cookie_saved": True, "http": code}
+    _tb_log("验证探测: 还没通过(HTTP %s)" % code)
+    return dict(_CDP_VERIFY, status="waiting", http=code,
+                message="还没通过(HTTP %s) —— 请在窗口里把滑块做完" % code)
+
+
+def tb_verify_stop():
+    r = tb_login_stop()
+    _CDP_VERIFY.update(status="stopped", message="验证窗口已关闭")
+    return r
 
 
 def _cdp_set_cookie(ws_url, name, value, url):
@@ -2739,7 +3924,7 @@ def fetch_pool(quick=False):
 
     # --- 榜单源: 并行抓取(严肃模式跳过: 榜单内容非教程类, 抓了也全被滤掉) ---
     ser_mode = sget("mode") == "严肃"
-    tb_future = xhh_future = fol_future = local_serious_future = None
+    tb_future = xhh_future = fol_future = live_future = local_serious_future = None
     serious_search_futures = []
     quick_search_futures = []
     if ser_mode and not quick:
@@ -2762,6 +3947,8 @@ def fetch_pool(quick=False):
             tb_future = _FX.submit(fetch_tieba_pool, True)
         if int(sget("xhh_weight") or 15) > 0:
             xhh_future = _FX.submit(fetch_xhh_pool, True)
+        if int(sget("live_weight") or 25) > 0:
+            live_future = _FX.submit(fetch_live_pool, True)
         # 快速开屏搜索词与榜单阶段同时开跑(此前先等榜单完成再搜, 两段串行拖慢首屏)
         kws = []
         if ser_mode:
@@ -2785,6 +3972,8 @@ def fetch_pool(quick=False):
             tb_future = _FX.submit(fetch_tieba_pool, False)
         if int(sget("xhh_weight") or 15) > 0:
             xhh_future = _FX.submit(fetch_xhh_pool, False)
+        if int(sget("live_weight") or 25) > 0:
+            live_future = _FX.submit(fetch_live_pool, False)
         if sget("bili_follow_emph") == "1":
             fol_future = _FX.submit(fetch_following_videos)
     # --- 偏好词引擎(提前并行提交): 用户偏好备注=最高优先级的主动意图 ---
@@ -2949,6 +4138,22 @@ def fetch_pool(quick=False):
             names.append("小黑盒×%d" % len(xhh_items))
         elif xhh_errs and not quick:
             errors += xhh_errs
+
+    # --- B站直播源(v0.3.1.51): 关注的人正在直播 + 热门推荐, 独立平台「B站直播」进信息流 ---
+    # 与贴吧/小黑盒同批消费; 权重 0 时连抓取都不做(省一次直播接口请求)。
+    if int(sget("live_weight") or 25) > 0:
+        if live_future:
+            live_items, live_errs = live_future.result()
+        else:
+            live_items, live_errs = fetch_live_pool(quick=quick)
+        for x in live_items:
+            if x["key"] not in seen and len(items) < 400:
+                seen[x["key"]] = 1
+                items.append(x)
+        if live_items:
+            names.append("B站直播×%d" % len(live_items))
+        elif live_errs and not quick:
+            errors += live_errs
 
     if sget("bili_follow_emph") == "1":
         if not quick:
@@ -3298,6 +4503,196 @@ def call_llm(messages, max_tokens=1200, temperature=0.3):
     usage = data.get("usage") or {}
     record_usage(usage)
     return data["choices"][0]["message"]["content"], usage
+
+
+# ---- 让 AI「先想再改设置」(v0.3.1.62) -------------------------------------
+# deepseek-flash 默认就会吐 reasoning_content, 所以「关掉思考」必须显式发
+# thinking.disabled, 只靠不发参数是关不掉的(实测: plain 请求 reasoning_tokens 也是 39)。
+CHAT_EFFORT_TOKENS = {"off": 500, "low": 700, "mid": 900, "high": 1400}
+CHAT_EFFORT_PARAM = {"low": "low", "mid": "medium", "high": "high"}
+
+
+def call_llm_plan(messages, effort="mid"):
+    """改设置专用的模型调用: effort 控制思考强度, 返回 (content, 思考字符数, usage)。"""
+    eff = effort if effort in ("off", "low", "mid", "high") else "mid"
+    payload = {"model": sget("ai_model"), "messages": messages,
+               "max_tokens": CHAT_EFFORT_TOKENS[eff], "temperature": 0.1}
+    if eff == "off":
+        payload["thinking"] = {"type": "disabled"}
+    else:
+        payload["reasoning_effort"] = CHAT_EFFORT_PARAM[eff]
+    req = urllib.request.Request(
+        sget("ai_base").rstrip("/") + "/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json",
+                 "Authorization": "Bearer %s" % sget("ai_key")})
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    usage = data.get("usage") or {}
+    record_usage(usage)
+    msg = (data.get("choices") or [{}])[0].get("message") or {}
+    return (msg.get("content") or "",
+            len(msg.get("reasoning_content") or ""), usage)
+
+
+# 只允许模型改这些键 —— 其它一律丢弃, 免得它顺手改到抓取/数据类设置
+_CHAT_PLAN_ENUMS = {
+    "theme": {"dark", "light"},
+    "layout": {"single", "dual", "big"},
+    "cover": {"s", "m", "l", "xl"},
+    "font": {"small", "medium", "large"},
+    "reason": {"hide", "show"},
+    "srcacc": {"0", "1"},
+    "mode": {"严格", "标准", "宽松", "严肃"},
+}
+_CHAT_PLAN_WEIGHTS = {"bili_weight", "tb_weight", "xhh_weight", "live_weight"}
+
+# 模型只能看到"当前设置"，看不到"刚才改成了什么"。用户说「换回去」时它无从下手，
+# 只能回一句"你自己去设置里点"。所以每次真的改了东西就记一笔现状 → 旧值。
+# 键 → 上面 cur 里对应的中文名（weights 那几项在 cur 里是带"占比"的）
+_CHAT_PLAN_CURKEY = {
+    "theme": "主题", "layout": "信息流布局", "cover": "封面大小", "font": "字体",
+    "reason": "推荐理由", "srcacc": "来源标识跟随强调色", "accent": "强调色",
+    "mode": "过滤档位", "bili_weight": "B站占比", "tb_weight": "贴吧占比",
+    "xhh_weight": "小黑盒占比", "live_weight": "B站直播占比",
+    "live_min_viewers": "直播人气门槛", "live_only_followed": "直播只看关注",
+}
+_CHAT_PLAN_LAST_TTL = 600      # 10 分钟内的「换回去」才认它；隔很久再说不该套到远古操作上
+
+
+def _chat_plan_sanitize(actions):
+    out = []
+    for a in actions or []:
+        if not isinstance(a, dict):
+            continue
+        k = str(a.get("k") or "").strip()
+        v = a.get("v")
+        if k in _CHAT_PLAN_ENUMS:
+            if str(v) in _CHAT_PLAN_ENUMS[k]:
+                out.append({"k": k, "v": str(v)})
+        elif k in _CHAT_PLAN_WEIGHTS:
+            try:
+                n = int(float(v))
+            except Exception:
+                continue
+            out.append({"k": k, "v": max(0, min(100, n))})
+        elif k == "live_min_viewers":
+            try:
+                n = int(float(v))
+            except Exception:
+                continue
+            out.append({"k": k, "v": max(0, min(10000000, n))})
+        elif k == "live_only_followed":
+            on = str(v).strip().lower() in ("1", "true", "yes", "on", "开", "是", "只看关注")
+            out.append({"k": k, "v": 1 if on else 0})
+        elif k == "accent":
+            s = str(v or "").strip().lower()
+            if re.match(r"^#[0-9a-f]{6}$", s):
+                out.append({"k": k, "v": s})
+    return out[:8]      # 一句话最多改 8 项, 多了多半是模型在瞎编
+
+
+def chat_plan(text, effort="mid", prefs=None, weights=None, live=None, history=None):
+    """把一句自然语言交给模型理解成设置改动; 模型不可用时回 ok=False, 让前端退回本地规则。
+
+    history: 本次会话最近的对话（从旧到新）。必须带 —— 「换回去」「再大一点」这类话
+    离开上下文就没有意义，只给当前设置的话模型只能反问或瞎猜。
+    """
+    if not ai_ok():
+        return {"ok": False, "error": "no_ai"}
+    prefs, weights, live = prefs or {}, weights or {}, live or {}
+    cur = {
+        "主题": prefs.get("theme"), "信息流布局": prefs.get("layout"),
+        "封面大小": prefs.get("cover"), "字体": prefs.get("font"),
+        "推荐理由": prefs.get("reason"), "来源标识跟随强调色": prefs.get("srcacc"),
+        "强调色": prefs.get("accent"), "过滤档位": sget("mode"),
+        "B站占比": weights.get("B站"), "贴吧占比": weights.get("贴吧"),
+        "小黑盒占比": weights.get("小黑盒"), "B站直播占比": weights.get("B站直播"),
+        "直播人气门槛": live.get("min_viewers"), "直播只看关注": live.get("only_followed"),
+    }
+    # 上一轮真改过什么（10 分钟内有效）—— 给「换回去」一个能落地的依据
+    last = []
+    try:
+        raw = sget("chat_plan_last")
+        obj = json.loads(raw) if raw else {}
+        if isinstance(obj, dict) and (time.time() - float(obj.get("ts") or 0)) < _CHAT_PLAN_LAST_TTL:
+            last = obj.get("items") if isinstance(obj.get("items"), list) else []
+    except Exception:
+        last = []
+
+    hist = ""
+    for h in (history or [])[-8:]:
+        if not isinstance(h, dict):
+            continue
+        c = str(h.get("content") or "").strip()
+        if not c:
+            continue
+        hist += ("用户: " if h.get("role") == "user" else "助手: ") + c[:200] + "\n"
+
+    sys_prompt = (
+        "你在帮用户改一个信息聚合软件的设置。只输出一个 JSON 对象, 不要解释、不要代码块:\n"
+        '{"setting": true, "say": "20 字内的中文回执", "actions": [{"k": "键", "v": 值}]}\n'
+        "setting: 这句是不是在说界面/设置本身。不是设置请求(问内容、闲聊)就 setting=false、"
+        "actions 留空、say 留空 —— 系统会把这句交给普通聊天。\n"
+        "可用键: theme=dark|light, layout=single|dual|big, cover=s|m|l|xl, "
+        "font=small|medium|large, reason=hide|show, srcacc=0|1, "
+        "mode=严格|标准|宽松|严肃, accent=#rrggbb, "
+        "bili_weight/tb_weight/xhh_weight/live_weight=0..100 整数, "
+        "live_min_viewers=整数, live_only_followed=0|1。\n"
+        "规矩: 用户只提某项就只改那项; 一句话里有多条要求就全部列进 actions; "
+        "拿不准别猜, actions 留空并在 say 里问一句。\n"
+        "相对说法必须换算成具体值(对照上面的当前设置): 「字号大一点/调大」= 往上走一档"
+        "(small→medium→large), 「调到最大」= large; 「封面大一点」同理; "
+        "占比「高一点/调高」= 当前值 +10, 「低一点」= 当前值 -10(限制在 0..100); "
+        "「全都要」「都调高」这类要分别列出每一项。"
+        "「换回去/改回来/恢复原样/退回去」= 把下面『上一轮改过的设置』逐项改回 old 值; "
+        "上一轮没有记录就 actions 留空, 在 say 里问一句是哪一项。"
+        "「再大一点/再高一点」= 在**当前值**基础上再走一档, 不是回到默认值。"
+    )
+    ctx = ""
+    if hist:
+        ctx += "最近对话(从旧到新):\n" + hist
+    if last:
+        ctx += "上一轮改过的设置: " + json.dumps(last, ensure_ascii=False) + "\n"
+    messages = [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": "当前设置: " + json.dumps(cur, ensure_ascii=False)
+         + "\n" + ctx + "用户说: " + str(text)},
+    ]
+    try:
+        content, rchars, _usage = call_llm_plan(messages, effort)
+    except Exception as e:
+        return {"ok": False, "error": "AI 调用失败: %s" % e}
+    obj = {}
+    try:
+        obj = llm_json(content)
+    except Exception:
+        obj = {}        # 模型没按格式吐 JSON: 当作"没读懂", 交前端回退本地规则
+    if not isinstance(obj, dict):
+        obj = {}
+    acts = _chat_plan_sanitize(obj.get("actions"))
+    # 老模型不一定吐 setting, 缺省按"有没有动作"推断 —— 有动作就一定是设置请求。
+    # 也别直接 bool(): 模型常把布尔值写成字符串, bool("false") 会是 True。
+    sv = obj.get("setting")
+    if isinstance(sv, bool):
+        is_setting = sv
+    elif sv is None:
+        is_setting = bool(acts)
+    else:
+        is_setting = str(sv).strip().lower() in ("1", "true", "yes", "是", "对")
+    if acts:
+        items = []
+        for a in acts:
+            ck = _CHAT_PLAN_CURKEY.get(a["k"])
+            items.append({"k": a["k"], "name": ck or a["k"],
+                          "old": cur.get(ck, "") if ck else "", "new": a["v"]})
+        try:
+            sset("chat_plan_last", json.dumps({"ts": time.time(), "items": items},
+                                              ensure_ascii=False))
+        except Exception:
+            pass        # 记不上就只是"换回去"不好使, 不能因此让这次改动失败
+    return {"ok": True, "setting": is_setting, "say": str(obj.get("say") or "")[:80],
+            "actions": acts, "effort": effort, "reasoning_chars": rchars}
 
 
 def llm_stream(messages, max_tokens=1200, on_reasoning=None):
@@ -4899,6 +6294,9 @@ def account_cookie():
 
 
 def bili_get(url):
+    # v0.3.1.66: 账号类接口(登录态/未读/收藏/标签/播放地址)也排一下队。这里只拖延不拒绝 ——
+    # 被限流挡回去会让登录态误判成"未登录", 那比慢 200 毫秒糟得多。
+    _net_pace("bili-api", 0.25)
     req = urllib.request.Request(url, headers=dict(ACCOUNT_HEADERS, Cookie=account_cookie()))
     return json.loads(urllib.request.urlopen(req, timeout=10).read().decode("utf-8"))
 
@@ -5295,6 +6693,262 @@ def fetch_following_videos(max_up=20, per_up=30, total_cap=60):
     return items[:total_cap], ""
 
 
+# ---------------------------------------------------------------- B站直播(v0.3.1.51)
+# 用户要求: 内容源里加「B站直播」(默认占比 25, 与小黑盒/贴吧同档), 并有独立直播页;
+# 信息流里要能刷到**关注的人正在直播**。
+# 接口探测结论(本机实测):
+#   ① Referer/Origin 必须是 https://live.bilibili.com/ —— 缺了直接吃风控 code=-352;
+#   ② /xlive/web-interface/v1/index/getList?platform=web → data.room_list(模块数组)+recommend_room_list;
+#   ③ /room/v1/room/get_user_recommend → data 直接是房间数组(上面的接口抽风时兜底);
+#   ④ /room/v1/Room/get_status_info_by_uids (POST {"uids":[...]}) → {uid: room}, 带 live_status 判断在播;
+#   ⑤ second/getList 与 getListByArea 需要 wbi 签名, 返回 -352 —— 不用它们。
+LIVE_PLATFORM = "B站直播"
+LIVE_API = "https://api.live.bilibili.com"
+LIVE_HEADERS = dict(ACCOUNT_HEADERS, Referer="https://live.bilibili.com/",
+                    Origin="https://live.bilibili.com",
+                    Accept="application/json, text/plain, */*")
+_live_cache = {"ts": 0.0, "data": None}
+_live_lock = threading.Lock()
+_live_last_fetch = 0
+_live_fetch_total = 0
+
+
+def live_api(path, params=None, body=None, timeout=10):
+    """直播接口 GET/POST(带登录 Cookie)。返回 data 字段; code!=0 时抛异常。"""
+    url = LIVE_API + path
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    payload = json.dumps(body).encode("utf-8") if body is not None else None
+    hdr = dict(LIVE_HEADERS)
+    if account_cookie():
+        hdr["Cookie"] = account_cookie()   # 登录后个人化推荐更准; 未登录也能出热门
+    if payload is not None:
+        hdr["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=payload, headers=hdr)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        d = json.loads(resp.read().decode("utf-8", "ignore"))
+    if d.get("code") != 0:
+        raise RuntimeError("code=%s %s" % (d.get("code"), (d.get("message") or "")[:60]))
+    return d.get("data")
+
+
+def _live_roomid(room):
+    """房间号: 列表接口给 roomid, 状态接口给 room_id, 个别模块只给 link("/24011597?hotRank=0")。"""
+    try:
+        rid = room.get("roomid") or room.get("room_id")
+        if not rid:
+            link = str(room.get("link") or "")
+            rid = link.strip("/").split("?")[0].split("/")[0]
+        return int(rid or 0)
+    except Exception:
+        return 0
+
+
+def _live_item(room, following=False, src="直播"):
+    """直播房间 → 信息流条目(字段与视频条目对齐, 下游筛选/排序/卡片无需特判)。
+
+    语义差别:
+      views   = 人气值(排序/展示用, 不是播放量);
+      pubdate = 抓取时刻 —— 直播是「此刻正在发生」, 用开播时间当发布日期会被
+                m_max_age_months / 资讯24h 那套窗口误杀, 关注的人那套月数窗也会误判;
+      live_time = 真实开播时间戳(卡片显示「开播 N 分钟前」用)。
+    """
+    roomid = _live_roomid(room)
+    uid = int(room.get("uid") or 0)
+    cover = (room.get("user_cover") or room.get("cover") or room.get("keyframe")
+             or room.get("system_cover") or "")
+    try:
+        online = int(room.get("online") or 0)
+    except Exception:
+        online = 0
+    tags = (room.get("tags") or room.get("tag_name") or "").strip()
+    now = int(time.time())
+    try:
+        live_time = int(room.get("live_time") or 0)
+    except Exception:
+        live_time = 0
+    if live_time <= 0 or live_time > now:
+        live_time = now
+    url = "https://live.bilibili.com/%d" % roomid
+    return {
+        "key": url, "platform": LIVE_PLATFORM, "gid": "live", "src": src,
+        "title": (room.get("title") or "").strip() or "直播中",
+        "author": (room.get("uname") or "").strip() or "主播",
+        "author_mid": uid,
+        "desc": (tags or (room.get("area_v2_parent_name") or ""))[:200],
+        "cover": cover, "views": online, "likes": 0, "danmaku": 0, "reply": 0,
+        "duration": 0, "pubdate": now, "url": url,
+        "tname": room.get("area_v2_name") or room.get("area_name") or "",
+        "area": room.get("area_v2_parent_name") or room.get("areaName") or "",
+        "tag": tags[:80],
+        "roomid": roomid, "online": online, "live_time": live_time,
+        "live_status": 1, "is_live": True, "following": bool(following),
+    }
+
+
+def live_status_by_uids(mids):
+    """批量查「这些 UID 里谁正在直播」→ {uid: room}; 失败抛异常(由调用方兜底)。"""
+    ids = []
+    for m in mids or ():
+        try:
+            v = int(m)
+        except Exception:
+            continue
+        if v > 0:
+            ids.append(v)
+    if not ids:
+        return {}
+    data = live_api("/room/v1/Room/get_status_info_by_uids", body={"uids": ids[:100]})
+    out = {}
+    for k, room in (data or {}).items():
+        if not isinstance(room, dict):
+            continue
+        try:
+            uid = int(room.get("uid") or k)
+        except Exception:
+            continue
+        if int(room.get("live_status") or 0) != 1:
+            continue   # 有关注但没开播: 不进任何列表
+        out[uid] = room
+    return out
+
+
+def fetch_live_hot(limit=24):
+    """首页推荐直播(热门)。index/getList 的推荐模块为主, 抽风时退回 get_user_recommend。"""
+    rooms = []
+    try:
+        data = live_api("/xlive/web-interface/v1/index/getList", params={"platform": "web"})
+        for mod in (data or {}).get("room_list") or []:
+            for r in (mod or {}).get("list") or []:
+                if isinstance(r, dict):
+                    rooms.append(r)
+        for r in (data or {}).get("recommend_room_list") or []:
+            if isinstance(r, dict):
+                rooms.append(r)
+    except Exception:
+        rooms = []
+    if not rooms:
+        try:
+            data = live_api("/room/v1/room/get_user_recommend",
+                            params={"page": 1, "page_size": max(12, int(limit)), "source": 54})
+            rooms = [r for r in (data or []) if isinstance(r, dict)]
+        except Exception:
+            rooms = []
+    out, seen = [], set()
+    for r in rooms:
+        rid = _live_roomid(r)
+        if not rid or rid in seen:
+            continue
+        seen.add(rid)
+        out.append(_live_item(r, src="直播"))
+        if len(out) >= limit:
+            break
+    return out
+
+
+def live_filters():
+    """直播筛选档位(v0.3.1.57): (观众量门槛, 只显示关注的人的直播)。
+    门槛只对"热门直播"生效 —— 关注的主播本来就没几个, 再被人数门槛筛掉就成了"我关注的开播了却看不到"。"""
+    try:
+        mn = int(sget("live_min_viewers") or 0)
+    except Exception:
+        mn = 0
+    return max(0, mn), sget("live_only_followed") == "1"
+
+
+def _live_pass(it, mn, follow_only):
+    followed = bool(it.get("following"))
+    if follow_only and not followed:
+        return False
+    if mn and not followed and int(it.get("online") or 0) < mn:
+        return False
+    return True
+
+
+def fetch_live_pool(quick=False):
+    """直播源入信息流: 关注的人正在直播(src=关注, following=True) + 热门直播(src=直播)。
+    返回 (items, errors)。关注部分依赖本地关注 UID 缓存(与「关注的人投稿」同源), 未登录只出热门。"""
+    global _live_last_fetch, _live_fetch_total
+    items, errs, seen = [], [], set()
+    mn, follow_only = live_filters()
+
+    def push(it):
+        if not it.get("roomid") or it["key"] in seen:
+            return False
+        if not _live_pass(it, mn, follow_only):
+            return False
+        seen.add(it["key"])
+        items.append(it)
+        return True
+
+    mids, _names = following_identities()
+    if mids:
+        try:
+            for _uid, room in live_status_by_uids(mids).items():
+                push(_live_item(room, following=True, src="关注"))
+        except Exception as e:
+            errs.append("关注直播: " + str(e)[:80])
+    try:
+        for it in fetch_live_hot(limit=8 if quick else 24):
+            push(it)
+    except Exception as e:
+        errs.append("热门直播: " + str(e)[:80])
+    if not items:
+        if errs:
+            sset("live_error", errs[0])
+            return [], errs
+        # 全被筛选档位筛掉不算故障(别在左栏报"抓取失败")
+        _live_last_fetch = int(time.time())
+        sset("live_last_fetch", _live_last_fetch)
+        sset("live_error", "")
+        return [], []
+    _live_fetch_total += len(items)
+    _live_last_fetch = int(time.time())
+    sset("live_last_fetch", _live_last_fetch)
+    sset("live_error", "")
+    return items, []
+
+
+def live_snapshot(refresh=False, ttl=60):
+    """直播页数据: {followed, hot, ts, logged_in, need_login, error}。60 秒缓存, refresh 强刷。"""
+    now = time.time()
+    with _live_lock:
+        c = _live_cache
+        if not refresh and c["data"] and now - c["ts"] < ttl:
+            return dict(c["data"], cached=True)
+    followed, hot, errs = [], [], []
+    mids, _names = following_identities()
+    if mids:
+        try:
+            for _uid, room in live_status_by_uids(mids).items():
+                it = _live_item(room, following=True, src="关注")
+                if it.get("roomid"):
+                    followed.append(it)
+        except Exception as e:
+            errs.append("关注直播: " + str(e)[:80])
+    try:
+        hot = [it for it in fetch_live_hot(limit=24) if it.get("roomid")]
+    except Exception as e:
+        errs.append("热门直播: " + str(e)[:80])
+    fk = {it["key"] for it in followed}
+    hot = [it for it in hot if it["key"] not in fk]
+    # 与信息流同一套筛选档位, 免得"直播页有一堆、信息流里一条没有"
+    mn, follow_only = live_filters()
+    followed = [it for it in followed if _live_pass(it, mn, follow_only)]
+    hot = [it for it in hot if _live_pass(it, mn, follow_only)]
+    data = {"ok": bool(followed or hot), "followed": followed, "hot": hot,
+            "count": len(followed) + len(hot),
+            "followed_n": len(followed),
+            "min_viewers": mn, "only_followed": follow_only,
+            "logged_in": bool(account_cookie()),
+            "need_login": not bool(mids),
+            "error": "; ".join(errs)[:200],
+            "ts": int(now), "last_fetch": _live_last_fetch}
+    with _live_lock:
+        _live_cache.update(ts=now, data=data)
+    return dict(data, cached=False)
+
+
 def parse_scores(content):
     """从 LLM 输出中提取评分数组, 容错处理。"""
     try:
@@ -5577,7 +7231,8 @@ def _prewarm_loop():
             if not building and (n == 0 or n < PREWARM_MIN
                                  or time.time() - built_at > PREWARM_IDLE):
                 _prewarm_gen[0] += 1
-                build_universe(quick=False)
+                # v0.3.1.55: 走 kick_build 的单飞/合并, 别让预热和用户刷新各起一个构建
+                kick_build(quick=False)
         except Exception:
             pass
         time.sleep(PREWARM_TICK)
@@ -6343,7 +7998,13 @@ def extract_intent(msg):
                     "   漫画/资讯/直播/军事 之一; 只看→only, 加上→add, 关掉→remove\n"
                     "7) 想看点新领域/探索模式 → {\"action\":\"open_explore\"}\n"
                     "8) 想要今日简报/复盘今天看了什么 → {\"action\":\"digest\"}\n"
-                    "9) 其他闲聊/提问 → {\"action\":\"reply\",\"keywords\":[]}"},
+                    # 改界面/显示这类话不能当搜索: "帮我换个布局"曾被判成 search,
+                    # 回了句"已按你的要求刷「换个布局」相关视频"。设置通道在前端先跑,
+                    # 这里兜的是它没接住的残句(如"换回去"), 让它落到聊天而不是搜索。
+                    "9) 想改界面/显示设置(主题、单栏/双栏/大图、字号、封面、推荐理由、"
+                    "强调色、来源标识、平台占比、直播筛选) → "
+                    "{\"action\":\"reply\",\"keywords\":[]}; 这类交给设置通道, 别当搜索词\n"
+                    "10) 其他闲聊/提问 → {\"action\":\"reply\",\"keywords\":[]}"},
                 {"role": "user", "content": msg[:300]}], max_tokens=1500)
             d = json.loads(content)
             if isinstance(d, dict):
@@ -7682,24 +9343,28 @@ def machine_filter(items):
     _funnel_bump("fetched", len(items))
     seen_titles, out = set(), []
     for it in items:
-        if it.get("following"):
+        # v0.3.1.51 直播条目: 时间/播放量/时长窗天然不适用(pubdate=抓取时刻, views=人气, 无时长),
+        # 情绪/广告/fastText 也放宽 —— B站官方直播标题多为「【直播】…」式, 套视频那套会误杀。
+        # 拉黑/厌恶词/标题去重继续生效。
+        is_live = (it.get("platform") == "B站直播")
+        if it.get("following") and not is_live:
             if not it["pubdate"]:
                 _funnel_bump("follow_window")
                 continue   # 关注视频无发布时间 → 直接丢弃
             if fm and now - it["pubdate"] > fm * 30.44 * 86400:
                 _funnel_bump("follow_window")
                 continue   # 超出强调月数 → 直接丢弃(单独机制, 不符合规则不进池)
-        if not it.get("following"):
+        if not it.get("following") and not is_live:
             # 偏好词直搜结果不再豁免时间窗, 只按偏好专属窗判定(宽松档多给6个月, 其余与设定一致);
             # 关注的人走 bili_follow_months 单独机制(上面已判)。
             win = pref_age if it.get("pref_kw") else max_age
             if win and it["pubdate"] and now - it["pubdate"] > win * 30.44 * 86400:
                 _funnel_bump("pref_age" if it.get("pref_kw") else "age")
                 continue   # 只保留最近 N 个月内发布的内容
-        if news_fresh and it.get("pubdate") and _is_newsy(it) and now - it["pubdate"] > 86400:
+        if news_fresh and not is_live and it.get("pubdate") and _is_newsy(it) and now - it["pubdate"] > 86400:
             _funnel_bump("news")
             continue   # 时效分层: 资讯/热点只推24小时内(干货/教程不受此限)
-        if not it.get("following"):
+        if not it.get("following") and not is_live:
             views_known = it.get("views_known") is True or it.get("platform") == "B站"
             duration_known = it.get("duration_known") is True or it.get("platform") == "B站"
             if views_known:
@@ -7734,7 +9399,7 @@ def machine_filter(items):
                               " " + (it.get("tag") or "")).lower() for k in dkws):
             _funnel_bump("dislike")
             continue   # 厌恶备注关键词命中(含tag) → 直接剔除
-        if emotion:
+        if emotion and not is_live:
             why = _emo_bad(it)
             if not why and _ad_bad(it):
                 why = "广告"   # 广告识别查简介(硬标记/软标记≥2), 与情绪过滤共占漏斗
@@ -7744,7 +9409,7 @@ def machine_filter(items):
         # v0.3.1.43dsk 快速文本分析: 规则层没抓到的语义垃圾(引战/低质/标题党/阴阳怪气)
         # 交给本地 fastText 兜一遍。词表命中的上面已经拦了, 这里只处理"词表覆盖不到"的。
         # 只在 m_emotion 之后跑 —— 省一次模型调用, 也让漏斗计数各归各的。
-        if ft_enabled() and sget("ft_video") == "1":
+        if not is_live and ft_enabled() and sget("ft_video") == "1":
             _w = ft_scan([(it.get("title") or "") + " " + (it.get("desc") or "")], "video")[0]
             if _w:
                 _funnel_bump("ft")
@@ -7793,11 +9458,15 @@ def is_help_post(it):
     return any(k.lower() in text for k in HELP_POST_KWS)
 
 
-def rules_filter(items, skip_age=False, apply_blocks=True):
+def rules_filter(items, skip_age=False, apply_blocks=True, skip_windows=False):
     """机器规则过滤(保留原顺序, 用于显式搜索): 时间窗/播放量/时长/拉黑名单。
     skip_age=True 时跳过时间窗(主动搜索想找特定主题, 老内容也应出现)。
+    skip_windows=True 时连同播放量/时长窗一起跳过 —— 只给**显式搜索**用:
+    播放量/时长窗是"信息流推荐"的质量闸(m_min_views 之类), 套到主动搜索上会把冷门但
+    切题的B站视频全挡掉, 而贴吧/小黑盒没有播放量字段天然免疫 → 表现就是
+    "搜索里经常没有B站视频"(用户报过)。要筛播放量就不该用搜索找。
     apply_blocks=False 时跳过屏蔽类机制(负反馈/账号拉黑/厌恶词): 搜索默认不受用户屏蔽影响,
-    搜索词前缀 * 表示"保留屏蔽"(见 search_all)。播放量/时长/求助帖等质量窗不受此开关影响。"""
+    搜索词前缀 * 表示"保留屏蔽"(见 search_all)。求助帖规则不受这两个开关影响。"""
     if apply_blocks:
         items = negative_feedback_filter(items)
     min_views = int(sget("m_min_views") or 0)
@@ -7824,7 +9493,8 @@ def rules_filter(items, skip_age=False, apply_blocks=True):
                 continue   # 超出强调月数 → 直接丢弃(单独机制, 不符合规则不进池)
         if not skip_age and max_age and not it.get("following") and it["pubdate"] and now - it["pubdate"] > max_age * 30.44 * 86400:
             continue
-        if not it.get("following"):
+        # skip_windows: 显式搜索不套播放量/时长质量窗(见 docstring; 否则B站条目被全挡掉)
+        if not it.get("following") and not skip_windows:
             views_known = it.get("views_known") is True or it.get("platform") == "B站"
             duration_known = it.get("duration_known") is True or it.get("platform") == "B站"
             if views_known:
@@ -7902,17 +9572,21 @@ def _interleave3(a, b):
     return out
 
 
-def _local_pool_hits(terms, seen, limit=100):
-    """本地沉淀池(贴吧/小黑盒)分词命中: 任一token命中即算, 命中数多者优先/标题命中加权。
-    旧版要求整句连续子串命中 → 多词/短词查询几乎必空(跨平台搜索形同虚设)。"""
+def _local_pool_hits(terms, seen, limit=100, platforms=("贴吧", "小黑盒")):
+    """本地沉淀池分词命中: 任一token命中即算, 命中数多者优先/标题命中加权。
+    旧版要求整句连续子串命中 → 多词/短词查询几乎必空(跨平台搜索形同虚设)。
+    platforms: 参与兜底的平台。默认只兜贴吧/小黑盒(它们没有稳定可用的直搜接口);
+    传 ("B站",) 时给B站直搜失败的情况兜底 —— 见 _search_first_wave。"""
     toks = [t for t in {str(x).strip().lower() for x in (terms or [])} if len(t) >= 2][:12]
-    if not toks:
+    plats = [p for p in (platforms or ()) if p]
+    if not toks or not plats:
         return []
     try:
+        where = " OR ".join(["json LIKE ?"] * len(plats))
         rows = db().execute(
-            "SELECT json FROM items WHERE (json LIKE ? OR json LIKE ?) "
+            "SELECT json FROM items WHERE (" + where + ") "
             "ORDER BY fetched_at DESC LIMIT 3000",
-            ('%"platform": "贴吧"%', '%"platform": "小黑盒"%')).fetchall()
+            ['%"platform": "' + p + '"%' for p in plats]).fetchall()
     except Exception:
         return []
     scored = []
@@ -7958,6 +9632,11 @@ def _search_first_wave(q, apply_blocks=True):
                 bili.append(x)
         if not page:
             break   # 空页=直搜见底, 不再空翻
+    if not bili:
+        # B站直搜一条都没回来(风控 -412 / WBI 签名失效 / 断网 / 这词确实没视频):
+        # 用本地沉淀池已经收过的 B站 条目按词兜底。没有这一步, 搜索里就会一条B站视频都没有 ——
+        # 这正是用户报的"经常没有B站视频"。
+        bili = _local_pool_hits([q], seen, limit=60, platforms=("B站",))
     tb = []
     try:
         for x in tb_x.result() or []:
@@ -7969,7 +9648,8 @@ def _search_first_wave(q, apply_blocks=True):
     local = _local_pool_hits([q], seen)
     candidates = _interleave3(bili, tb + local)
     _annotate_following(candidates)
-    return rules_filter(candidates, skip_age=True, apply_blocks=apply_blocks)
+    return rules_filter(candidates, skip_age=True, apply_blocks=apply_blocks,
+                        skip_windows=True)
 
 
 def _search_expand_wave(q, used_terms, apply_blocks=True):
@@ -8006,7 +9686,8 @@ def _search_expand_wave(q, used_terms, apply_blocks=True):
             out.append(x)
     out.extend(_local_pool_hits(terms, seen))
     _annotate_following(out)
-    return rules_filter(out, skip_age=True, apply_blocks=apply_blocks), terms
+    return rules_filter(out, skip_age=True, apply_blocks=apply_blocks,
+                        skip_windows=True), terms
 
 
 def _prune_search_waves():
@@ -8104,6 +9785,11 @@ def search_all(q, offset=0, limit=30, refresh=False, sort="default"):
         finally:
             with _search_wave_lock:
                 w["building"] = False
+        # 首波一条都没搜到(接口失败/网络抖动/风控)时别把这个空结果缓存一小时:
+        # 否则同一个词接下来一小时里永远只剩贴吧。缩短到 2 分钟后重试。
+        if not w["items"]:
+            with _search_wave_lock:
+                w["ts"] = time.time() - SEARCH_WAVE_TTL + 120
     with _search_wave_lock:
         pool = w["items"]
         if sort in SEARCH_SORTS and sort != "default":
@@ -8185,6 +9871,8 @@ _universe = {"gen": 0, "items": [], "source": "", "offline": True, "ai": False,
              "partitions": "全部"}
 _uni_lock = threading.Lock()
 _uni_token = 0   # 设置版本令牌: 切分区等变更时+1, 旧构建结果作废
+_last_force_ts = 0.0   # v0.3.1.55: force_rebuild 合并窗口(见 force_rebuild)
+_force_pending = False
 _score_progress = {"done": 0, "total": 0, "ts": 0, "full": False}
 MAX_UNIVERSE = 2000   # 信息池上限(防内存无限增长); 持续追加到达上限后裁最旧头部
 
@@ -8451,6 +10139,7 @@ PLATFORMS = [
     ("B站", "bili_weight", 90),
     ("贴吧", "tb_weight", 25),
     ("小黑盒", "xhh_weight", 15),
+    ("B站直播", "live_weight", 5),    # v0.3.1.51 直播独立成源; v0.3.1.52 默认降到 5(用户要求)
 ]
 _PLATFORM_WKEYS = {p[1] for p in PLATFORMS}
 
@@ -8463,7 +10152,7 @@ def platform_weights():
             w = int(sget(key) or default)
         except Exception:
             w = default
-        out[name] = w if w in {0, 25, 50, 75, 100} else default
+        out[name] = w if 0 <= w <= 100 else default
     return out
 
 
@@ -8504,33 +10193,42 @@ def mix_sources(kept):
     total = sum(len(v) for v in mixed.values())
     if total == 0:
         return []
-    # credit 加权轮转: 每步 credit[n] += w[n], 选信用最高且有货的平台, 取后 credit -= Σw
-    # 平局时随机(不固定顺序), 让混排更"随机散布"
     W = float(sum(active.values()))
-    credit = {n: 0.0 for n in mixed}
-    pos = {n: 0 for n in mixed}
+    # 配额上限(v0.3.1.57): 每个平台最多出 round(total*w/W) 条(权重>0 至少 1 条)。
+    # 池子不够就**少出**, 绝不把别的平台空出来的名额补给它 —— 原来的 credit 轮转在
+    # 先把权重高的两路掏空后, 剩下的名额会被权重最低的那一路整段吃掉:
+    # 实测 27(B站)/14(小黑盒)/50(直播) 的池子会原样出成 27/14/50, 直播占 55%,
+    # 末尾连排 44 条。用户把直播档位设成 5% 却刷出一屏直播, 根因就在这里。
+    cap = {}
+    for n in mixed:
+        cap[n] = max(1, int(math.floor(total * active[n] / W + 0.5)))
+    # 均匀铺开(最大缺口法): 每步给各路加"应得份额" w/Σw, 取缺口最大的那路出队并扣 1。
+    # 这样 5% 的直播就是每 20 条上下一条, 不会因为 B站/小黑盒先掏空就把剩下的名额
+    # 全塞给它(旧的 credit 轮转实测会在末尾连排 44 条直播), 也不会在末尾堆一路。
+    share = {n: active[n] / W for n in mixed}
+    deficit = {n: 0.0 for n in mixed}
+    used = {n: 0 for n in mixed}
     out = []
-    last_platform, same_run = None, 0
-    for _ in range(total):
+    pos = {n: 0 for n in mixed}
+    while True:
         for n in mixed:
-            credit[n] += active[n]
-        cand = [n for n in mixed if pos[n] < len(mixed[n])]
+            deficit[n] += share[n]
+        # 每路都有自己的上限(前面按权重算好的 cap), 所以这里可以放心把能出的都出了:
+        # 池子偏科时最多把某一路堆到它的配额, 不会再出现"把剩下名额整段塞给最低权重那路"。
+        cand = [n for n in mixed if used[n] < min(len(mixed[n]), cap[n])]
         if not cand:
             break
-        # 平台比例不能以连续堆叠的方式体现: 只要还有其他平台候选, 同平台最多连2条。
-        spaced = [n for n in cand if not (n == last_platform and same_run >= 2)]
-        if spaced:
-            cand = spaced
-        best = max(credit.get(n, 0) for n in cand)
-        ties = [n for n in cand if credit[n] == best]
-        pick = random.choice(ties) if len(ties) > 1 else ties[0]
+        # 同平台不连排三条: 只要还有别的源能出, 就不让第三张连在一起(旧规则, 用户认过)。
+        if len(out) >= 2 and (out[-1].get("platform") or "B站") == (out[-2].get("platform") or "B站"):
+            lastp = out[-1].get("platform") or "B站"
+            alt = [n for n in cand if n != lastp]
+            if alt:
+                cand = alt
+        pick = max(cand, key=lambda n: deficit[n])
         out.append(mixed[pick][pos[pick]])
         pos[pick] += 1
-        credit[pick] -= W
-        if pick == last_platform:
-            same_run += 1
-        else:
-            last_platform, same_run = pick, 1
+        used[pick] += 1
+        deficit[pick] -= 1.0
     return _enforce_platform_spacing(out)
 
 
@@ -8592,6 +10290,57 @@ def _space_same_author(items, gap=_AUTHOR_SPACING_GAP):
             old = recent.popleft()
             recent_set.discard(old)
         out.append(it)
+    return out
+
+
+def _declump_cat(items, win=5, win_max=3, look=8, max_run=2):
+    """同分类轻度去扎堆(有界局部换位, 不做全局重排)。
+
+    用户反馈"一大堆同类型信息挤在一起": mix_sources 只管平台层间距(B站/贴吧/小黑盒),
+    平台内部完全不管, 所以同一分区/同一个吧的条目一多就成片出现。
+    为什么不是全局轮转重排: 试过按分类队列逐条挑(轮转), 两种分类条目数不相等时会把剩下
+    的同类条目全挤到计划尾部 —— 尾部变成单平台长带, serve 层防扎堆只能把它们全部暂缓,
+    一页吐不出几条, 反而变成"抓不到内容"(回归测试 '沉积带' 就是这么挂的)。
+    这里只做局部交换: 同一分类在最近 win 条里已出现 win_max 次时, 到后面 look 条内找一个
+    不同类的条目换上来; 换位后必须仍满足平台连排 <= max_run, 否则跳过。只换位不重排,
+    计划整体排序/热度分层/尾部构成都不动。"""
+    n = len(items)
+    if n < win or look < 1:
+        return list(items)
+    out = list(items)
+    cat = [_cat_key(it) for it in out]
+    plat = [(it.get("platform") or "B站") for it in out]
+
+    def _swap_ok(i, j):
+        """交换 i/j 后, 两点附近的平台连排是否仍 <= max_run(连排只可能被局部改动影响)。"""
+        lo = max(0, min(i, j) - max_run)
+        hi = min(n, max(i, j) + max_run + 1)
+        seg = plat[lo:hi]
+        seg[i - lo], seg[j - lo] = seg[j - lo], seg[i - lo]
+        run, last = 0, None
+        for p in seg:
+            run = run + 1 if p == last else 1
+            last = p
+            if run > max_run:
+                return False
+        return True
+
+    for i in range(n):
+        c = cat[i]
+        if cat[max(0, i - win + 1):i].count(c) < win_max:
+            continue
+        for j in range(i + 1, min(n, i + 1 + look)):
+            cj = cat[j]
+            if cj == c:
+                continue
+            if cat[max(0, i - win + 1):i].count(cj) >= win_max:
+                continue          # 换上来也是扎堆, 没意义
+            if not _swap_ok(i, j):
+                continue
+            out[i], out[j] = out[j], out[i]
+            cat[i], cat[j] = cat[j], cat[i]
+            plat[i], plat[j] = plat[j], plat[i]
+            break
     return out
 
 
@@ -9185,6 +10934,13 @@ def planned_feed(acts, new_session=False, exclude=None):
         if full:
             sc = scores.get(it["key"])
             if not sc:
+                if it.get("is_live"):
+                    # 直播是「此刻正在发生」的内容: 等 AI 评分落库时直播可能已经结束,
+                    # 所以不受「未评分不展示」门禁拦(与偏好词同理, 属于即时性豁免)。
+                    it["reason"] = "正在直播"
+                    it["interest"] = it.get("interest") or 7
+                    keep.append(it)
+                    continue
                 if not it.get("pref_kw"):
                     dropped += 1
                     continue   # 门禁: 未评分不展示(后台渐进补评分)
@@ -9299,6 +11055,7 @@ def planned_feed(acts, new_session=False, exclude=None):
     order = mix_sources(order)   # 最终出口再按平台权重重排, 避免槽位套餐冲淡贴吧/小黑盒比例
     order = _author_quota_hold(order)   # 同作者配额: 超出的留池, 后续构建分批放出(视觉降重)
     order = _space_same_author(order)   # 同作者/相似标题打散: 不再相邻出现
+    order = _declump_cat(order)         # 同分类(分区/吧/话题)局部去扎堆: 不再"一堆同类挤在一起"
     # 跨会话防重复: 新会话前5条强制避开上次会话末尾的类型
     if avoid and len(order) > 5:
         head, rest, used = [], [], set()
@@ -9485,21 +11242,76 @@ def _session_state(sid):
 
 
 _last_full_build_ts = 0   # 上次完整补池完成时间(节流冗余全量抓取)
+_BUILD_PENDING = False    # v0.3.1.55: 构建忙时收到的补池请求, 合并成"跑完再补一次"
+# 构建节流(v0.3.1.59): 只有"忙/不忙"两个状态不够 —— 滚动时 serve_chunk 每 5~10 秒
+# 就会因为"未送出条目不够"再拉一次补池(旧日志实测 5 秒一次), 每次都要把贴吧/小黑盒/
+# 搜索源全打一遍。这既是贴吧风控的源头, 也让缓存里明明有存货时反复空转。
+# 现在非用户发起的补池有最小间隔; 连续几次什么都没抓到时按 streak 退避。
+_BUILD_MIN_GAP = 25
+_next_build_ts = 0.0
+_build_empty_streak = 0
 
 
-def build_universe(quick=False):
+def _build_backoff(added_n):
+    """一次构建结束后决定下一次最早什么时候能再补。
+
+    added_n 为 0(全重复/全部源失败)时越退越远, 最多 3 分钟 —— 这时候快速重试
+    只会继续打已有且已经被拒的源, 除了喂风控没有别的作用。"""
+    global _next_build_ts, _build_empty_streak
+    now = time.time()
+    if added_n is None:          # 作废/异常: 只按最小间隔来, 不改退避档位
+        _next_build_ts = now + _BUILD_MIN_GAP
+        return
+    if added_n > 0:
+        _build_empty_streak = 0
+        _next_build_ts = now + _BUILD_MIN_GAP
+        return
+    _build_empty_streak = min(_build_empty_streak + 1, 6)
+    _next_build_ts = now + min(_BUILD_MIN_GAP + 25 * _build_empty_streak, 180)
+
+
+def kick_build(quick=True, pending=False):
+    """补池入口(唯一): 单飞 + 合并。
+    为什么要收敛到一个入口: 原来刷新按钮、滚动补池、见底补池、冷启动各自
+    `Thread(target=build_universe)`, 而它们读到的 building 是快照里的旧值 ——
+    两次点击就能起两个构建, 同时对贴吧发两串请求。这正是"看起来在刷站"的来源之一。
+    现在先原子占位再起线程; 忙时只记一个 pending, 等当前这次跑完自动补一次。"""
+    global _BUILD_PENDING
+    # 非用户发起的补池(滚动/见底/开屏轮询)受节流约束; pending=True 是"用户按了刷新/
+    # 改了设置", 必须立刻生效。
+    if not pending and time.time() < _next_build_ts:
+        return False
+    with _uni_lock:
+        if _universe["building"]:
+            # pending=True 只给"用户明确要一次"(刷新/改设置): 这类请求不能丢。
+            # 滚动补池/开屏轮询传 False —— 它们马上还会再来, 丢掉正好省一次抓取,
+            # 也避免"构建刚结束又被轮询立刻拉起"的死循环。
+            if pending:
+                _BUILD_PENDING = True
+            return False
+        _universe["building"] = True          # 先占位, 线程里按已占位启动
+        _universe["mode"] = "quick" if quick else "full"
+    threading.Thread(target=build_universe, kwargs={"quick": quick, "_claimed": True},
+                     daemon=True).start()
+    return True
+
+
+def build_universe(quick=False, _claimed=False):
     """构建新世代(绑定当前设置令牌)。quick=True 只取2个源秒开屏, 之后后台线程补全。
     令牌变更(切分区等)后, 正在跑的旧构建结果自动作废, 不会覆盖新设置。
     注: 原"首批≥10条立即发布"的特殊首页机制已删除——刷新/启动时全部内容统一
     走同一套 抓取→入库→bake→发布 管线, 不再有前几条的捷径(它导致刷新后内容不变)。"""
+    global _BUILD_PENDING    # finally 里会读它并清掉; 不声明就成局部变量, UnboundLocalError
     with _uni_lock:
-        if _universe["building"]:
-            return None
-        _universe["building"] = True
+        if not _claimed:
+            if _universe["building"]:
+                return None
+            _universe["building"] = True
         _universe["mode"] = "quick" if quick else "full"   # full 构建期间不被 quick 打断
         token = _uni_token
         _funnel_bump("build_quick" if quick else "build_full")
 
+    added_n = None   # 本次真正新增的池内条目数(给节流退备用; None=作废/异常, 不算空转)
     try:
         payload = fetch_pool(quick=quick)
         if not payload["offline"]:
@@ -9550,6 +11362,7 @@ def build_universe(quick=False):
                 new_items = list(_universe["items"]) + added
                 if len(new_items) > MAX_UNIVERSE:
                     new_items = new_items[len(new_items) - MAX_UNIVERSE:]
+            added_n = len(added)
             # built_at 仅在产出新条目时刷新: 空 quick 构建(抓回全是重复)不再推迟补池,
             # 否则薄池状态会被"空构建刷新时间戳"饿死, 用户始终等不到全量补池。
             _universe.update(gen=_universe["gen"] + 1, items=new_items, source=source,
@@ -9574,15 +11387,24 @@ def build_universe(quick=False):
                         if not _universe["building"]:
                             break
                     time.sleep(0.05)
-                build_universe(quick=False)
+                # pending=True: 刚跑完的 quick 构建已把节流闸门推到 25 秒后,
+                # 这次全量是"开屏后补全", 属于必须跑的那一次, 不能被节流吃掉。
+                kick_build(quick=False, pending=True)
             threading.Thread(target=_full, daemon=True).start()
         return _universe["gen"]
     except Exception:
         return None
     finally:
+        # v0.3.1.55: 标志必须无条件清掉 —— 旧实现"令牌变了就不清", 于是一次设置变更
+        # 会把 building 永久钉死在 True, 后面所有补池直接 return: 池子再也不动。
+        # 之前靠刷新分支里手动 `building=False` 兜这个坑, 结果又和并发构建撞在一起。
         with _uni_lock:
-            if token == _uni_token:   # 仍是最新设置版本才允许清标志
-                _universe["building"] = False
+            _universe["building"] = False
+            again = _BUILD_PENDING
+            _BUILD_PENDING = False
+        _build_backoff(added_n)
+        if again:
+            kick_build(quick=quick, pending=True)
 
 
 def feed_refresh_item(key, q=""):
@@ -9703,12 +11525,42 @@ def feed_refresh_item(key, q=""):
 
 
 def force_rebuild():
-    """设置变更(切分区)时调用: 作废旧构建并在最新设置下立即重建。"""
-    global _uni_token
+    """设置变更(切分区)时调用: 作废旧构建并在最新设置下立即重建。
+    v0.3.1.55: 加 2 秒合并窗口 —— 拖一次占比滑条会连着 POST 好几个值, 每个都触发一次
+    重建(=3 个贴吧请求)。窗口内的后续调用只挂一个 1.5 秒后的补建, 最终状态照样是
+    最新设置, 但不会一条一条地连发。"""
+    global _uni_token, _last_force_ts, _force_pending
+    now = time.time()
     with _uni_lock:
         _uni_token += 1
-        _universe["building"] = False   # 让新构建插队
-    build_universe(quick=True)
+        too_soon = now - _last_force_ts < 2.0
+        _last_force_ts = now
+        if too_soon:
+            if _force_pending:
+                return          # 已经排了一次合并重建, 别叠
+            _force_pending = True
+    if too_soon:
+        threading.Timer(1.5, _force_later).start()
+        return
+    kick_build(quick=True, pending=True)
+    # 等这次(或正在跑的那次)构建落地, 最多 8 秒: 权重/筛选改完要立刻生效, 否则前端
+    # restartFeed 拿到的还是旧池子的混排结果(改前这里是同步重建, 语义一致)。
+    # 等不到就算了 —— 构建还在后台跑, 请求不该被无限期挂住(单飞保证不会重复抓)。
+    end = time.time() + 8.0
+    while time.time() < end:
+        with _uni_lock:
+            if not _universe["building"]:
+                return
+        time.sleep(0.05)
+
+
+def _force_later():
+    global _force_pending
+    _force_pending = False
+    try:
+        kick_build(quick=True, pending=True)
+    except Exception:
+        pass
 
 
 _cold_last_save = [0]   # 预缓存节流游标
@@ -9796,10 +11648,11 @@ def serve_chunk(offset=0, limit=30, q="", request_id="", plat=""):
     # 缓冲和流对不上, 快速滑动时很快就没得看。放在这里过滤, 流里就只有这一个平台。
     if plat:
         items = [it for it in items if (it.get("platform") or "B站") == plat]
-    if not items and not building:
+    if not items:
         # 冷启动预缓存: 有缓存 → 注入空池并立即吐出(后台同时构建完整池); 没有才纯等待
         preheated = _cold_start_preheat()
-        threading.Thread(target=build_universe, kwargs={"quick": True}, daemon=True).start()
+        if not building:
+            kick_build(quick=True)
         if not preheated:
             return {"ok": True, "items": [], "building": True, "gen": uni["gen"],
                     "source": uni["source"], "offline": uni["offline"],
@@ -9834,6 +11687,7 @@ def serve_chunk(offset=0, limit=30, q="", request_id="", plat=""):
         # 单平台池不启用(否则吞吐退化为每页2条轮询)。
         plat_multi = len({(it.get("platform") or "B站") for it in acts}) > 1
         spaced_defer = 0
+        deferred = []
         last_p, run = sess.get("last_p"), sess.get("last_run", 0)   # 跨页持续: 上页末尾的连排不算清零
         while idx < len(acts) and len(chunk) < limit:
             it = acts[idx]
@@ -9841,12 +11695,28 @@ def serve_chunk(offset=0, limit=30, q="", request_id="", plat=""):
                 p = it.get("platform") or "B站"
                 if plat_multi and p == last_p and run >= 2:
                     spaced_defer += 1
+                    deferred.append(idx)
                     idx += 1
                     continue
                 chunk.append(it)
                 sess["keys"].add(it.get("key"))
                 last_p, run = (p, run + 1) if p == last_p else (p, 1)
             idx += 1
+        # 救急: 暂缓把本页压到只剩一两条时, 宁可放宽连排也要把池里已有的内容发出去。
+        # 池子见底/只剩单平台新批时, 死守"同平台最多连2条"会让每页只吐 1-2 条, 用户看到的
+        # 是一直"正在准备内容", 而池子里明明还有几十条没发 —— 这就是"有时候抓不到信息"。
+        # 正常情况(本页能吐满)不走这里, 间距规则照旧。
+        if spaced_defer and len(chunk) <= 2:
+            for k in deferred:
+                if len(chunk) >= limit:
+                    break
+                it = acts[k]
+                if it.get("key") in sess["keys"]:
+                    continue
+                p = it.get("platform") or "B站"
+                chunk.append(it)
+                sess["keys"].add(it.get("key"))
+                last_p, run = (p, run + 1) if p == last_p else (p, 1)
         sess["last_p"], sess["last_run"] = last_p, run
         consumed_end = idx
         sess["cursor"] = consumed_end
@@ -9855,8 +11725,7 @@ def serve_chunk(offset=0, limit=30, q="", request_id="", plat=""):
             if len(chunk) < limit and not building \
                     and time.time() - uni["built_at"] > 10:
                 need_full = time.time() - _last_full_build_ts > 90
-                threading.Thread(target=build_universe,
-                                 kwargs={"quick": not need_full}, daemon=True).start()
+                kick_build(quick=not need_full)
             if len(chunk) < limit:
                 building = True   # 前端按"构建中"静默轮询续上, 不显示"已到底"
     else:
@@ -9873,15 +11742,13 @@ def serve_chunk(offset=0, limit=30, q="", request_id="", plat=""):
     if not q and not building and chunk and unserved < 150 \
             and time.time() - uni["built_at"] > 10:
         need_full = unserved < 60 or time.time() - _last_full_build_ts > 90
-        threading.Thread(target=build_universe,
-                         kwargs={"quick": not need_full}, daemon=True).start()
+        kick_build(quick=not need_full)
     if not chunk:
         # 到底: 未在构建且距上次构建>5s → 后台抓新内容追加到池(持续无限滚动, 不清空);
         # 同样按缺量决定 quick/全量(池子见底时缺得多, 优先全量)。
         if not building and time.time() - uni["built_at"] > 5:
             need_full = time.time() - _last_full_build_ts > 90
-            threading.Thread(target=build_universe,
-                             kwargs={"quick": not need_full}, daemon=True).start()
+            kick_build(quick=not need_full)
             building = True
         if not chunk:
             # 最近发生过平台防扎堆暂缓: 构建补充中, 让前端继续轮询, 不误报"已到底"
@@ -10017,6 +11884,11 @@ def serve_chunk(offset=0, limit=30, q="", request_id="", plat=""):
                 except Exception:
                     pass
     next_offset = consumed_end
+    # 实际吐出的平台配比(滚动窗口 200 条): 档位说 5% 就应该是 5% 上下, 供状态接口当场核对
+    if chunk and not q:
+        with _mix_lock:
+            for it in chunk:
+                _mix_recent.append(it.get("platform") or "B站")
     return {"ok": True, "items": chunk, "building": building, "gen": uni["gen"],
             "source": uni["source"], "offline": uni["offline"],
             "ai": uni["ai"], "mode": uni["mode"], "account": uni["account"],
@@ -10115,8 +11987,7 @@ def ui_version():
     """前端文件指纹(内容hash): 前端据此检测服务端已更新并自动刷新页面。"""
     import hashlib
     h = hashlib.md5()
-    for name in ("index.html", "app.js", "style.css",
-                 "new/index.html", "new/app.js", "new/style.css"):
+    for name in ("index.html", "app.js", "style.css"):
         try:
             with open(web_path(name), "rb") as f:
                 h.update(f.read())
@@ -10385,8 +12256,6 @@ def _server_port():
 
 # 前端图标贴图(web/icons/*.svg 与 web/icons/png/*.png)的静态白名单: 只放行这两种形状的路径, 杜绝目录穿越
 _ICON_PATH_RE = re.compile(r"^/icons/(?:png/[a-z]+-(?:24|48|96|192)\.png|[a-z]+\.svg)$")
-# 新版界面(web/new/)的静态资源: 只允许 new/ 下、无子目录、白名单扩展名的文件, 防目录穿越
-_NEW_ASSET_RE = re.compile(r"^/new/[A-Za-z0-9_.-]+\.(?:js|css|png|svg|jpg|jpeg|ico|webp)$")
 
 
 def _assist_usage_snapshot():
@@ -10492,19 +12361,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_file("qrcode.js", "application/javascript")
         if path == "/style.css":
             return self.send_file("style.css", "text/css")
-        # ---- 新版界面(web/new/): 与旧版共用同一个后端与同一份数据, 两边可并排对比 ----
-        if path in ("/new", "/new/"):
-            return self.send_file("new/index.html", "text/html")
-        if path == "/ui":
-            return self.send_file("ui.html", "text/html")
-        if _NEW_ASSET_RE.match(path):
-            _ext = path.rsplit(".", 1)[-1].lower()
-            _ct = {"js": "application/javascript", "css": "text/css", "png": "image/png",
-                   "svg": "image/svg+xml", "jpg": "image/jpeg", "jpeg": "image/jpeg",
-                   "webp": "image/webp", "ico": "image/x-icon"}.get(_ext, "application/octet-stream")
-            return self.send_file(path[1:], _ct)
         if _ICON_PATH_RE.match(path):
             return self.send_file(path[1:], "image/svg+xml" if path.endswith(".svg") else "image/png")
+        if path == "/api/update/check":
+            return self.send_json(update_check())
+        if path == "/api/update/progress":
+            return self.send_json(update_progress())
         if path == "/api/search":
             q = qs.get("q", [""])[0].strip()
             offset = int(qs.get("offset", ["0"])[0] or 0)
@@ -10531,10 +12393,12 @@ class Handler(BaseHTTPRequestHandler):
                 # _uni_token +1 同时作废旧构建、并让 _feed_plan 的缓存 key 失效 → 重新规划顺序。
                 with _uni_lock:
                     _uni_token += 1
-                    _universe["building"] = False
+                # 用户主动刷新 = 明确要求重试贴吧: 解掉 403 冷却(否则要干等 10 分钟)。
+                # 60 秒内只放行一次, 连点不会把百度风控招得更狠。
+                _tb_allow_retry()
                 _fp_clear()   # 指纹拦的是"进池资格", 补池后要失效, 否则新内容进不来;
                               # 去重由 shown 窗口 + 随机页/源 + 新会话已返回集合承担
-                threading.Thread(target=build_universe, kwargs={"quick": True}, daemon=True).start()
+                kick_build(quick=True, pending=True)
             return self.send_json(serve_chunk(offset, limit, q, request_id=request_id, plat=plat))
         if path == "/api/messages":
             bili_logged_in = bili_is_logged_in()
@@ -10544,7 +12408,10 @@ class Handler(BaseHTTPRequestHandler):
             tb_unread = tb_unread_messages() if tb_logged_in else None
             xhh_logged_in = bool(sget("xhh_heybox_id"))
             xhh_unread = xhh_unread_messages() if xhh_logged_in else None
-            return self.send_json({"bili": {"logged_in": bili_logged_in,
+            # seen = 用户上次点开消息页时的未读数快照。前端角标只画 unread - seen(不小于0),
+            # 所以点完消息按钮红点会立刻消失, 之后真有新消息才会再冒出来。
+            return self.send_json({"seen": msg_seen(),
+                                   "bili": {"logged_in": bili_logged_in,
                                              "unread": bili_unread,
                                              "url": "https://message.bilibili.com/"},
                                    "tieba": {"logged_in": tb_logged_in,
@@ -10600,6 +12467,12 @@ class Handler(BaseHTTPRequestHandler):
                             "last_fetch": tb_last,
                             "fetched_today": _tb_fetch_total, "filtered_today": 0,
                             "error": sget("tb_error"),
+                            # v0.3.1.55: 被百度安全验证拦了 —— 前端据此把这一行做成
+                            # "点一下打开验证窗口, 拖个滑块就好", 而不是干等冷却。
+                            "need_verify": "安全验证" in (sget("tb_error") or ""),
+                            # 浏览器窗口通道是否接通(跨重启也能接回来): 前端优先显示
+                            # "窗口通道", 免得通道明明在用、左栏还挂着 403。
+                            "browser_channel": bool(_tb_br_channel()),
                             "bars": tb_bars_n,
                             "logged_in": tb_login.get("logged_in", False)})
             xhh_last = int(sget("xhh_last_fetch") or 0)
@@ -10608,10 +12481,33 @@ class Handler(BaseHTTPRequestHandler):
                             "fetched_today": _xhh_fetch_total, "filtered_today": 0,
                             "error": sget("xhh_error") or "",
                             "logged_in": bool(sget("xhh_heybox_id"))})
+            # v0.3.1.51: 直播源也进「内容源」状态卡(与左栏按钮 data-st 对应)
+            live_last = int(sget("live_last_fetch") or 0)
+            with _uni_lock:
+                live_n = sum(1 for x in _universe["items"] if x.get("platform") == LIVE_PLATFORM)
+            sources.append({"name": LIVE_PLATFORM,
+                            "status": "正常" if live_last else "未抓取",
+                            "last_fetch": live_last,
+                            "fetched_today": _live_fetch_total, "filtered_today": 0,
+                            "error": sget("live_error") or "",
+                            "items": live_n,
+                            "logged_in": bool(account_cookie())})
             return self.send_json({"ai": ai_ok(), "ai_on": ai_on(), "sources": sources,
+                                   # 前端用它决定空态是"正在准备内容…"还是"去配来源"
+                                   "configured": user_configured(),
                                    "items": pool_n,
                                    "summary": st, "ai_scoring": dict(_score_progress),
-                                   "funnel": {"labels": _FUNNEL_LABELS, "counts": funnel_stats()}})
+                                   "funnel": {"labels": _FUNNEL_LABELS, "counts": funnel_stats()},
+                                   # 最近一分钟各站点真实发出的请求数(排查"是不是在刷站")
+                                   "net": net_stats(), "mix": mix_stats()})
+        if path == "/api/live":
+            # 直播页数据(v0.3.1.51): 关注的人正在直播(followed) + 热门推荐(hot)。
+            # 60 秒缓存; refresh=1 强刷。接口失败只降级成空列表+error, 不抛给前端。
+            try:
+                return self.send_json(live_snapshot(refresh=(qs.get("refresh", ["0"])[0] == "1")))
+            except Exception as e:
+                return self.send_json({"ok": False, "followed": [], "hot": [], "count": 0,
+                                       "error": str(e)[:200], "need_login": False})
         if path == "/api/blacklist":
             rows = db().execute("SELECT kind,value FROM blacklist").fetchall()
             return self.send_json({"authors": [r[1] for r in rows if r[0] == "author"],
@@ -10724,6 +12620,9 @@ class Handler(BaseHTTPRequestHandler):
                                    "account_ok": account_slim().get("ok", False)})
         if path == "/api/account":
             return self.send_json(account_slim() | {"has_cookie": bool(account_cookie())})
+        if path == "/api/live/settings":
+            mn, only = live_filters()
+            return self.send_json({"ok": True, "min_viewers": mn, "only_followed": only})
         if path == "/api/tieba":
             login = tb_login_check()
             return self.send_json({
@@ -10737,11 +12636,23 @@ class Handler(BaseHTTPRequestHandler):
                 "nickname": login.get("nickname", ""),
                 "avatar": login.get("avatar", ""),
                 "cookie_set": bool(tb_cookie()),
+                "verify_cookie_set": bool(tb_verify_cookie()),
+                "verify_status": dict(_CDP_VERIFY),
+                # 浏览器通道是否可用(跨应用重启也能接回来): 前端据此显示"窗口通道接管中",
+                # 而不是只看 tb_error —— 否则验证过了界面还在报 403, 用户以为没生效。
+                "browser_channel": bool(_tb_br_channel()),
+                "browser_port": int(_CDP_PORT or 0),
                 "last_fetch": int(sget("tb_last_fetch") or 0),
                 "error": sget("tb_error") or "",
                 "fetch_total": _tb_fetch_total,
                 "login_status": dict(_CDP_LOGIN),
             })
+        if path == "/api/tieba/verify/start":
+            return self.send_json(tb_verify_start())
+        if path == "/api/tieba/verify/poll":
+            return self.send_json(tb_verify_poll())
+        if path == "/api/tieba/verify/stop":
+            return self.send_json(tb_verify_stop())
         if path == "/api/tieba/login/poll":
             return self.send_json(tb_login_poll())
         if path == "/api/tieba/browse":
@@ -10946,6 +12857,12 @@ class Handler(BaseHTTPRequestHandler):
             # 完整逆推(2..10位) + card 接口验真; 多候选时原样回给前端让用户自己挑。
             r = bili_dm_mid(qs.get("hash", [""])[0])
             return self.send_json({"ok": True} | r)
+        if path == "/api/intro":
+            # 首次引导的入口判定。放后端而不是 localStorage：清缓存/换内核不该让引导重弹，
+            # 真正决定"要不要引导"的是本机有没有配上来源。
+            return self.send_json({"ok": True, "done": sget("intro_done") == "1",
+                                   "configured": user_configured(),
+                                   "show": intro_needed()})
         if path == "/api/settings":
             return self.send_json({k: sget(k) for k in ("ai_base", "ai_key", "ai_model", "mode",
                                                         "prefs_note", "dislike_note",
@@ -10996,6 +12913,9 @@ class Handler(BaseHTTPRequestHandler):
             ok = page_lease_alive(token) if action == "alive" else page_lease_leaving(token)
             return self.send_json({"ok": ok, "grace_seconds": PAGE_LEASE_GRACE_SECONDS})
 
+        if path == "/api/update/download":
+            return self.send_json(update_download())
+
         if path == "/api/textfilter":
             # v0.3.1.43dsk 快速文本分析: 页面脚本(弹幕/评论筛选)把本页的**文本**送过来,
             # 问"这几条该不该拦"。纯本地 fastText 前向, 零联网、零 token。
@@ -11038,6 +12958,10 @@ class Handler(BaseHTTPRequestHandler):
             except Exception as e:
                 return self.send_json({"ok": False, "error": str(e)[:150]})
 
+        if path == "/api/messages/read":
+            # 用户点开了消息页 = 这些未读看过了。前端把当前各平台未读数报上来, 存成快照。
+            return self.send_json({"ok": True, "seen": msg_seen_save(body.get("seen"))})
+
         if path == "/api/account":
             sset("bili_cookie", (body.get("cookie") or "").strip())
             try:
@@ -11069,6 +12993,30 @@ class Handler(BaseHTTPRequestHandler):
             sset("xhh_avatar", "")
             return self.send_json({"ok": True})
 
+        # 百度安全验证的人工滑块通道(v0.3.1.55) —— 前端是 POST 过来的,
+        # 只挂 do_GET 会让点击变成 404("点了没反应"), 这里必须同样注册一份。
+        if path == "/api/tieba/verify/start":
+            return self.send_json(tb_verify_start())
+        if path == "/api/tieba/verify/poll":
+            return self.send_json(tb_verify_poll())
+        if path == "/api/tieba/verify/stop":
+            return self.send_json(tb_verify_stop())
+
+        if path == "/api/live/settings":
+            if "min_viewers" in body:
+                try:
+                    sset("live_min_viewers", str(max(0, int(body["min_viewers"]))))
+                except Exception:
+                    pass
+            if "only_followed" in body:
+                # 前端可能传 true/false, 也可能传 "1"/"0" 字符串 —— 字符串 "0" 是**真值**,
+                # 直接 if body[...] 会把"取消只看关注"存成开启(实测踩过), 这里显式判一遍。
+                _v = str(body["only_followed"]).strip().lower()
+                sset("live_only_followed", "0" if _v in ("0", "false", "off", "", "none") else "1")
+            force_rebuild()
+            mn, only = live_filters()
+            return self.send_json({"ok": True, "min_viewers": mn, "only_followed": only})
+
         if path == "/api/tieba":
             if "bars" in body:
                 bars = body.get("bars") or []
@@ -11084,7 +13032,8 @@ class Handler(BaseHTTPRequestHandler):
                         w = int(body[key])
                     except Exception:
                         continue
-                    if w in {0, 25, 50, 75, 100}:
+                    # 0-100 全区间可调(左栏每条内容源下面就是一条滑条, 不再只认 4 个档位)
+                    if 0 <= w <= 100:
                         sset(key, str(w))
             force_rebuild()   # 吧列表/权重变更 → 立即重建
             return self.send_json({"ok": True})
@@ -11244,6 +13193,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json({"ok": False, "error": "免责声明版本无效或已过期"}, 400)
             sset("disclaimer_version", version)
             return self.send_json({"ok": True, "version": version})
+
+        if path == "/api/intro/done":
+            # 完成与跳过都写这一条：不能每次启动都拦一遍
+            sset("intro_done", "1")
+            return self.send_json({"ok": True})
 
         if path == "/api/settings":
             old_prefs = sget("prefs_note") or ""
@@ -11499,6 +13453,28 @@ class Handler(BaseHTTPRequestHandler):
                              "error": "AI 这次没能给出有效回复(%s)，请再试一次" % str(e)[:80]})
             return
 
+        # v0.3.1.62: 把"用户说的这句改动"先交给模型理解(带可调的思考强度),
+        # 再回给前端落到现有设置接口; 模型不可用时前端退回本地关键词规则。
+        if path == "/api/chat/plan":
+            txt = str(body.get("text") or "").strip()
+            if not txt:
+                return self.send_json({"ok": False, "error": "空消息"}, 400)
+            eff = str(body.get("effort") or "mid")
+            prefs = body.get("prefs") if isinstance(body.get("prefs"), dict) else {}
+            weights = body.get("weights") if isinstance(body.get("weights"), dict) else {}
+            live = body.get("live") if isinstance(body.get("live"), dict) else {}
+            # 带上本会话最近的对话: "换回去"/"再大一点" 离开上下文没法解
+            hist = []
+            try:
+                cid = conv_cur(body.get("cid"))
+                rows = db().execute(
+                    "SELECT role,content FROM chat WHERE cid=? ORDER BY id DESC LIMIT 8",
+                    (cid,)).fetchall()
+                hist = [{"role": r, "content": c} for r, c in reversed(rows)]
+            except Exception:
+                hist = []
+            return self.send_json(chat_plan(txt, eff, prefs, weights, live, hist))
+
         if path == "/api/chat":
             msg = (body.get("message") or "").strip()
             if not msg:
@@ -11703,9 +13679,19 @@ class Handler(BaseHTTPRequestHandler):
             extra_ctx = "\n".join(x for x in (chat_item_context(cid), chat_last_context(msg)) if x)
             messages = ([{"role": "system", "content":
                           "你是「洞鉴虚明」的偏好助手。帮用户定义想看什么内容，"
-                          "回复要简短友好。注意：你只能口头回答，无法真正推送/搜索/切换视频；"
-                          "用户想刷视频时会直接说「给我刷/推/看XX」，系统会自动执行并另行确认，"
-                          "你不要声称「已推送」或「已切换到左侧」之类的话。"
+                          "回复要简短友好。"
+                          # v0.3.1.67: 这句原来写的是"你只能口头回答，无法真正切换" ——
+                          # 那是 AI 改设置(v62)之前的话。模型当真了，用户说"换回去"它就答
+                          # "我确实动不了你的页面布局，得你自己去点"。能力边界必须写准。
+                          "你能真正改动界面与筛选设置：主题、信息流布局（单栏/双栏/大图）、"
+                          "封面大小、字号、推荐理由显示、来源标识、强调色、过滤档位、"
+                          "各平台占比、直播筛选。用户直接说「换成双栏」「字号大一点」时，"
+                          "系统会在你回答之前就把它执行掉。"
+                          "所以绝不要说「我改不了」「动不了你的页面布局」或让他自己去设置页点；"
+                          "你不确定他想改哪一项时，就问一句「是想换成单栏吗」。"
+                          "你确实做不到的是推送/搜索/切换视频，也看不到页面上的执行结果，"
+                          "因此不要声称「已推送」「已切换到左侧」「已改好」。"
+                          "用户想刷视频时会直接说「给我刷/推/看XX」，系统会自动执行并另行确认。"
                           "如果上下文里有【用户当前正在聊的条目】或【用户指代的最近条目】，"
                           "围绕它可以做总结、点评、回答追问；没有依据的部分不要编造。"
                           "可参考的用户画像:\n" + (user_context() or "(空)")
@@ -11774,6 +13760,24 @@ class Handler(BaseHTTPRequestHandler):
             ctx = chat_ctx_set(cid, body.get("key", ""), body.get("title", ""))
             return self.send_json({"ok": True, "ctx": ctx})
 
+        if path == "/api/chat/note":
+            # 只记一笔对话, 不做任何推理。
+            # 用途: 聊天栏里"帮我改设置"这类指令是前端规则直接执行的(不等模型、不烧 token),
+            # 但对话历史仍要落库 —— 否则切会话/重开页面这段对话就没了, 用户以为自己没说过。
+            me = (body.get("me") or "").strip()
+            ai = (body.get("ai") or "").strip()
+            if not me and not ai:
+                return self.send_json({"ok": False, "error": "空消息"}, 400)
+            cid = conv_cur(body.get("cid"))
+            ts = int(time.time())
+            db().execute("INSERT INTO chat(role,content,ts,cid) VALUES('user',?,?,?)", (me, ts, cid))
+            if ai:
+                db().execute("INSERT INTO chat(role,content,ts,cid) VALUES('assistant',?,?,?)",
+                             (ai, ts, cid))
+            db().commit()
+            conv_touch(cid, me)
+            return self.send_json({"ok": True, "cid": cid})
+
         if path == "/api/chat/clear":
             cid = conv_cur(body.get("cid"))
             db().execute("DELETE FROM chat WHERE cid=?", (cid,))
@@ -11802,7 +13806,6 @@ class Handler(BaseHTTPRequestHandler):
                 db().commit()
             with _uni_lock:
                 _uni_token += 1
-                _universe["building"] = False
                 _universe["items"] = []
                 _universe["gen"] += 1
             _fp_clear()   # 指纹记忆随池清空(重建拉回同内容不被误拦)

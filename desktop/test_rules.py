@@ -9,7 +9,7 @@ import sys
 import time
 
 PROJECT = os.path.dirname(os.path.abspath(__file__))
-TMP = os.path.join(PROJECT, "rules-tmp")
+TMP = os.path.join(PROJECT, "build", "probe", "rules-tmp")
 if os.path.isdir(TMP):
     shutil.rmtree(TMP, ignore_errors=True)
 os.makedirs(TMP, exist_ok=True)

@@ -501,9 +501,30 @@ _REP_REG = {}             # id(ctrl) -> {"ev": Event}  正在跑的看门狗(新
 _REP_LOCK = threading.Lock()
 
 
+def _fs_soft():
+    """全屏补呈现用哪种手段: 默认**硬补**, MSX_FS_SOFT=1 退化轻补。
+
+    为什么默认硬补: 网页一进 HTML 全屏, WebView2 的合成层就会被打断(画面整块停住,
+    而且是 #0f1115 那种"什么都没画"的停法) —— 只 Invalidate/置顶**不会**让它重新挂上,
+    必须一次"隐藏→显示"才会重新出图(m02002 的实测结论)。
+    为什么硬补是安全的: 实验台 `_fs_lab.py` 实测这一次 toggle **不会**把浏览器踢出全屏
+    (toggle 之后 ContainsFullScreenElement 仍为 true)。真正把人搞死的是以前那套
+    "补 8 次 + 摘挂父容器(reparent) + GDI 校验", 不是这一次 toggle。
+    个别机器若 toggle 会退出全屏(看日志 `fs tap done ... fs=False`), 设 MSX_FS_SOFT=1
+    退化成"只置顶+重绘"。
+    """
+    return os.environ.get("MSX_FS_SOFT", "0") == "1"
+
+
 def _rep_level(i):
-    """第 i 次补呈现(0 起)用第几级手段: 前两次最轻, 中段加刷新, 之后摘挂父容器。"""
-    return 1 if i < 2 else (2 if i < 4 else 3)
+    """第 i 次补呈现(0 起)用第几级手段: 前两次最轻, 之后加一次强制重绘。
+
+    **曾经的第 3 级「从父容器摘下再挂回」已彻底删除** —— 它对 WebView2 是破坏性的:
+    控件 HWND 与 CoreWebView2 绑定, reparent 会让合成器直接停摆, 画面再也回不来。
+    用户报修: 播放视频点全屏 → 画布整块没有视频、界面像卡死, 就是这个级别在反复
+    Remove/Add。普通 WinForms 控件可以这么"逼排版", WebView2 不行。
+    """
+    return 1 if i < 2 else 2
 
 
 def _frame_flat(hwnd):
@@ -597,11 +618,15 @@ def _rep_cancel(cc):
         pass
 
 
-def _rep_tap(ui, ctrls, cc, key, hwnd_box, level):
+def _rep_tap(ui, ctrls, cc, key, hwnd_box, level, gentle=False):
     """补呈现(在 UI 线程执行)。level 越高手段越重, 全程**不重载页面**:
       1 隐藏→显示→置顶(与旧实现一致)
       2 加一次强制重绘(Invalidate+Update)
-      3 从父容器摘下再挂回(几何原样还原) —— 最重的一招, 逼宿主重走一遍编排
+
+    gentle=True: **绝不碰 Visible**, 只置顶 + 重绘。视频全屏期间必须用它 ——
+    对正在全屏的 WebView2 做一次 隐藏→显示, 浏览器会认为全屏元素已被移除而**退出全屏**,
+    于是 ContainsFullScreenElementChanged 再触发一次"进入", 窗口跟着反复最大化/还原,
+    画面永远出不来(用户报修: 点全屏就卡死、画布没视频, 就是这么来的)。
     """
     def _do():
         try:
@@ -609,29 +634,29 @@ def _rep_tap(ui, ctrls, cc, key, hwnd_box, level):
                 return          # 控件已被换掉
             if cc.IsDisposed:
                 return
-            try:
-                hwnd_box["h"] = int(cc.Handle.ToInt32())
-            except Exception:
-                pass
-            par = None
-            geo = None
-            if level >= 2:
+            if not gentle:
                 try:
-                    par = cc.Parent
-                    geo = (cc.Location, cc.Size, cc.Dock, cc.Anchor)
-                except Exception:
-                    par, geo = None, None
-            if level >= 3 and par is not None and geo is not None:
-                try:
-                    par.Controls.Remove(cc)
-                    par.Controls.Add(cc)
-                    cc.Location, cc.Size, cc.Dock, cc.Anchor = geo
+                    hwnd_box["h"] = int(cc.Handle.ToInt32())
                 except Exception:
                     pass
-            cc.Visible = False
-            cc.Visible = True
+                cc.Visible = False
+                cc.Visible = True
+            # 补呈现有没有把浏览器**踢出全屏**? 在 UI 线程读一次放进 hwnd_box
+            # (工作线程别碰 .NET), 供看门狗复核 / 日志留证。
+            try:
+                core = cc.CoreWebView2
+                hwnd_box["fs"] = (None if core is None
+                                  else bool(core.ContainsFullScreenElement))
+            except Exception:
+                hwnd_box["fs"] = None
             cc.BringToFront()
-            if level >= 2:
+            try:
+                _dbg_log("rep tap key=%s gentle=%s vis=%s bounds=%s dock=%s fs=%s"
+                         % (key, gentle, cc.Visible, cc.Bounds, cc.Dock,
+                            hwnd_box.get("fs")))
+            except Exception:
+                pass
+            if level >= 2 or gentle:
                 try:
                     cc.Invalidate(True)
                     cc.Update()
@@ -642,15 +667,27 @@ def _rep_tap(ui, ctrls, cc, key, hwnd_box, level):
     ui(_do)
 
 
-def _represent(ui, ctrls, cc, key=None, why="", taps=None, settle=None):
+def _represent(ui, ctrls, cc, key=None, why="", taps=None, settle=None,
+               gentle=False, verify=None):
     """补呈现看门狗(模块级, 便于离线测试)。
 
     到点补呈现 → 校验是否真出图 → 出图即收工; 还黑就继续补并加重手段, 直到 deadline。
     同一控件上重复触发会取消上一个看门狗(避免两个 worker 同时 toggle 造成抖动)。
     任意线程可调。
+
+    gentle=True: 只"置顶+重绘", 不切 Visible(全屏那条路默认是**硬补**, gentle 只是
+    MSX_FS_SOFT=1 时的退化形态)。
+
+    verify=False: 不做 GDI 抓屏校验。**视频全屏必须关掉校验** —— 视频层是 DComp 独立
+    平面, GDI 抓到的是平色, 校验必然误判"没出图", 于是一直补到 deadline(8 秒), 期间
+    反复打扰合成器, 用户体感就是卡死。None = 自动(gentle/legacy 时不校验)。
     """
     try:
         legacy = os.environ.get("MSX_NO_REPRESENT") == "1"
+        if verify is None:
+            # 默认"补完校验": 但视频全屏那条路必须关掉 —— GDI 抓不到 DComp 视频平面,
+            # 会把正常画面judge 成"没出图", 然后一路补到 deadline(体感=卡死)。
+            verify = not (gentle or legacy)
         sched = tuple(taps if taps is not None else
                       (_REP_LEGACY_TAPS if legacy else _REP_TAPS))
         wait = _REP_SETTLE if settle is None else settle
@@ -669,16 +706,20 @@ def _represent(ui, ctrls, cc, key=None, why="", taps=None, settle=None):
                 if time.time() - t0 > _REP_DEADLINE:
                     break
                 n += 1
-                _rep_tap(ui, ctrls, cc, key, hb, _rep_level(i))
+                _rep_tap(ui, ctrls, cc, key, hb, _rep_level(i), gentle)
                 if ev.wait(wait):
                     return
-                if legacy:
-                    continue
+                if gentle and hb.get("fs") is False:
+                    _dbg_log("represent STOP why=%s (补呈现把浏览器踢出了全屏 → 立刻收工)"
+                             % why)
+                    return
+                if not verify:
+                    continue        # 不校验: 见 verify 的注释
                 if _frame_flat(hb.get("h")) is False:
                     _dbg_log("represent ok why=%s taps=%d dt=%.2f"
                              % (why, n, time.time() - t0))
                     return
-            if not legacy:
+            if verify:
                 _dbg_log("represent TIMEOUT why=%s taps=%d key=%s (画面仍无出图)"
                          % (why, n, key))
         threading.Thread(target=worker, daemon=True,
@@ -1179,14 +1220,14 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
             import traceback
             traceback.print_exc()
 
-    def _retext_later(cc, key=None, why=""):
+    def _retext_later(cc, key=None, why="", **kw):
         """补呈现看门狗(见模块级 _represent)。
 
         旧实现在 0.35/0.9/1.6s 三个写死的时间点各补一次、不校验也不重试 —— 慢机器三次
         全落空就把黑屏永久留下(用户机 vs 开发机的差异根源)。现在改成"补完校验、还黑就
         继续补并加重手段", 出图即收工。需要 UI 线程 → 内部走 _ui; 控件已被销毁/换掉就放弃。
         """
-        _represent(_ui, _Pool.ctrls, cc, key, why)
+        _represent(_ui, _Pool.ctrls, cc, key, why, **kw)
 
     class _Pool:
         ctrls = {0: None}   # tab_key -> WebView2 控件(0 = 信息流主控件)
@@ -1194,6 +1235,9 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
         _dead = set()        # 已关闭标签的key: 迟到的create直接丢弃(防僵尸控件)
         # bug6: 网页(视频)全屏状态 —— on 时当前控件铺满整个客户区(标签栏/导航栏让位)
         fs = {"on": False, "key": None}
+        _fs_last = {}    # tab_key -> 上次处理过的全屏状态: 同一状态重复事件直接丢
+                         # (播放器常常先 requestFullscreen 再改 CSS, WebView2 会连发好几次;
+                         #  每次都重排窗口/控件, 画面就抖成"卡死")
         _fs_rec = None   # bug10: 进入网页全屏时的现场(宿主窗体/控件几何/被藏起来的兄弟控件)
         float_of = {}    # bug6: 控件被迁进悬浮窗时记下宿主窗体 → 全屏回调只对主窗口壳隐藏chrome
                          # (名字必须是 float_of: dispose/send_to_window/dock_to_main/on_fs_changed
@@ -1311,6 +1355,10 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
                 except Exception:
                     on = False
                 _dbg_log("fullscreen=%s tab=%s" % (on, tab_key))
+                last = _Pool._fs_last.get(tab_key)
+                if last is on:
+                    return          # 同状态重复事件: 不去重就会反复最大化/还原
+                _Pool._fs_last[tab_key] = on
                 try:
                     self.set_fullscreen(tab_key, on)
                 except Exception:
@@ -1567,6 +1615,37 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
                     except Exception:
                         pass
 
+        def _same_form(self, a, b):
+            """两个 Form 是不是同一个窗口。
+
+            **不能用 is**: pywebview 的 native 每次访问可能返回新的托管包装对象,
+            同一个窗口 `a is b` 会是 False —— 那会让"主窗口"被判成"悬浮窗",
+            走进悬浮窗分支(不最大化、不 Dock=Fill), 全屏就只能靠页面自己铺满。
+            按 HWND 比较才是可靠的。
+            """
+            if a is None or b is None:
+                return a is b
+            try:
+                return int(a.Handle.ToInt64()) == int(b.Handle.ToInt64())
+            except Exception:
+                try:
+                    return bool(a.Equals(b))
+                except Exception:
+                    return False
+
+        def _fs_desc(self, c):
+            """一行描述控件关键状态(全屏诊断用; 必须在 UI 线程调)。"""
+            try:
+                z = -1
+                try:
+                    z = int(c.Parent.Controls.GetChildIndex(c))
+                except Exception:
+                    pass
+                return ("vis=%s bounds=%s dock=%s z=%s parent=%s"
+                        % (c.Visible, c.Bounds, c.Dock, z, type(c.Parent).__name__))
+            except Exception as e:
+                return "desc-err:%r" % (e,)
+
         def set_fullscreen(self, key, on):
             """bug6/bug10: 网页(视频)全屏 → 控件铺满客户区; **主窗口**的宿主窗体一起最大化。
             只把控件铺满窗口是不够的: 窗口本身比屏幕小时四周(尤其左缘)会直接露出桌面,
@@ -1594,7 +1673,10 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
                             host = host.FindForm() or host
                     except Exception:
                         pass
-                    is_float = host is not box.get("form")
+                    is_float = not self._same_form(host, box.get("form"))
+                    _dbg_log("fs enter key=%s float=%s host=%s state=%s %s"
+                             % (key, is_float, type(host).__name__,
+                                host.WindowState, self._fs_desc(c)))
                     if _Pool._fs_rec is None:
                         hid = []
                         try:
@@ -1615,7 +1697,8 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
                         if is_float:
                             # 悬浮窗内全屏: 只铺满悬浮窗自身(位置/尺寸都不变), 不最大化到屏幕
                             c.Dock = getattr(WF.DockStyle, "None")   # None 是 Python 关键字
-                            c.Location = WF.Point(0, 0)
+                            from System.Drawing import Point as _Pt   # WF 里没有 Point
+                            c.Location = _Pt(0, 0)
                             c.Size = host.ClientSize
                             c.Anchor = (WF.AnchorStyles.Top | WF.AnchorStyles.Left
                                         | WF.AnchorStyles.Right | WF.AnchorStyles.Bottom)
@@ -1630,13 +1713,24 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
                         # Page.captureScreenshot 超时), 且不会自己恢复(0.7~3.1s 五次采样全黑);
                         # 而在同一控件上补一次"隐藏→显示→置顶"立刻有画面(0.75s 起就正常)。
                         # 与最大化/Dock/chrome 隐藏/--disable-direct-composition-video-overlays 都无关。
-                        _retext_later(c, key, "fullscreen")
+                        # 全屏必须 gentle: 不切 Visible(切了浏览器会退出全屏), 只置顶+重绘一次。
+                        # 慢 GPU / 冷启动的差异不该靠反复 toggle 硬补 —— 那会把"黑一下"
+                        # 变成"一直黑 + 卡死"。
+                        _retext_later(c, key, "fullscreen", gentle=_fs_soft(),
+                                      verify=False, taps=(0.4,))
+                        _dbg_log("fs enter done key=%s state=%s %s"
+                                 % (key, host.WindowState, self._fs_desc(c)))
                     except Exception:
                         import traceback
-                        traceback.print_exc()
+                        _dbg_log("fs enter FAILED key=%s: %s"
+                                 % (key, traceback.format_exc().replace("\n", " | ")))
+                    finally:
+                        _dbg_log("fs enter end key=%s %s"
+                                 % (key, self._fs_desc(c)))
                 else:
                     self._fs_restore()
                     c.BringToFront()
+                    _dbg_log("fs exit key=%s %s" % (key, self._fs_desc(c)))
             _ui(go)
 
         def show(self, key):

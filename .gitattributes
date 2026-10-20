@@ -1,0 +1,42 @@
+# 洞鉴虚明 · Git 属性
+# 仓库里统一存 LF，检出时按项目现状还原：Windows 源码/脚本用 CRLF，文档用 LF。
+
+* text=auto
+
+*.py    text eol=crlf
+*.js    text eol=crlf
+*.css   text eol=crlf
+*.html  text eol=crlf
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+*.nsi   text eol=crlf
+*.json  text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.txt   text eol=lf
+.gitignore      text eol=lf
+.gitattributes  text eol=lf
+
+# 二进制：不做换行转换、不显示文本 diff
+*.exe    binary
+*.dll    binary
+*.apk    binary
+*.aab    binary
+*.so     binary
+*.bin    binary
+*.ico    binary
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.gif    binary
+*.webp   binary
+*.zip    binary
+*.7z     binary
+*.gz     binary
+*.db     binary
+*.sqlite binary
+*.woff   binary
+*.woff2  binary
+*.ttf    binary

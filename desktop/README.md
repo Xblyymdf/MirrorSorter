@@ -1,6 +1,6 @@
 # Mirror·Sorter · Desktop
 
-> Current version follows the `web/index.html` footer (e.g. v0.2.9.0a). Android lives in `android/`.
+> Current version is `app.py`'s `APP_VER` (also shown in the `web/index.html` footer), e.g. `v0.4.1dsk`. Android lives in `android/`.
 
 A locally-running content sorter: aggregates Bilibili / Baidu Tieba / HeyBox
 content → rule + AI filtering → interactive feed + source status panel + AI chat.
@@ -18,13 +18,58 @@ on the system's Edge WebView2 runtime. Clicking any video/post opens it as a
 | Action | What it does | Notes |
 |---|---|---|
 | Double-click `启动.bat` | starts the service → opens the **app window** | requires Python + WebView2 (preinstalled on Win10/11) |
-| Double-click `dist\洞鉴虚明v0.2.9.0a.exe` | same, standalone single file | **no Python needed**, portable to any Windows PC |
+| Double-click `build\dist\洞鉴虚明v<ver>.exe` | same, standalone single file | **no Python needed**, portable to any Windows PC |
 | Double-click `启动-服务模式.bat` | old headless mode → opens your default browser | fallback / advanced use |
 | Double-click `停止.bat` | stops all related processes | or kill via Task Manager |
 | Double-click `构建exe.bat` | rebuild the exe | run after changing code |
+| Double-click `发布更新.bat` | maintainers: push + publish the exe to GitHub Releases | asks for `YES`; never uploads the installer |
 
 Double-clicking again is safe: it detects the running service and just opens the window.
-> ⚠ PyInstaller builds occasionally trigger antivirus false positives — if so, add `dist\洞鉴虚明v0.2.9.0a.exe` to the trust list.
+> ⚠ PyInstaller builds occasionally trigger antivirus false positives — if so, add `build\dist\洞鉴虚明*.exe` to the trust list.
+
+### Auto-update (v0.4.1dsk+)
+
+The Windows exe has a **「检测更新」** button in the left rail, directly below **设置**.
+It reads `releases/latest` from `Xblyymdf/MirrorSorter`, shows the new version / size /
+release notes, then downloads to the user data directory, verifies the file, closes the
+app, replaces the exe (keeping its filename) and restarts. The previous exe is kept as
+`<name>.exe.bak` for one-step rollback. Source runs, Android and non-Windows hide the
+button (`shell_info.self_update = false`).
+
+Publishing: bump the version in `app.py` + `web/index.html`, run `构建exe.bat`, commit,
+then run `发布更新.bat`. Attach **only the standalone exe** — installer assets are
+skipped by the updater, but keeping the release clean avoids confusion. Full checklist:
+[docs/STANDARD.md](../docs/STANDARD.md) §7.
+
+### Build outputs all live in `build/`
+
+Everything a build produces stays inside `desktop\build\`, so the root stays clean and
+the whole lot can be wiped in one go:
+
+| Path | What's in it |
+|---|---|
+| `build\dist\` | finished `.exe` / installer |
+| `build\pybuild\` | PyInstaller work dir (intermediate `.toc` / `.pyz` / `.pkg`) |
+| `build\spec\` | the `.spec` generated on every build |
+| `build\logs\` | reserved for build logs |
+| `build\probe\` | scratch dirs for probes & smoke tests (`smoke-tmp`, `rules-tmp`, …) |
+| `build\cache\` | downloads (NSIS zip, WebView2 offline runtime) — reused by later builds |
+
+Double-click `清理构建.bat` to delete `build\` entirely (asks for confirmation first).
+Deleting it also drops the cached downloads, so the next installer build fetches them again.
+
+### Building the installer
+
+Double-click `installer\构建安装包.bat`. It needs two large inputs that are **not** in
+the repo — `installer\redist\` (offline WebView2 runtime, ~200 MB) and
+`installer\tools\` (NSIS compiler), both git-ignored because of size and staleness.
+The script downloads them automatically on first run and caches them in
+`build\cache\`; later builds skip the network. If you're offline, the failure message
+prints the exact URL and target path for each one.
+
+Output: `build\dist\洞鉴虚明vX.Y.Zdsk_安装包.exe` (~280 MB = onedir app + WebView2).
+Machines you install it on need neither Python nor a network connection.
+
 
 ## Built-in Browser Tabs (v0.2.9+)
 
@@ -187,8 +232,10 @@ desktop/
 ├── web/app.js        # frontend logic (openExternal routes links into shell tabs)
 ├── test_shell.py     # shell/tab-manager smoke tests (no GUI)
 ├── data.db           # data (auto-created; delete to reset)
-├── 启动.bat / 启动-服务模式.bat / 停止.bat / 构建exe.bat
-└── dist\洞鉴虚明v0.2.9.0a.exe  # standalone single-file build
+├── 启动.bat / 启动-服务模式.bat / 停止.bat / 构建exe.bat / 清理构建.bat
+├── 发布更新.bat      # maintainers: push + GitHub Release (standalone exe only)
+└── build\            # every build artifact + probe scratch dir (safe to delete wholesale)
+    └── dist\洞鉴虚明v<ver>.exe  # standalone single-file build
 ```
 
 ## Troubleshooting
@@ -199,4 +246,6 @@ desktop/
 | Page shows "offline sample data" | no network or Bilibili rate-limiting; click "Refresh now" and retry later |
 | AI calls fail | check API URL / key / model in settings; DeepSeek keys start with `sk-` |
 | Start over | delete `data.db` (or Account → clear all data) |
+| Update says "程序目录不可写" | move the exe to a user-writable folder (Desktop / Downloads) and retry |
+| Need to roll back an update | close the app, rename the sibling `<name>.exe.bak` back to the exe name |
 | Port busy | automatically falls back 8000 → 8010 → 8020 |

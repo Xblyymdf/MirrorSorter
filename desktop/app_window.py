@@ -18,6 +18,7 @@
 """
 import os
 import re
+import subprocess
 import sys
 import threading
 import time
@@ -271,6 +272,7 @@ class ShellApi:
         self._navbar_update = None  # 导航工具栏重绘回调, bind_navbar() 注入
         self._floats = None       # 独立悬浮窗管理器(shell_float), bind_floats() 注入
         self._lock = threading.Lock()
+        self._update_started = False
         # float=True 的标签不在主窗口标签栏显示, 而由独立悬浮窗承载(见 shell_float.py)
         self._tabs = [{"id": self.HOME_ID, "url": None, "title": "信息流",
                        "pinned": True, "opened": True, "float": False}]
@@ -287,7 +289,9 @@ class ShellApi:
     def shell_info(self):
         return {"name": "desktop-shell", "version": APP_VER.lstrip("v"),
                 "embedded_browser": True, "tabs": True,
-                "windows": True, "new_window": self._new_window_enabled()}
+                "windows": True, "new_window": self._new_window_enabled(),
+                # 只有 Windows 上打包出来的 exe 才能自我替换；源码运行/安卓不显示更新入口
+                "self_update": (os.name == "nt" and bool(getattr(sys, "frozen", False)))}
 
     def _new_window_enabled(self):
         """「信息以新窗口形式打开」开关(设置键 ui_new_window, 默认开)。"""
@@ -295,6 +299,52 @@ class ShellApi:
             return app.sget("ui_new_window") != "0"
         except Exception:
             return True
+
+    # ---- 桥: 自动更新(关闭窗口 -> 独立 cmd 等文件解锁 -> 覆盖 -> 重启) ----
+    def install_update(self):
+        """把已下载好的更新包落到原地并重启。
+
+        页面只负责点按钮；校验与替换脚本都在 app.update_prepare_install 里。
+        Windows 会锁住正在运行的 exe，所以先拉起独立 cmd，等本进程退出后
+        重试 move，换好再从原目录启动 —— 保留原文件名，桌面快捷方式/任务栏
+        固定项不会失效。"""
+        if os.name != "nt" or not getattr(sys, "frozen", False):
+            return "err:自动更新只在 Windows 桌面版 exe 里可用"
+        with self._lock:
+            if self._update_started:
+                return "err:正在更新"
+            self._update_started = True
+        try:
+            st = app.update_progress()
+            if st.get("phase") != "ready":
+                raise ValueError("更新包还没下载好")
+            res = app.update_prepare_install(st.get("path") or "")
+            if not res.get("ok"):
+                raise ValueError(str(res.get("error") or "准备更新失败"))
+            flags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0)) | \
+                    int(getattr(subprocess, "DETACHED_PROCESS", 0))
+            subprocess.Popen(["cmd.exe", "/c", res["script"]],
+                             cwd=os.path.dirname(res["script"]),
+                             creationflags=flags, close_fds=True)
+        except Exception as e:
+            with self._lock:
+                self._update_started = False
+            return "err:" + str(e)[:160]
+        # 先把返回值交给页面，再关窗；直接在这里 destroy 会让 JS 收不到结果
+        threading.Timer(0.9, self._close_for_update).start()
+        return "ok"
+
+    def _close_for_update(self):
+        try:
+            if self._floats is not None:
+                self._floats.close_all()
+        except Exception:
+            pass
+        try:
+            if self._win is not None:
+                self._win.destroy()
+        except Exception:
+            _log_exc("update/close")
 
     # ---- 桥: 另存为(导出设置用) ----
     def save_text(self, filename, text):
@@ -722,6 +772,12 @@ def main(argv=None):
             e2e_float_url = argv[argv.index("--e2e-float") + 1]
         except IndexError:
             e2e_float_url = None
+    e2e_float_resize_url = None
+    if "--e2e-float-resize" in argv:  # 测试钩子: 真鼠标消息驱动悬浮窗八向缩放
+        try:
+            e2e_float_resize_url = argv[argv.index("--e2e-float-resize") + 1]
+        except IndexError:
+            e2e_float_resize_url = None
     # 悬浮球模式: frozen exe 再入自身时走这里; 源码模式 float_ball_spawn 直接调 app.py
     if "--float-ball" in argv:
         try:
@@ -747,7 +803,8 @@ def main(argv=None):
             return 0 if port is not None else 1
         _serve_forever_cli(server)
         return 0
-    return shell_main(e2e_url=e2e_url, e2e_float_url=e2e_float_url)
+    return shell_main(e2e_url=e2e_url, e2e_float_url=e2e_float_url,
+                      e2e_float_resize_url=e2e_float_resize_url)
 
 
 def _install_mouse_side_buttons(api, win):
@@ -859,6 +916,206 @@ def _log_exc(tag):
             traceback.print_exc(file=f)
     except Exception:
         pass
+
+
+def _e2e_float_resize_run(api, url):
+    """v0.3.1.51 自测: 用**真实鼠标消息**驱动悬浮窗八向缩放, 记录每步 Bounds 变化。
+
+    为什么不用 form.Size=...: 那只是调 API, 证明不了「用户拖得动」。这里往热区 Panel 投递
+    WM_LBUTTONDOWN/MOUSEMOVE/WM_LBUTTONUP —— 而 shell_float 的 _step_resize 读的是
+    `WinForms.Cursor.Position`, 所以投递前必须把真实光标摆到热区上再挪动, 与
+    _e2e_drag_to_tabbar 同一套办法, 等价于真人拖拽。
+
+    每一步都断言「尺寸真的变了 + 被拖的那条边方向对 + 钉住的边没动」, 最后压一遍最小尺寸
+    钳制; 结果同时写 <数据目录>/float_resize_e2e.log, 供外部脚本判定(pass/fail 计数)。
+    """
+    import ctypes
+    import System.Windows.Forms as WinForms
+    from System.Drawing import Point as SPoint
+    u32 = ctypes.windll.user32
+    logp = os.path.join(app.DATA_DIR, "float_resize_e2e.log")
+    lines, fails = [], []
+
+    def say(s):
+        lines.append("[float-resize] " + s)
+        try:
+            print(lines[-1], flush=True)
+        except Exception:
+            pass
+        try:
+            with open(logp, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        except Exception:
+            pass
+
+    def ok(name, cond, detail=""):
+        say("%s %s %s" % ("PASS" if cond else "FAIL", name, detail))
+        if not cond:
+            fails.append(name)
+
+    def zones_of(f):
+        """热区 Panel → {方向: 控件}。缩放过程中面板会跟着重排, 每次都要重算。"""
+        out = {}
+        for i in range(f.Controls.Count):
+            c = f.Controls[i]
+            try:
+                if c.GetType().Name != "Panel":
+                    continue
+                cur = c.Cursor
+                n = None
+                if cur == WinForms.Cursors.SizeWE:
+                    n = "w" if c.Left <= 2 else "e"
+                elif cur == WinForms.Cursors.SizeNS:
+                    n = "n" if c.Top <= 2 else "s"
+                elif cur == WinForms.Cursors.SizeNWSE:
+                    n = "nw" if (c.Left <= 2 and c.Top <= 2) else "se"
+                elif cur == WinForms.Cursors.SizeNESW:
+                    n = "ne" if c.Left > 2 else "sw"
+                if n:
+                    out[n] = c
+            except Exception:
+                continue
+        return out
+
+    # 假光标: 缩放读的是 shell_float 的 _cursor_pos(), 注入后与真鼠标无关 ——
+    # 无人值守跑在真桌面上时, 真人一动鼠标也不会把位移量搅乱(见 shell_float.set_cursor_probe)。
+    _cur = [(0, 0)]
+
+    def drag(f, name, dx, dy):
+        z = zones_of(f).get(name)
+        if z is None:
+            ok("热区-" + name, False, "没找到该方向的热区")
+            return None
+        b0 = f.Bounds
+        cx = z.Left + max(1, z.Width // 2)
+        cy = z.Top + max(1, z.Height // 2)
+        p = f.PointToScreen(SPoint(cx, cy))
+        lp = (((cy & 0xFFFF) << 16) | (cx & 0xFFFF))
+        hwnd = z.Handle.ToInt32()
+        # 光标摆到热区 → 按下(记起点) → 挪光标 → 投递 MOVE(改 Bounds) → 松手。
+        # 投递的是真鼠标消息, 走的是产品代码里热区 Panel 的事件链, 只是"光标在哪"由我们喂。
+        _cur[0] = (p.X, p.Y)
+        u32.SendMessageW(hwnd, 0x0201, 1, lp)
+        _cur[0] = (p.X + dx, p.Y + dy)
+        u32.SendMessageW(hwnd, 0x0200, 1, lp)
+        time.sleep(0.06)
+        u32.SendMessageW(hwnd, 0x0202, 0, lp)
+        time.sleep(0.35)
+        b1 = f.Bounds
+        say("drag %-2s b=%s→%s 位移 期望%+d/%+d 实际%+d/%+d"
+            % (name, (b0.X, b0.Y, b0.Width, b0.Height),
+               (b1.X, b1.Y, b1.Width, b1.Height), dx, dy,
+               b1.X - b0.X, b1.Y - b0.Y))
+        return (b0, b1)
+
+    try:
+        time.sleep(8)   # 等主窗口与服务就绪
+        scale = float(getattr(api._win.native, "_scale", 1.0) or 1.0)
+        # 用带 query 的地址: open_in_app 按 url 去重, 首页标签已经占了不带参数的同一个地址,
+        # 直接传原地址会命中已有标签(切过去), 根本不会开悬浮窗。
+        furl = url.rstrip("/") + "/?e2e=float-resize"
+        say("scale=%s open -> %s" % (scale, api.open_in_app(furl, "缩放自测", mode="window")))
+        time.sleep(7)
+        tid = next((t["id"] for t in api._tabs if t.get("float") and t.get("url") == furl), None)
+        if tid is None:
+            tid = next((t["id"] for t in api._tabs if t.get("float")), None)
+        ctl = api._pages.control(tid) if tid is not None else None
+        if ctl is None or ctl.Parent is None:
+            ok("悬浮窗已打开", False, "找不到悬浮窗控件 tid=%s" % tid)
+            return
+        f = ctl.Parent
+        bar = next((c for i in range(f.Controls.Count) for c in [f.Controls[i]]
+                    if getattr(c, "Dock", None) == WinForms.DockStyle.Top), None)
+        bar_h = int(bar.Height) if bar is not None else 0
+        b = f.Bounds
+        say("initial bounds=%s client=%s min=%s bar_h=%s state=%s"
+            % (b, f.ClientSize, f.MinimumSize, bar_h, f.WindowState))
+        ok("初始是普通窗口", f.WindowState == WinForms.FormWindowState.Normal and b.Width > 300,
+           "state=%s w=%d" % (f.WindowState, b.Width))
+        ok("八向热区齐全", len(zones_of(f)) == 8, "zones=%s" % sorted(zones_of(f)))
+        import shell_float as _sf
+        _sf.set_cursor_probe(lambda: _cur[0])
+
+        r = drag(f, "e", 140, 0)
+        if r:
+            ok("右边缘最右拖 +140 → 宽度 +140, 左边不动",
+               abs((r[1].Width - r[0].Width) - 140) <= 12 and r[1].X == r[0].X,
+               "dw=%d dx=%d" % (r[1].Width - r[0].Width, r[1].X - r[0].X))
+        r = drag(f, "w", 80, 0)
+        if r:
+            ok("左边缘右拖 +80 → 左边右移, 宽度 -80",
+               abs((r[1].X - r[0].X) - 80) <= 12 and abs((r[1].Width - r[0].Width) + 80) <= 12,
+               "dx=%d dw=%d" % (r[1].X - r[0].X, r[1].Width - r[0].Width))
+        r = drag(f, "s", 0, 90)
+        if r:
+            ok("下边缘下拖 +90 → 高度 +90, 上边不动",
+               abs((r[1].Height - r[0].Height) - 90) <= 12 and r[1].Y == r[0].Y,
+               "dh=%d dy=%d" % (r[1].Height - r[0].Height, r[1].Y - r[0].Y))
+        r = drag(f, "se", 120, 70)
+        if r:
+            ok("右下角拖 +120/+70 → 宽高同时变大",
+               abs((r[1].Width - r[0].Width) - 120) <= 14 and abs((r[1].Height - r[0].Height) - 70) <= 14,
+               "dw=%d dh=%d" % (r[1].Width - r[0].Width, r[1].Height - r[0].Height))
+        r = drag(f, "n", 0, 60)
+        if r:
+            ok("上边缘下拖 +60 → 上边下移, 高度 -60",
+               abs((r[1].Y - r[0].Y) - 60) <= 12 and abs((r[1].Height - r[0].Height) + 60) <= 12,
+               "dy=%d dh=%d" % (r[1].Y - r[0].Y, r[1].Height - r[0].Height))
+        # 最小尺寸钳制: 往内拖 3000px, 宽度/高度必须停在最小尺寸上
+        mw, mh = int(f.MinimumSize.Width), int(f.MinimumSize.Height)
+        r = drag(f, "e", -3000, 0)
+        if r:
+            ok("右边缘往左拖到底 → 宽度停在最小 %d" % mw, r[1].Width == mw and r[1].X == r[0].X,
+               "w=%d" % r[1].Width)
+        r = drag(f, "s", 0, -3000)
+        if r:
+            ok("下边缘往上拖到底 → 高度停在最小 %d" % mh, r[1].Height == mh,
+               "h=%d" % r[1].Height)
+        # 缩到最小后网页内容区必须跟着缩(不是只换了外框)
+        cw, ch = f.ClientSize.Width, f.ClientSize.Height
+        say("after-min client=%s webview=%s" % (f.ClientSize, ctl.Size))
+        ok("网页内容区随窗口变化", int(ctl.Width) == int(cw) and int(ctl.Height) <= int(ch) - bar_h + 2,
+           "ctl=%s client=%s bar_h=%d" % (ctl.Size, f.ClientSize, bar_h))
+        # 放大回来再确认一次(缩小→放大这条路上也得分得到 Move)
+        r = drag(f, "se", 200, 160)
+        if r:
+            ok("右下角再放大 +200/+160", r[1].Width >= r[0].Width + 150 and r[1].Height >= r[0].Height + 120,
+               "dw=%d dh=%d" % (r[1].Width - r[0].Width, r[1].Height - r[0].Height))
+        say("final bounds=%s" % f.Bounds)
+        # 最大化态拖边: 应先还原成上次的浮动尺寸, 再从那个框继续缩放(与系统窗口一致)。
+        # 用标题栏右数第二枚「□」按钮进最大化(走产品自己的按钮判定 + _toggle_max)。
+        norm = f.Bounds
+        bw = int(round(34 * scale))
+        bx = int(bar.Width) - int(bw * 1.5)
+        by = max(2, int(bar.Height) // 2)
+        lp2 = (((by & 0xFFFF) << 16) | (bx & 0xFFFF))
+        u32.SendMessageW(bar.Handle.ToInt32(), 0x0201, 1, lp2)
+        u32.SendMessageW(bar.Handle.ToInt32(), 0x0202, 0, lp2)
+        time.sleep(0.8)
+        ok("点标题栏「□」进入最大化", f.WindowState == WinForms.FormWindowState.Maximized,
+           "state=%s" % f.WindowState)
+        r = drag(f, "e", 100, 0)
+        if r:
+            want_w = int(norm.Width) + 100
+            ok("最大化态拖边 → 先还原成浮动尺寸再缩放",
+               f.WindowState == WinForms.FormWindowState.Normal
+               and r[1].X == norm.X and abs(r[1].Width - want_w) <= 14,
+               "state=%s w=%d 期望w=%d x=%d 期望x=%d"
+               % (f.WindowState, r[1].Width, want_w, r[1].X, norm.X))
+    except Exception:
+        _log_exc("e2e-float-resize")
+        fails.append("异常")
+    finally:
+        try:
+            _sf.set_cursor_probe(None)   # 恢复真鼠标: 别把测试缝留在运行中的窗口壳里
+        except Exception:
+            pass
+        say("DONE pass=%d fail=%d" % (len([x for x in lines if x.startswith("[float-resize] PASS")]),
+                                      len(fails)))
+        try:
+            api.tab_close(tid)
+        except Exception:
+            pass
 
 
 def _e2e_float_run(api, url):
@@ -1027,7 +1284,7 @@ def _e2e_drag_to_tabbar(api, tid, say):
         return False
 
 
-def shell_main(e2e_url=None, e2e_float_url=None):
+def shell_main(e2e_url=None, e2e_float_url=None, e2e_float_resize_url=None):
     """窗口壳主流程: 起/复用服务 → WebView2 检测 → 主窗口(含标签页) → 全关后收尾。
 
     e2e_url 仅测试用(_e2e_shell.py): 主窗口就绪后自动走一次 open_in_app 桥调用,
@@ -1177,6 +1434,25 @@ def shell_main(e2e_url=None, e2e_float_url=None):
             import threading as _th
             _th.Thread(target=dump_controls, daemon=True).start()
             print("[float-e2e] DONE", flush=True)
+        if e2e_float_resize_url:
+            # v0.3.1.51 测试钩子: 悬浮窗八向缩放(真鼠标消息), 结果落 float_resize_e2e.log
+            try:
+                _e2e_float_resize_run(
+                    api, url if e2e_float_resize_url == "local" else e2e_float_resize_url)
+            except Exception:
+                import traceback
+                traceback.print_exc()
+            finally:
+                try:
+                    time.sleep(1)
+                    win.destroy()
+                except Exception:
+                    pass
+                try:
+                    app.shutdown(server)
+                except Exception:
+                    pass
+                os._exit(0)
         if e2e_float_url:
             # v0.3.1.34 测试钩子: 走一遍 新窗口 → 塞回标签页 → 拖出悬浮窗 → 关闭 全链路,
             # 每步 dump 控件归属(父窗体/可见性), 验证控件实例跨窗口迁移、页面不重载。

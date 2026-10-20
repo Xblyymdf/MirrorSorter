@@ -1,7 +1,7 @@
 ﻿; 洞鉴虚明 桌面端安装包 — NSIS 3.11 Unicode
 ; 产物: dist\洞鉴虚明vX.Y.Zdsk_安装包.exe (应用 onedir + WebView2 离线运行时)
-; 前置: ① PyInstaller 已按 洞鉴虚明*-installer.spec 产出 ..\dist\洞鉴虚明\
-;       ② redist\MicrosoftEdgeWebView2RuntimeInstallerX64.exe (微软官方离线包, fwlink 2099617)
+; 前置: ① PyInstaller 已按 洞鉴虚明*-installer.spec 产出 build/dist/洞鉴虚明/
+;       ② redist/MicrosoftEdgeWebView2RuntimeInstallerX64.exe (微软官方离线包, fwlink 2124701)
 Unicode true
 ManifestDPIAware true
 !include "MUI2.nsh"
@@ -16,7 +16,9 @@ ManifestDPIAware true
 !define WV2 "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"   ; WebView2 Evergreen 运行时
 
 Name "${APPNAME} ${APPVER}"
-OutFile "..\dist\${APPNAME}${APPVER}_安装包.exe"
+OutFile "..\build\dist\${APPNAME}${APPVER}_安装包.exe"   ; 产物统一进 build/dist/
+; 注意: 注释不要以反斜杠结尾 —— NSIS 会把注释末尾的 \ 当续行符, 把下一行的
+;       InstallDir 整条吃掉, 安装目录会掉回默认值。
 InstallDir "$PROGRAMFILES64\${APPNAME}"
 InstallDirRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${UNKEY}" "InstallLocation"
 RequestExecutionLevel admin
@@ -56,7 +58,7 @@ check_lock:
   ${EndIf}
 
   SetOutPath "$INSTDIR"
-  File /r "..\dist\${APPNAME}\*.*"
+  File /r "..\build\dist\${APPNAME}\*.*"
   SetOutPath "$INSTDIR\redist"
   File "redist\MicrosoftEdgeWebView2RuntimeInstallerX64.exe"
   SetOutPath "$INSTDIR"

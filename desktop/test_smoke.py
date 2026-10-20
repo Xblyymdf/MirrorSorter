@@ -16,7 +16,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PROJECT = os.path.dirname(os.path.abspath(__file__))
-TMP = os.path.join(PROJECT, "smoke-tmp")
+TMP = os.path.join(PROJECT, "build", "probe", "smoke-tmp")
 if os.path.isdir(TMP):
     shutil.rmtree(TMP, ignore_errors=True)
 os.makedirs(TMP, exist_ok=True)
@@ -296,6 +296,10 @@ app = importlib.util.module_from_spec(spec)
 sys.modules["app2"] = app
 spec.loader.exec_module(app)
 app.DATA_DIR = TMP   # 保持旧测试写法, 双保险隔离真实用户存档
+# v0.3.1.56: 出站闸门(同站点最小间隔/每分钟上限)是给真实抓取用的防刷网护栏,
+# 但单测会连着打同一站点(还 mock urlopen), 开着会让后面的用例互相限流。
+# 这里统一关掉, 另用"抓取:出站闸门真的会挡住连发"一条单独验证它本身有效。
+app._NET_GUARD_ON = False
 
 srv = ThreadingHTTPServer(("127.0.0.1", 8099), app.Handler)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -689,6 +693,63 @@ try:
     check("深挖: 到底后循环保护(不再增长)", sd6.get("end") is True and not sd6.get("items")
           and sd6.get("total") == 120, (sd6.get("total"), sd6.get("end")))
     app._search_wave.clear()
+
+    # --- B站直搜全空时, 首屏不许"一条B站视频都没有"(本地沉淀池兜底) ---
+    # 用户报的"搜索结果经常没有B站视频": 直搜接口被风控(-412)/WBI 签名失效/断网时,
+    # 旧实现把"接口失败"当成"这词没结果"(search_items 里 code!=0 直接 return []),
+    # 空页直接收工 → 首屏只剩贴吧。现在: 失败重试一次; 仍为空则用本地池里收过的 B站 条目兜底。
+    req("/api/settings", {"ai_full_scan": "0"})   # 关掉同步评分门禁, 只看"有没有 B站条目"
+    app._search_wave.clear()
+    _pool_it = {"key": "pool_bili_0001", "platform": "B站", "title": "沉淀池兜底测试视频",
+                "author": "池作者", "desc": "简介", "cover": "", "views": 300000,
+                "likes": 20, "duration": 180, "pubdate": int(time.time()) - 1800,
+                "url": "https://www.bilibili.com/video/pool_bili_0001"}
+    with app._db_lock:
+        app.db().execute("INSERT INTO items(key,json,fetched_at,score_at) VALUES(?,?,?,0) "
+                         "ON CONFLICT(key) DO UPDATE SET json=excluded.json,fetched_at=excluded.fetched_at",
+                         (_pool_it["key"], json.dumps(_pool_it, ensure_ascii=False), time.time()))
+        app.db().commit()
+    _bili_direct = app.search_items
+    app.search_items = lambda kw, page=1, limit=30, **kwx: []   # 模拟直搜全线失败
+    app.tb_search_items = lambda q, rn=20: []
+    sfb = req("/api/search?q=" + urllib.parse.quote("沉淀池兜底测试") + "&limit=30")
+    check("搜索兜底: 直搜全空时本地池出B站条目",
+          any(it.get("key") == "pool_bili_0001" for it in sfb.get("items", [])),
+          [(it.get("platform"), it.get("key")) for it in sfb.get("items", [])][:3])
+    # 空首波不能被当成正常结果缓存一小时, 否则同一个词一小时内永远只剩贴吧
+    check("搜索兜底: 空首波不缓存一小时",
+          "SEARCH_WAVE_TTL + 120" in open(app.__file__, encoding="utf-8").read())
+    app.search_items = _bili_direct
+    app.tb_search_items = lambda q, rn=20: []
+    app._search_wave.clear()
+    req("/api/settings", {"ai_full_scan": "1"})
+
+    # --- 搜索不受"最低播放量/时长"质量窗限制(那是信息流推荐的质量闸) ---
+    # 旧实现里 skip_age=True 只跳过时间窗, 播放量窗/时长窗仍对 B站 生效; 贴吧/小黑盒没有播放量字段
+    # 天然免疫 → 用户一设"最低播放量", 搜索结果就只剩贴吧, 表现成"搜索经常没有B站视频"。
+    # 注意: 播放量窗属于机器规则, 走 app.sset("m_min_views") 而不是 /api/settings 白名单
+    _old_min_views = app.sget("m_min_views")
+    req("/api/settings", {"ai_full_scan": "0"})
+    app.sset("m_min_views", "100000")
+    _win_it = {"key": "win_bili_0001", "platform": "B站", "title": "播放量窗测试视频",
+               "author": "作者", "desc": "简介", "cover": "", "views": 10, "likes": 0,
+               "duration": 60, "pubdate": int(time.time()) - 1800,
+               "url": "https://www.bilibili.com/video/win_bili_0001"}
+    _feed_kept = app.rules_filter([dict(_win_it)], skip_age=True)
+    check("搜索质量窗: 信息流仍按最低播放量筛", len(_feed_kept) == 0, len(_feed_kept))
+    _search_kept = app.rules_filter([dict(_win_it)], skip_age=True, skip_windows=True)
+    check("搜索质量窗: 显式搜索跳过播放量窗", len(_search_kept) == 1, len(_search_kept))
+    app._search_wave.clear()
+    app.search_items = lambda kw, page=1, limit=30, **kwx: ([dict(_win_it)] if page == 1 else [])
+    app.tb_search_items = lambda q, rn=20: []
+    sw = req("/api/search?q=" + urllib.parse.quote("播放量窗测试") + "&limit=30")
+    check("搜索质量窗: 低播放B站条目仍出现在搜索里",
+          any(it.get("key") == "win_bili_0001" for it in sw.get("items", [])),
+          [(it.get("platform"), it.get("key")) for it in sw.get("items", [])][:3])
+    app.search_items = _bili_direct
+    app._search_wave.clear()
+    app.sset("m_min_views", _old_min_views or "0")
+    req("/api/settings", {"ai_full_scan": "1"})
 
     # --- 推荐标准: 兴趣分门槛剔除 ---
     req("/api/settings", {"ai_interest_min": "7"})
@@ -1085,7 +1146,13 @@ try:
     # 候选不足目标(120bili+20tb, 目标30tb→截断至20): 全部采用, 均匀散布, 不丢条目
     mixed = app.mix_sources(mkpool(120, 20))
     n_tb = sum(1 for it in mixed if it.get("platform") == "贴吧")
-    check("权重混排: 总数不变", len(mixed) == 140, len(mixed))
+    # v0.3.1.57: 配额上限成为契约 —— 每路最多出 round(total*w/Σw) 条, 池子再多也截断,
+    # 免得高权重那路先把名额吃完、最低权重那路再把尾巴整段吃掉(用户报的"5% 直播刷一屏")。
+    _Wt = 115.0   # 这个池子里只有 B站(90)/贴吧(25), Σw 只算在场的平台
+    _n_b = sum(1 for it in mixed if it.get("platform") == "B站")
+    _cap_b = int(round(140 * 90 / _Wt))
+    check("权重混排: 高权重按配额截断(不再全采用)",
+          len(mixed) <= 140 and _n_b <= _cap_b and _n_b >= _cap_b - 12, (len(mixed), _n_b, _cap_b))
     check("权重混排: 候选不足时贴吧全采用", n_tb == 20, n_tb)
     gaps, last = [], -1
     for i, it in enumerate(mixed):
@@ -1223,13 +1290,20 @@ try:
     req("/api/tieba", {"allow_help": False})
     check("求助帖API: 关闭保存", req("/api/tieba")["allow_help"] is False)
     req("/api/tieba", {"allow_help": True})
-    # 权重白名单(合法: 0/25/50/75/100)
+    # 权重范围: v0.3.1.52 起改成 0-100 连续可调(左栏每条内容源下面是一条滑条),
+    # 只拒绝越界/非数字; 旧的"只认 0/25/50/75/100 四档"白名单已取消
     req("/api/tieba", {"tb_weight": "37", "bili_weight": "99"})
     d = req("/api/tieba")
-    check("权重白名单: 非法值忽略", d["bili_weight"] == 90 and d["tb_weight"] == 25, (d["bili_weight"], d["tb_weight"]))
+    check("权重范围: 0-100 任意整数可存", d["bili_weight"] == 99 and d["tb_weight"] == 37,
+          (d["bili_weight"], d["tb_weight"]))
+    req("/api/tieba", {"tb_weight": "101", "bili_weight": "-1"})
+    d = req("/api/tieba")
+    check("权重范围: 越界值忽略", d["bili_weight"] == 99 and d["tb_weight"] == 37,
+          (d["bili_weight"], d["tb_weight"]))
     req("/api/tieba", {"tb_weight": "100", "bili_weight": "25"})
     d = req("/api/tieba")
-    check("权重白名单: 100合法", d["bili_weight"] == 25 and d["tb_weight"] == 100, (d["bili_weight"], d["tb_weight"]))
+    check("权重范围: 100合法", d["bili_weight"] == 25 and d["tb_weight"] == 100,
+          (d["bili_weight"], d["tb_weight"]))
     req("/api/tieba", {"tb_weight": "25", "bili_weight": "90"})
     # 平台豁免: 贴吧条目不过分区检查
     check("item_domain_ok 贴吧豁免", app.item_domain_ok({"platform": "贴吧", "tname": "X"}, {"anime"}))
@@ -1270,6 +1344,9 @@ try:
         tb_unread = app.tb_unread_messages()
         check("贴吧未读: 回复我加@我真实汇总", tb_unread == 6, tb_unread)
         app.urllib.request.urlopen = lambda *args, **kwargs: TbUnreadResponse("<script>count:{}</script>")
+        # 这里验的是"解析失败就当未知", 不是缓存有效期 —— 先让缓存过期, 否则新实现会直接
+        # 返回 5 分钟内的旧值(那本身是期望行为)。
+        app._tb_unread.update(ts=0, data=None)
         check("贴吧未读: 缺失计数保持未知", app.tb_unread_messages() is None)
     finally:
         app.tb_login_check, app.urllib.request.urlopen = old_tb_check, old_urlopen
@@ -1315,7 +1392,9 @@ try:
         {"key": "b%d" % i, "platform": "B站", "title": "v%d" % i, "src": "B%d" % (i % 3)}
         for i in range(30)])
     n_xhh = sum(1 for it in mp if it.get("platform") == "小黑盒")
-    check("小黑盒混排: 条目保留", n_xhh == 10, n_xhh)
+    # 配额 = round(40 * 15 / 130) ≈ 5: 权重 15 的一路不再和 B站 平分秋色,
+    # 超出的条目留在池里等后续构建重混(不是丢掉)。
+    check("小黑盒混排: 按配额保留", 3 <= n_xhh <= 6, n_xhh)
     # 权重API含小黑盒
     d = req("/api/tieba")
     pnames = [p["name"] for p in d.get("platforms", [])]
@@ -2339,23 +2418,338 @@ try:
     check("几何:拖拽每步都刷 idle 任务", 'root.geometry("+%d+%d" % (nx, ny))' in _src
           and _src.count('root.update_idletasks()') >= 6)
 
-    # ---------- 主页面预览档位: ×1 必须仍在, 且走「原位播放」分支 ----------
-    # ×1 的意义是「不放大也能看」——对已足够大的封面/竖屏视频, 放大反而糊。
-    # 它必须和小程序里的放大档一样的可见性, 不能被谁顺手删掉。
+    # ---------- 界面只剩一套: 新版界面顶替旧版, 旧入口与旧废案一并删除(v0.3.1.47dsk 起) ----------
+    # 旧版 web/index.html + app.js + style.css 已整份替换为新版界面(同名同路径),
+    # 旧版的 /new 与 /ui(版本选择页) 入口、web/new/ 目录、ui.html 全部删除。
+    # 下面几条钉的是"别再冒出第二套界面", 以及首页的静态引用必须是根路径 ——
+    # 引用写成 /new/style.css 而文件已经搬到根, 页面会直接白板。
     _root = os.path.dirname(os.path.abspath(app.__file__))
     _html = open(os.path.join(_root, "web", "index.html"), encoding="utf-8").read()
     _js = open(os.path.join(_root, "web", "app.js"), encoding="utf-8").read()
     _css = open(os.path.join(_root, "web", "style.css"), encoding="utf-8").read()
-    check("预览:×1 档位按钮存在", 'data-v="1"' in _html, _html[_html.find('id="pvRow"'):][:200])
-    check("预览:×1 在倍率白名单内", "PV_ZOOMS = [1," in _js)
-    check("预览:非法倍率回退到 2", "PV_ZOOMS.includes(v) ? v : 2" in _js)
-    check("预览:×1 走原位分支", "if (zoom === 1) {" in _js)
-    check("预览:×1 有独立样式钩子", ".pv-overlay.pv-flat" in _css and 'zoom === 1 ? " pv-flat"' in _js)
-    # 窗口窄 + 高倍率时浮层会比信息流还宽, 简单的 Math.max/min 夹取会退化成"永远贴左缘"。
-    # 那时应当按信息流居中(两侧对称溢出), 这条断言钉住这个分支不被删掉。
-    check("预览:过宽时改为居中而非贴边",
-          "ovW >= feedRect.width" in _js and "(feedRect.width - ovW) / 2" in _js)
-    check("预览:浮层挂html下绕开zoom坐标系", "document.documentElement.appendChild(ov)" in _js)
+    check("界面:首页引用根路径 app.js", 'src="/app.js"' in _html)
+    check("界面:首页引用根路径 style.css", 'href="/style.css"' in _html)
+    check("界面:没有残留的 /new/ 目录", not os.path.isdir(os.path.join(_root, "web", "new")))
+    check("界面:没有 ui.html 版本选择页", not os.path.exists(os.path.join(_root, "web", "ui.html")))
+    check("界面:后端没有 /new 路由与资源白名单",
+          '"/new"' not in _src and "_NEW_ASSET_RE" not in _src)
+    check("界面:页脚版本号跟随 APP_VER",
+          ("洞鉴虚明 " + app.APP_VER) in _html, app.APP_VER)
+    # 用户点名的两个废案: AI 推荐标准整组(兴趣分门槛/评分范围/每批条数/缓存时长)
+    # 与卡片上的「打开原文」「站内播放」按钮 —— 删了就不该被谁顺手加回来。
+    check("界面:AI 推荐标准废案已删除",
+          "aiminRow" not in _html and "aifullRow" not in _html
+          and "aibatchRow" not in _html and "aicacheRow" not in _html
+          and "推荐标准" not in _html)
+    # 只删按钮, 不删入口: 点标题/缩略图仍然打开原文(openAttr 上的 data-act="open")。
+    # 所以这里断的是「没有按钮」而不是「没有 data-act=open」。
+    check("界面:卡片上没有「打开原文」按钮", "打开原文</button>" not in _js)
+    check("界面:卡片上没有「站内播放」按钮", 'data-act="play"' not in _js)
+    # 设置入口在左栏最上方且带「设置」文字(原来缩在左下角只有图标, 用户找不到)
+    check("界面:设置入口在左栏顶部且带文字",
+          'id="btnSettings" class="nav setEntry"' in _html and ">设置</button>" in _html)
+    check("界面:设置入口有独立样式", "#btnSettings.setEntry" in _css)
+    # 字体「中」= zoom 1.15, 旧规则 minmax(330px,1fr) 在这个缩放下只排两列 —— 改成显式三列
+    check("布局:大图模式固定三列", "grid-template-columns:repeat(3,minmax(0,1fr))" in _css)
+    # 设置页铺满: 旧规则 .svPanel{max-width:660px} 把内容全挤在左边
+    # 注意别把注释里的 "原本是 max-width:660px" 当成命中: 这里查的是规则本身
+    check("布局:设置页铺满且有栏目分栏", ".svPanel.on{display:grid" in _css
+          and ".svPanel{max-width" not in _css)
+    # 三个平台的登录头像要显示在搜索框右侧(与旧版一致)
+    check("界面:顶栏三平台头像",
+          'id="topAvaBili"' in _html and 'id="topAvaTb"' in _html and 'id="topAvaXhh"' in _html)
+    check("界面:顶栏头像有样式", "#topAvatars" in _css)
+    # hidden 属性会被 display:flex 盖掉 → 没登录也画出三枚假头像, 必须显式隐藏
+    check("界面:顶栏头像框未登录时隐藏", "#topAvatars[hidden]" in _css)
+    # 大图列数不能只靠 CSS 断点: 字体「中/大」走的是 document.body.style.zoom,
+    # 媒体查询量到的是缩放前的视口宽, 所以列数改由 JS 按 .big 的真实宽度算。
+    check("布局:大图列数按缩放后宽度算",
+          "function applyListCols()" in _js and "w >= 640 ? 3" in _js)
+    # v0.3.1.52: 设置页统一改成一侧单栏（用户: 左右双栏看着乱，要一列顺着读下来）。
+    # 原来那套"按宽度量列数、两列之间画竖线"的做法整体删除，别再被谁加回来。
+    check("布局:设置页/筛选页统一单栏",
+          ".svPanel.on{display:grid;grid-template-columns:1fr;" in _css
+          and ".mPane.on{display:grid;grid-template-columns:1fr;" in _css)
+    # 内容源顺序: B站 → B站直播（用户点名的位置）→ 贴吧 → 小黑盒，每栏下面一条占比滑条
+    _i_bili = _html.index('data-src="B站"')
+    _i_live = _html.index('data-src="B站直播"')
+    _i_tb = _html.index('data-src="贴吧"')
+    check("界面:内容源顺序 B站→B站直播→贴吧", _i_bili < _i_live < _i_tb)
+    check("界面:每条内容源下面带占比滑条",
+          _html.count('class="share"') == 4 and "renderRailShares(" in _js
+          and '"B站直播": "live_weight"' in _js)
+    # 拉黑名单不再平铺: 固定最大高度的滚动框, 高度明显高于常规备注框(rows 6/8)
+    check("界面:拉黑名单是滚动框",
+          'id="mBlList" class="chips blBox"' in _html and ".blBox{max-height:320px" in _css)
+    check("界面:常规备注框加高", 'id="prefsNote" rows="6"' in _html
+          and 'id="dislikeNote" rows="8"' in _html)
+    # B站直播默认占比按用户要求降到 5%（0-100 全区间可调，不再是四档按钮）
+    check("界面:B站直播默认占比 5%", str(app.DEFAULTS.get("live_weight")) == "5"
+          and ("B站直播\", \"live_weight\", 5" in _src))
+    # v0.3.1.58: 百度安全验证通过后, 贴吧请求必须走**那扇浏览器窗口**。
+    # 实测同一个 URL: 浏览器里 200, 把同样的 Cookie 抄出来用 urllib 打还是 403(按指纹判),
+    # 所以"拖完滑块软件里还是没贴吧内容"就卡在这一步 —— 别再退回"抄 cookie 自己请求"。
+    check("抓取:滑块验证后走浏览器通道取贴吧页",
+          "def _tb_browser_html(" in _src and "_TB_BR" in _src
+          and "html, berr = _tb_browser_html(url" in _src
+          and "return tb_verify_page_ok(html), url, 200" in _src)
+    # 验证窗口不能再整份删 profile: 滑块通过的会话就存在里面, 删了等于每次都要重新拖
+    check("抓取:验证窗口保留浏览器会话",
+          "SingletonLock" in _src and 'def _cdp_launch(url, profile_name="_tb_login_profile", fresh=False)' in _src)
+    # 占比数字不再标黄（用户: 5% 没必要弄成黄色文本）
+    check("界面:占比数字不用黄色高亮",
+          'pc.classList.remove("warn")' in _js and ".share .pc.warn" not in _css)
+    # B站直播筛选: 观众量门槛 + 只看关注
+    check("界面:直播筛选有观众量门槛和只看关注",
+          'id="mLiveMin"' in _html and 'id="mLiveFollowOnly"' in _html
+          and 'data-m="live"' in _html and "/api/live/settings" in _js
+          and 'id="mLiveSave"' in _html)
+    # v0.3.1.59: 大图模式动作行曾加 overflow:hidden 收住按钮, 结果把按钮的
+    # ::after 中文说明浮层一起裁掉 —— 悬停只剩图标, 看不出按钮干什么。
+    check("界面:大图模式按钮说明不被裁掉",
+          "overflow:visible" in _css
+          and "flex-wrap:nowrap;overflow:visible" in _css
+          and "flex-wrap:nowrap;overflow:hidden" not in _css)
+    # v0.3.1.60: 大图模式的标题挪到封面下方(用户要求)。
+    # 靠 order 换位置(不动 DOM 顺序), 文字帖不参与 —— 否则正文会被顶到标题上面。
+    check("界面:大图模式标题在封面下方",
+          "#list.big .card:not(.text) .media{order:-1}" in _css
+          and "#list.big .card:not(.text) .col .meta{display:none}" in _css)
+    # v0.3.1.64(用户要求): 大图模式下作者名落到标题正下方, 并用强调色 —— 不再压在封面角标里。
+    # 只在 #list.big 显示: 单栏/双栏的作者本来就在 .col .meta 里; 文字帖/封面挂了的卡片也一样,
+    # 所以 .text 卡片要藏掉这条, 否则同一个作者会出现两遍。
+    check("界面:大图模式作者在标题下方用强调色",
+          '<div class="byline">' in _js and '<span class="au">' in _js
+          and '<span class="ov au">' not in _js
+          and "#list.big .card .byline{display:block" in _css
+          and "#list.big .card .byline .au{color:var(--accent-ink)}" in _css
+          and "#list.big .card.text .byline{display:none}" in _css)
+    # v0.3.1.66(用户要求): 「几天前」挪到 up 名那一行, 封面角标不再重复显示时间。
+    check("界面:发布时间并到 up 名那一行",
+          '<span class="tm"> · ' in _js and '<span class="ov tm">' not in _js
+          and "#list.big .card .byline .tm{color:var(--fg2)}" in _css
+          and ".stats .ov" not in _css)
+    # v0.3.1.66(用户要求): 关注的人发布的内容, 在作者名前挂「关注的人」小标。
+    check("界面:关注的人发布时名字前有小标",
+          'data-follow="1"' in _js and "关注的人" in _js
+          and 'const followed = !!it.following;' in _js
+          and ".pf{display:inline-block" in _css
+          and 'color:var(--accent-ink);background:var(--accent-soft)}' in _css)
+    # v0.3.1.60: 设置里新增「信息来源遵循强调色」, 默认关闭; 打开后所有来源角标/左栏图标统一强调色
+    check("界面:信息来源可跟随强调色",
+          'id="srcAccentRow"' in _html and 'data-srcacc="1"' in _html
+          and '["#srcAccentRow", "srcacc"]' in _js and "srcacc: \"0\"" in _js
+          and 'setAttribute("data-srcacc"' in _js
+          and 'html[data-srcacc="1"] .pb.bili' in _css
+          and 'html[data-srcacc="1"] .mark.live' in _css)
+    # v0.3.1.61(用户要求): 设置页别铺满整宽, 收到 65% 就够 —— 但要有下限, 否则窄窗口里
+    # 表单行会折成两行、控件被压扁。
+    check("布局:设置页收到 65% 宽",
+          "width:65%" in _css and "min-width:470px" in _css and ".svPanel.on{display:grid" in _css)
+    # 卡片角标宽度要一样: 「B站」和「小黑盒」字数不同, 不固定宽度会把标题顶得左右不齐
+    check("布局:卡片角标定宽, 标题左缘对齐",
+          "min-width:44px;text-align:center" in _css)
+    # v0.3.1.61: 文字帖在大图模式给一块「文字封面」(正文开头), 这样没有封面时标题
+    # 也和带封面的卡片落在同一条线上, 又不留空图位。
+    check("布局:文字帖在大图模式有文字封面",
+          "class=\"tpanel\"" in _js and ".tpanel{display:none}" in _css
+          and "#list.big .card .tpanel{display:block;width:100%;aspect-ratio:16/9" in _css
+          and "#list.big .card.text .desc{display:none}" in _css)
+    # v0.3.1.61: 聊天栏能直接改设置 —— 本地规则解析后立刻生效, 并把这段对话落库
+    check("界面:聊天栏能直接改设置",
+          "async function nlApplySettings(" in _js and "const NL_PLAT" in _js
+          and "if (!payload) {" in _js and "已改好：" in _js
+          and '"/api/chat/note"' in _src)
+    # v0.3.1.62: 聊天里改设置改成「先请模型想清楚」, 思考强度可在聊天栏里选(关/低/中/高),
+    # 模型不可用或没读懂再退回本地关键词规则 —— 两条路都要在, 否则没额度就改不了设置。
+    check("聊天:改设置先过模型且带思考档位",
+          "def chat_plan(" in _src and "def call_llm_plan(" in _src
+          and '"type": "disabled"' in _src
+          and '"reasoning_effort"' in _src
+          and '"/api/chat/plan"' in _src
+          and "async function aiPlanSettings(" in _js and "function applyPlan(" in _js
+          and 'id="chatEffort"' in _html and 'effort: "mid"' in _js
+          and "!!d.ai_on" in _js)
+    # 用户消息气泡曾被左栏「个人」按钮的全局 .me{flex:1} 命中, 在纵向 flex 里被撑成大绿块。
+    # 规则必须限定在 .railFoot 里, 别把 .me 写回全局。
+    check("界面:用户消息气泡不被撑满",
+          ".railFoot .me{flex:1" in _css and "\n.me{flex:1" not in _css)
+    check("抓取:直播按观众量与关注筛选",
+          "def live_filters(" in _src and "_live_pass(it, mn, follow_only)" in _src
+          and '"live_min_viewers"' in _src and '"live_only_followed"' in _src)
+    # v0.3.1.53: 滑条不再用 accent-color 整条上高饱和强调色（用户: 太亮晃眼）。
+    # 改成自绘轨道: 填充段 = --accent-strong, 未填充段 = --line, 比例由 JS 写 --pct。
+    # 别退回 accent-color —— 一屏五六条并排时会亮得刺眼。
+    check("界面:滑条自绘轨道且填充分色",
+          "input[type=range]::-webkit-slider-runnable-track" in _css
+          and "var(--accent-strong) 0 var(--pct,50%)" in _css
+          and "function paintRange(" in _js and "paintRanges()" in _js
+          and "accent-color:var(--accent-ink)" not in _css)
+    # v0.3.1.53: 没有封面的文字帖不留空图位（用户: 空图片显示太丑）, 直接铺正文。
+    check("界面:无封面卡片不用空图位",
+          ".card.text .thumb{display:none}" in _css
+          and "window.msImgFail" in _js and "class=\"card' + (hasCover ? \"\" : \" text\")" in _js
+          and "function hasBody(" in _js
+          and "esc((it.title || \"?\").slice(0, 1))" not in _js)
+    # v0.3.1.53: 占比只走六档 0/5/25/50/75/100（用户: 一般 25% 一档, 另补一个 5% 小档）。
+    # 拖到两档中间会被吸到最近的档, 键盘按档跳 —— 别再退回 step=1 的连续值。
+    check("界面:占比只走六档且会吸附",
+          "const SHARE_STEPS = [0, 5, 25, 50, 75, 100];" in _js
+          and "function snapShare(" in _js and "const base = SHARE_STEPS;" in _js
+          and 'inp.addEventListener("keydown"' in _js)
+    check("界面:封面加载失败自动转文字帖", 'onerror="msImgFail(this)"' in _js)
+    # v0.3.1.53: 大图模式动作行不占位(浮层), 空出来的那条带子平时显示一行简介
+    # (没简介就显示作者/播放/时间), 悬停换成按钮且卡片高度不变(用户报的"空出一块")。
+    check("界面:大图模式空带子显示一行简介",
+          "#list.big .card .bdesc" in _css and 'class="bdesc"' in _js
+          and "#list.big .card .acts{position:absolute" in _css
+          and "#list.big .card:hover .bdesc" in _css
+          and "nometa" in _js)
+    # 贴吧 403 有两种: 登录过期 / 百度安全验证拦 IP。分型报错 + 10 分钟冷却 + 刷新可放行一次,
+    # 否则用户看到的永远是"抓取失败"且要干等一小时(用户报的"怎么老是抓取失败")。
+    check("抓取:贴吧403区分为百度安全验证",
+          "def _tb_err_text" in _src and "百度安全验证(403)" in _src)
+    check("抓取:贴吧冷却10分钟且刷新可放行",
+          "_tb_cooldown_until = int(time.time()) + 600" in _src
+          and "def _tb_allow_retry" in _src and "_tb_allow_retry()" in _src)
+    check("界面:抓取失败写清原因", '被百度拦截' in _js)
+    # v0.3.1.55: 被百度安全验证拦住时不能只报错让用户干等 —— 弹出真浏览器窗口让用户
+    # 自己拖滑块, 通过后把浏览器里的 baidu cookie 抄进 tb_verify_cookie 供抓取沿用,
+    # 然后清冷却、自动重抓。光提示"被拦截"= 用户以为功能坏了(用户原话)。
+    check("验证:百度安全验证有人工滑块通道",
+          "def tb_verify_start" in _src and "def tb_verify_poll" in _src
+          and "def tb_verify_page_ok" in _src and "def _tb_verify_probe" in _src
+          and '"/api/tieba/verify/start"' in _src
+          and '"/api/tieba/verify/poll"' in _src)
+    check("验证:验证 cookie 会与登录 cookie 合并发出去",
+          "def _tb_cookie_header" in _src and "tb_verify_cookie()" in _src
+          and '"tb_verify_cookie"' in _src)
+    check("验证:通过后清冷却并重新抓取",
+          "sset(\"tb_verify_cookie\", cookie_str)" in _src
+          and "_tb_cooldown_until = 0" in _src)
+    check("验证:左栏拦截行可点开验证窗口",
+          '"need_verify"' in _src and "verify: true" in _js
+          and "function startTbVerify(" in _js and 'data-verify="1"' in _js
+          and ".st.verifiable" in _css)
+    # 前端是用 POST 调这三个接口的, 只注册在 do_GET 就会 404 —— 用户点了"没反应"的根因。
+    check("验证:验证接口GET/POST都注册",
+          _src.count('"/api/tieba/verify/start"') >= 2
+          and _src.count('"/api/tieba/verify/poll"') >= 2
+          and _src.count('"/api/tieba/verify/stop"') >= 2)
+    # v0.3.1.56: 用户问"为什么这么容易触发安全检测" —— 查出来是同一秒里好几路自己在抓。
+    # 补池必须只有一个入口(单飞 + 忙时合并), 否则刷新按钮/滚动补池/见底补池/预热各起一个构建,
+    # 同时往贴吧发好几串请求; 而旧实现"令牌变了就不清 building"会把标志永久钉死。
+    check("抓取:补池走单飞且忙时合并",
+          "def kick_build(" in _src and "_BUILD_PENDING = True" in _src
+          and '_claimed": True' in _src
+          and _src.count("threading.Thread(target=build_universe") == 1
+          and "if token == _uni_token:   # 仍是最新设置版本才允许清标志" not in _src)
+    check("抓取:出站按平台限速且可观测",
+          "def _net_guard(" in _src and "def net_stats(" in _src
+          and _src.count('_net_guard("tieba"') >= 5 and '"net": net_stats()' in _src)
+    check("抓取:未读角标不再一分钟查四次",
+          "setInterval(loadMessages, 300000)" in _js
+          and "_tb_login_cache" in _src and "_tb_unread" in _src)
+    # v0.3.1.66(用户要求): 点完「消息」按钮, 红点要立刻消失, 不能等下一轮 5 分钟刷新。
+    # 做法是服务端存"看过时的未读数"快照(msg_seen), 角标只画 unread - seen; 纯本地语义。
+    _mr = req("/api/messages/read", {"seen": {"bili": 3, "tieba": 1, "xhh": "7"}})
+    _ms = app.msg_seen()
+    _mr2 = req("/api/messages/read", {"seen": {"bili": -5, "xhh": "abc", "junk": 99}})
+    _ms2 = app.msg_seen()
+    check("界面:点开消息后红点立刻消失(未读快照落库)",
+          _mr.get("ok") is True and _ms == {"bili": 3, "tieba": 1, "xhh": 7}
+          and _ms2 == {"bili": 0, "tieba": 0, "xhh": 0}      # 脏输入一律夹到 0, 不认识键丢掉
+          and "markMessagesRead" in _js and '"/api/messages/read"' in _js
+          and "function paintMsgBadge(" in _js
+          and "markMessagesRead(); renderMsgPane();" in _js
+          and "def msg_seen(" in _src and '"seen": msg_seen()' in _src, (_ms, _ms2))
+    # 闸门本身: 同一站点连发第二下必须被挡(前面全局关掉了它, 这里单独开关验一次)
+    _guard_old = app._NET_GUARD_ON
+    try:
+        app._NET_GUARD_ON = True
+        with app._NET_LOCK:
+            app._NET["last"].clear(); app._NET["minute"].clear(); app._NET["min"] = 0
+        _g1 = app._net_guard("unit-gate", 1.0, 3)
+        _g2 = app._net_guard("unit-gate", 1.0, 3)
+    finally:
+        app._NET_GUARD_ON = _guard_old
+    check("抓取:出站闸门真的会挡住连发", _g1 is True and _g2 is False, (_g1, _g2))
+    # v0.3.1.66(用户要求: 少触发风控): 撞上 403/安全验证/-352 之后要给这个站点挂惩罚期 ——
+    # 期内最小间隔翻倍、每分钟额度减半, 而且"只延长不缩短"。这里直接验机制本身。
+    _pen_old = app._NET_GUARD_ON
+    try:
+        app._NET_GUARD_ON = True
+        with app._NET_LOCK:
+            app._NET["penalty"].clear(); app._NET["last"].clear()
+            app._NET["minute"].clear(); app._NET["min"] = 0
+        app._net_penalty("unit-pen", 600, 2.0)
+        app._net_penalty("unit-pen", 60, 1.5)     # 想缩短 → 必须被拒
+        _p1 = app._net_guard("unit-pen", 1.0, 4)
+        _p2 = app._net_guard("unit-pen", 1.0, 4)
+        _pen = app.net_stats().get("penalty", {})
+    finally:
+        app._NET_GUARD_ON = _pen_old
+        with app._NET_LOCK:
+            app._NET["penalty"].pop("unit-pen", None)
+    check("抓取:撞风控后进入惩罚期且不可缩短",
+          _p1 is True and _p2 is False and _pen.get("unit-pen", 0) > 500, (_p1, _p2, _pen))
+    # 抖动的方向只有一个: 只能把间隔拉长, 不能比设定的最小间隔更密(否则等于给自己松绑)。
+    check("抓取:请求间隔有向上抖动",
+          "random.uniform(1.0, 1.45)" in _src and "def _net_penalty(" in _src
+          and "def _net_pace(" in _src and '_net_penalty("tieba"' in _src
+          and '_net_penalty("bili"' in _src and "_net_pace(\"bili-api\"" in _src)
+    # v0.3.1.57: 直播档位 5%, 实际却刷出一屏(用户报的)。根因是混排把"别的源掏空后
+    # 剩下的名额"整段给了最后一路: 27(B站)/14(小黑盒)/50(直播) 的池子原样出成
+    # 27/14/50 = 直播 55%, 末尾连排 44 条。现在按权重给每路设配额上限, 并做最大缺口
+    # 均摊 + 尾部截断 —— 5% 的直播就该是几十条里一两条, 绝不铺满。
+    _mix_in = ([{"key": "b%d" % i, "platform": "B站", "title": "b%d" % i, "views": 1} for i in range(27)]
+               + [{"key": "x%d" % i, "platform": "小黑盒", "title": "x%d" % i, "views": 1} for i in range(14)]
+               + [{"key": "l%d" % i, "platform": "B站直播", "title": "l%d" % i, "views": 1} for i in range(50)])
+    _mix_out = app.mix_sources(_mix_in)
+    _n_live = sum(1 for it in _mix_out if it.get("platform") == "B站直播")
+    _n_all = len(_mix_out) or 1
+    _run, _live_run, _last = 1, 0, (_mix_out[0].get("platform") if _mix_out else "")
+    for _it in _mix_out[1:]:
+        _p = _it.get("platform") or "B站"
+        _run = _run + 1 if _p == _last else 1
+        if _p == "B站直播":
+            _live_run = max(_live_run, _run)
+        _last = _p
+    check("抓取:低权重平台不会补满空位",
+          _n_live <= 5 and _n_live <= 0.15 * _n_all and _live_run <= 2,
+          (_n_live, _n_all, _live_run))
+    # 推荐理由默认关闭: 只改默认值对老存档没用(存档里写着 show), 必须带一次性迁移
+    check("界面:推荐理由默认关闭",
+          'reason: "hide"' in _js and "ms-new-prefs-reason-off" in _js)
+    # 大图模式不显示简介
+    check("布局:大图模式不显示简介", "#list.big .card .desc{display:none}" in _css)
+    # 卡片动作默认只出图标, 悬停才显示文字
+    check("界面:卡片动作默认只显示图标", "#list .card .acts button{font-size:0" in _css)
+    # 悬停文字必须是"不重排"的浮层: 早先放回 font-size/padding 会撑宽按钮, 把右邻顶走,
+    # 鼠标横扫会跳过中间那个(用户实测报的问题)。所以文字走 data-label 的 ::after 浮层,
+    # 且旧的"悬停改字号"规则必须已经删干净。
+    check("界面:悬停文字是不重排的浮层",
+          'content:attr(data-label)' in _css and 'data-label="换一条"' in _js)
+    check("界面:悬停不再改按钮字号/内边距",
+          "font-size:11.5px;gap:5px;padding:3px 9px" not in _css)
+    # 悬停预览播放按要求加回来: 就地静音试播(走 /api/preview), 不做 2× 放大浮层
+    check("界面:悬停预览播放已恢复",
+          "function startPreview(" in _js and "/api/preview?bvid=" in _js
+          and ".thumb .pvVid" in _css)
+    # 打开原文必须走壳桥 open_in_app(新窗口/新标签页): pywebview 在
+    # OPEN_EXTERNAL_LINKS_IN_BROWSER=False 时把 window.open 当成"在当前 WebView 里导航",
+    # 主界面会被目标网页整页顶掉, 点返回只能重载 index.html(用户报的"回退之后严重问题")。
+    check("界面:打开原文走壳桥(新窗口/新标签页)",
+          "function openExternal(" in _js and "open_in_app" in _js
+          and "function shellBridge()" in _js
+          and 'openItem(key, card.dataset.url, tt ? tt.textContent : "")' in _js)
+    # 壳里桥没就绪也只能排队等 pywebviewready, 不许 window.open 把界面顶掉;
+    # 允许的 window.open 只有两处兜底: 壳桥调用失败后的纯浏览器退路 + 压根不在壳里。
+    check("界面:壳里不回退 window.open 顶掉界面",
+          "shellQueue" in _js and "inShellWebview" in _js
+          and _js.count('window.open(url, "_blank", "noopener")') == 2)
+    check("界面:打开原文不再直接 window.open",
+          'if (url) window.open(url, "_blank", "noopener");' not in _js)
 
     # ---------- 孤儿球清理: tasklist 输出必须按 GBK 解 ----------
     # 中文 Windows 的 tasklist 输出是 GBK; 以前用 text=True 让 subprocess 按 UTF-8 解,
@@ -2365,23 +2759,22 @@ try:
     check("清理:按 GBK 优先解码", 'for enc in ("gbk", "utf-8")' in _src)
     check("清理:解码失败有兜底", 'decode("utf-8", "replace")' in _src)
 
-    # ---------- 长按抑制标志: 全站必须用 window.__lpSuppress ----------
-    # 曾经写值用 window.__lpSuppress、读值用裸 lpSuppress, 于是 document 上的捕获阶段
-    # click 处理器每次都抛 ReferenceError("lpSuppress is not defined") —— 每次点击都报错,
-    # 且长按菜单后的那次点击会穿透。这条断言钉死命名一致。
-    # 先剥掉注释再查: 注释里为了说明由来会提到那个裸名字, 不该算命中。
+    # ---------- 旧版遗留: 长按抑制已随旧界面上岸, 悬停预览只回了一半 ----------
+    # 新版界面没有长按菜单(触屏那套); 封面悬停预览在 v0.3.1.48dsk 按用户要求加回来了,
+    # 但加回来的是"就地静音试播", 不是 89a4638 删掉的 2× 放大浮层 ——
+    # 那个浮层是用户明确说不要的, 所以这里改成"放大浮层不许再出现"。
     import re as _re
     _js_code = _re.sub(r"//[^\n]*", "", _re.sub(r"/\*.*?\*/", "", _js, flags=_re.S))
     _bare = _re.findall(r'(?<![.\w])lpSuppress(?![.\w])', _js_code)
-    check("长按:无裸 lpSuppress 引用", not _bare, "裸引用 %d 处" % len(_bare))
-    check("长按:统一走 window.__lpSuppress",
-          "window.__lpSuppress" in _js_code and _js_code.count("window.__lpSuppress") >= 3,
-          _js_code.count("window.__lpSuppress"))
+    check("旧版:没有长按抑制残留", not _bare, "裸引用 %d 处" % len(_bare))
+    check("旧版:没有封面放大浮层",
+          "pv-overlay" not in _js_code and "PV_ZOOMS" not in _js_code)
 
     # ---------- 设置页的「找不到球」入口 ----------
     check("定位:设置页有定位按钮", 'id="floatBallFind"' in _html)
     check("定位:按钮已绑事件", "#floatBallFind" in _js and "/api/ball_recall_go" in _js)
-    check("定位:按钮有独立样式", ".fb-acts" in _css and "#floatBallFind" in _css)
+    # 新版界面里它的样式钩子是 .alt(次级按钮), 不再有旧版那套 .fb-acts 布局块
+    check("定位:按钮有独立样式", 'id="floatBallFind" class="alt"' in _html and ".alt" in _css)
     check("定位:未运行时不误报成功",
           "先点「开启悬浮窗」" in _js)
     # 请求发出去 ≠ 球收到了(球靠 2.5s 心跳取信号), 所以必须等回执才敢报成功,

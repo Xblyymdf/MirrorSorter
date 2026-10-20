@@ -1,0 +1,181 @@
+/* v0.4.1dsk 检测更新前端行为测试：直接抽取 web/app.js 里的真实代码，在 vm 里跑。
+   假 DOM + 假 fetch 队列 + 手动时钟（setInterval 只登记，不真等 500ms）。 */
+const fs = require("fs");
+const vm = require("vm");
+
+const SRC = fs.readFileSync("web/app.js", "utf8");
+const START = SRC.indexOf("/* ================= 自动更新");
+const MARK = 'window.addEventListener("pywebviewready", updWireShell);';
+const END = SRC.indexOf(MARK, START) + MARK.length;
+if (START < 0 || SRC.indexOf(MARK, START) < 0) {
+  console.error("FAIL  找不到自动更新代码块");
+  process.exit(1);
+}
+const block = SRC.slice(START, END);
+
+let PASS = 0;
+const FAIL = [];
+function ok(cond, name) {
+  if (cond) { PASS++; console.log("PASS  " + name); }
+  else { FAIL.push(name); console.log("FAIL  " + name); }
+}
+
+/* ---------- 假 DOM ---------- */
+const btn = { hidden: true, disabled: false, onclick: null };
+const mbody = { innerHTML: "" };
+const bar = { style: { width: "" } };
+const pct = { textContent: "" };
+const bytes = { textContent: "" };
+const $ = (sel) => {
+  if (sel === "#btnCheckUpdate") return btn;
+  if (sel === "#modal .mbody") return mbody;
+  if (sel === "#updBarFill") return bar;
+  if (sel === "#updPct") return pct;
+  if (sel === "#updBytes") return bytes;
+  return null;
+};
+
+const modal = { title: "", html: "", buttons: [] };
+function openModal(title, html, buttons) {
+  modal.title = title;
+  modal.html = html;
+  modal.buttons = buttons || [];
+  mbody.innerHTML = "";
+}
+function closeModal() { modal.title = "__closed"; }
+function esc(s) {
+  return String(s == null ? "" : s).replace(/&/g, "&amp;").replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+const listeners = {};
+const win = {
+  addEventListener: (ev, fn) => { (listeners[ev] = listeners[ev] || []).push(fn); },
+  pywebview: null,
+};
+
+let apiImpl = async () => ({ ok: false, error: "no stub" });
+let bridgeImpl = null;
+const api = (...a) => apiImpl(...a);
+function shellBridge() { return bridgeImpl; }
+
+let tickFn = null;
+let tickCount = 0;
+function fakeSetInterval(fn) { tickFn = fn; return ++tickCount; }
+function fakeClearInterval(id) { if (id === tickCount) tickFn = null; }
+
+const sandbox = {
+  console, Promise, $, document: { querySelector: $ }, window: win,
+  openModal, closeModal, esc, api, shellBridge,
+  setInterval: fakeSetInterval, clearInterval: fakeClearInterval,
+};
+vm.createContext(sandbox);
+vm.runInContext(
+  block + "\n;globalThis.__upd = { updCheck, updDownload, updWireShell, busy: () => updBusy };\n",
+  sandbox);
+
+async function flush() { await new Promise((r) => setTimeout(r, 0)); }
+
+(async function main() {
+  /* ---------- 1. 壳能力探测 ---------- */
+  let infoCalls = 0;
+  btn.hidden = true;
+  bridgeImpl = { shell_info: async () => { infoCalls++; return { self_update: true }; } };
+  sandbox.__upd.updWireShell();
+  await flush();
+  ok(infoCalls === 1, "updWireShell 调 shell_info");
+  ok(btn.hidden === false, "self_update=true 时显示检测更新按钮");
+  ok(typeof btn.onclick === "function", "按钮绑定 updCheck");
+
+  btn.hidden = true;
+  bridgeImpl = { shell_info: async () => ({ self_update: false }) };
+  sandbox.__upd.updWireShell();
+  await flush();
+  ok(btn.hidden === true, "self_update=false（源码/安卓）不显示按钮");
+
+  /* ---------- 2. 检测到新版本 → 询问 → 下载 → 进度 → 安装 ---------- */
+  bridgeImpl = {
+    shell_info: async () => ({ self_update: true }),
+    install_update: async () => { bridgeImpl.installs = (bridgeImpl.installs || 0) + 1; return "ok"; },
+  };
+  const calls = [];
+  let state = "check";
+  apiImpl = async (path) => {
+    calls.push(path);
+    if (path === "/api/update/check") {
+      return { ok: true, has_update: true, current: "0.4.1dsk", latest: "0.4.2dsk",
+               size: 10 * 1024 * 1024, notes: "修复 A\n修复 B" };
+    }
+    if (path === "/api/update/download") return { ok: true };
+    if (path === "/api/update/progress") {
+      if (state === "down") return { ok: true, phase: "downloading", received: 5 * 1024 * 1024, total: 10 * 1024 * 1024 };
+      return { ok: true, phase: "ready", received: 10 * 1024 * 1024, total: 10 * 1024 * 1024, path: "C:\\tmp\\new.exe" };
+    }
+    return { ok: false, error: "unexpected " + path };
+  };
+  await sandbox.__upd.updCheck();
+  ok(modal.title.includes("发现新版本 v0.4.2dsk"), "弹窗显示新版本号");
+  ok(modal.html.includes("当前版本 <b>v0.4.1dsk</b>"), "弹窗显示当前版本");
+  ok(modal.html.includes("10.0 MB"), "弹窗显示安装包大小");
+  ok(modal.html.includes("修复 A\n修复 B"), "弹窗显示 Release 说明");
+  ok(modal.buttons.length === 2 && modal.buttons[1].t === "立即更新", "有「稍后 / 立即更新」两个按钮");
+
+  state = "down";
+  const p = modal.buttons[1].fn();
+  await p;
+  ok(calls.includes("/api/update/download"), "点立即更新 → POST download");
+  ok(typeof tickFn === "function", "开始轮询下载进度");
+  await tickFn();
+  ok(bar.style.width === "50%" && pct.textContent === "50%", "进度条 50% 与百分比同步");
+  ok(bytes.textContent.includes("5.0 MB") && bytes.textContent.includes("10.0 MB"), "进度显示已下载/总量");
+
+  state = "ready";
+  await tickFn();
+  await flush();
+  ok(bridgeImpl.installs === 1, "下载完成 → 调壳 install_update");
+  ok(mbody.innerHTML.includes("正在重启"), "安装后提示即将重启");
+  ok(tickFn === null, "就绪后停止轮询");
+
+  /* ---------- 3. 已是最新版本 ---------- */
+  modal.title = ""; modal.html = "";
+  apiImpl = async () => ({ ok: true, has_update: false, current: "0.4.1dsk" });
+  await sandbox.__upd.updCheck();
+  ok(modal.title === "检测更新" && modal.html.includes("已是最新版本"), "无更新时明确提示已是最新");
+
+  /* ---------- 4. 检查失败 ---------- */
+  modal.title = ""; modal.html = "";
+  apiImpl = async () => ({ ok: false, error: "仓库还没有发布可用的版本（没有 Release）。" });
+  await sandbox.__upd.updCheck();
+  ok(modal.title === "检测更新" && modal.html.includes("没有 Release"), "检查失败显示后端原因");
+
+  /* ---------- 5. 下载失败 ---------- */
+  modal.title = ""; modal.html = "";
+  state = "down";
+  apiImpl = async (path) => {
+    if (path === "/api/update/check") return { ok: true, has_update: true, current: "0.4.1dsk", latest: "0.4.2dsk" };
+    if (path === "/api/update/download") return { ok: true };
+    return { ok: true, phase: "error", error: "下载文件太小，可能不是完整的 exe" };
+  };
+  await sandbox.__upd.updCheck();
+  await modal.buttons[1].fn();
+  await tickFn();
+  ok(modal.title === "更新失败" && modal.html.includes("下载文件太小"), "下载失败给出原因并可关闭");
+
+  /* ---------- 6. 安装失败 ---------- */
+  modal.title = ""; modal.html = "";
+  bridgeImpl.install_update = async () => "err:程序目录不可写，请把 exe 放到用户目录后再试";
+  state = "ready";
+  apiImpl = async (path) => {
+    if (path === "/api/update/check") return { ok: true, has_update: true, current: "0.4.1dsk", latest: "0.4.2dsk" };
+    if (path === "/api/update/download") return { ok: true };
+    return { ok: true, phase: "ready", received: 10, total: 10 };
+  };
+  await sandbox.__upd.updCheck();
+  await modal.buttons[1].fn();
+  await tickFn();
+  await flush();
+  ok(modal.title === "更新失败" && modal.html.includes("程序目录不可写"), "安装失败去掉 err: 前缀展示原因");
+
+  console.log("\n" + PASS + " PASS / " + FAIL.length + " FAIL");
+  if (FAIL.length) { console.log("FAILED: " + FAIL.join("; ")); process.exit(1); }
+})().catch((e) => { console.error(e); process.exit(1); });
