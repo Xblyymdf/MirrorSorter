@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-洞鉴虚明 · 基础版 (v0.4.1dsk)
+洞鉴虚明 · 基础版 (v0.4.3dsk)
 ==========================
 本地运行的洞鉴虚明：读取 B站 内容 → 黑白名单/AI 分拣 → 推荐流 + 数据源状态 + AI 聊天。
 
@@ -40,6 +40,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -64,7 +65,7 @@ if _PORT_ENV:
         PORTS = (int(_PORT_ENV),)
     except Exception:
         pass
-APP_VER = "v0.4.1dsk"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
+APP_VER = "v0.4.3dsk"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
 # 本机回环请求必须绕过系统代理: 用户开着 Clash/V2Ray/公司代理时, 环境里的 http_proxy 会把
 # 127.0.0.1 的请求转给代理服务器, 轻则 502, 重则心跳连续失败 -> 悬浮球探活 2 轮不过自我了断,
 # 表现为「球莫名消失/点定位没反应」。这里建一个禁用代理的 opener 专供本地调用; 外网 API 仍走
@@ -84,7 +85,7 @@ _PAGE_LEASE_LAST = {}    # token -> 最后一次存活心跳时间(看门狗据�
 _PAGE_LEASE_LOCK = threading.Lock()
 _PAGE_LEASE_GENERATION = 0
 CACHE_TTL = 300          # B站数据缓存 5 分钟
-PREWARM_TICK = 20        # 常驻预热巡检间隔(秒)
+PREWARM_TICK = 30        # 常驻预热巡检间隔(秒); v0.4.2 由 20 放宽: 预热本身也是抓取
 PREWARM_IDLE = 900       # 池子超过这么久没有新内容 → 后台提前抓一轮(15分钟)
 PREWARM_MIN = 120        # 池内可用条目少于这个数 → 后台提前补池
 SCORE_TTL_DEFAULT = 86400        # AI 评分缓存 24 小时(可经 ai_cache_hours 设置 24/48)
@@ -1388,7 +1389,7 @@ def search_items(keyword, page=1, limit=30, order=None, duration=None, pub_begin
     def _once(extra):
         # v0.3.1.66(用户要求: 降低风控概率): 搜索是 fan-out 最猛的一条(偏好词/快速开屏 8 路并发),
         # 过闸门把同一瞬间的点击摊开; 太密就放弃这一次(上层按空页处理, 下一轮还会来查)。
-        if not _net_guard("bili", 0.25, 150, wait=1.5):
+        if not _net_guard("bili", 0.35, 110, wait=1.5):
             raise RuntimeError("本地限速(未发出)")
         params = {"search_type": "video", "keyword": keyword,
                   "page": str(page), "page_size": str(limit)}
@@ -1450,7 +1451,7 @@ def _safe_json(url, timeout=10):
     """带错误收集的GET JSON。返回 (data, error)。
     v0.3.1.66: 榜单页是一次性并发好几页, 也过同一道闸门 —— 太密就放弃这一页(下一轮再抓),
     不要为了"这一屏多几条"把出口 IP 送上风控名单。"""
-    if not _net_guard("bili", 0.3, 100, wait=1.0):
+    if not _net_guard("bili", 0.4, 90, wait=1.0):
         return None, "本地限速(未发出)"
     try:
         req = urllib.request.Request(url, headers=HEADERS)
@@ -1900,6 +1901,15 @@ def bili_weight():
     return w if 0 <= w <= 100 else 90
 
 
+def xhh_weight():
+    """小黑盒当前权重; 0=后台完全不出不抓(显式搜索不受影响)。"""
+    try:
+        w = int(sget("xhh_weight") or 15)
+    except Exception:
+        w = 15
+    return w if 0 <= w <= 100 else 15
+
+
 def _tb_session_jar():
     """获取/创建匿名会话 jar(池轮换)。失效时重建。"""
     global _tb_sess_idx
@@ -2176,8 +2186,8 @@ _tb_retry_lock = threading.Lock()
 _tb_retry_at = 0         # 上次手动放行重试的时间戳(最短间隔 60 秒)
 # 贴吧补池的最小间隔(v0.3.1.59): 信息流补池是"滚动就补", 滚动一分钟能补十几次;
 # 贴吧按这个频率打, 一分钟就是二三十个请求 —— 触发风控只是时间问题。贴吧本来就不需要
-# 那么新, 100 秒一轮足够, 而且和本地闸门(每分钟 10 个)互不冲突。
-_TB_POOL_MIN_GAP = 120
+# 那么新, v0.4.2 起 150 秒一轮(抖动到 225 秒), 而且和本地闸门(每分钟 10 个)互不冲突。
+_TB_POOL_MIN_GAP = 150
 _tb_pool_last_ts = 0.0
 
 
@@ -2203,15 +2213,17 @@ def fetch_tieba_pool(quick=False):
     403冷却: 一旦全部403进入冷却期, 期间直接空返回(不再拖慢内容池构建)。"""
     global _tb_last_err, _tb_last_fetch, _tb_fetch_total, _tb_cooldown_until
     global _tb_pool_last_ts
+    if tb_weight() <= 0:
+        return [], []   # 占比=0: 后台完全停抓(显式搜索走 tb_search_items, 不受影响)
     bars = tb_users()
     if not bars:
         return [], []
     if time.time() < _tb_cooldown_until:
         return [], []   # 冷却中: 快速返回, 不浪费构建时间
     now_ts = time.time()
-    # v0.3.1.66: 间隔也加抖动。固定 100 秒整点一到就抓, 从站方看是"表一样准时"的脚本特征;
-    # 现在落在 120~162 秒之间, 只是晚一点, 不影响内容新旧。
-    if now_ts - _tb_pool_last_ts < _TB_POOL_MIN_GAP * random.uniform(1.0, 1.35):
+    # v0.3.1.66: 间隔也加抖动。固定整点一到就抓, 从站方看是"表一样准时"的脚本特征;
+    # v0.4.2: 基础间隔 150 秒 + 1.0~1.5 倍抖动(150~225 秒), 进一步弱化定时脚本特征。
+    if now_ts - _tb_pool_last_ts < _TB_POOL_MIN_GAP * random.uniform(1.0, 1.5):
         return [], []   # 距上次贴吧抓取太近: 这次不抓(不是失败, 不写 tb_error)
     _tb_pool_last_ts = now_ts
     items, errors, seen = [], [], set()
@@ -3714,6 +3726,9 @@ def xhh_get(path, extra=None, token=""):
     """签名GET小黑盒API。返回 (json_dict, err)。
     token: x_xhh_tokenid(网页版设备标识), 缺省用持久化tokenid。
     登录后自动附 pkey/heybox_id(网页版真实会话凭证)。"""
+    # v0.4.2: 小黑盒所有读写共用一道节奏闸 —— 补池/消息/登录同时打到同一个域名时,
+    # 站方看到的是一秒多下, 正是风控样本。
+    _net_pace("xhh-api", 0.8)
     t = int(time.time())
     n = xhh_nonce()
     hk = xhh_hkey(path, t, n)
@@ -3835,12 +3850,15 @@ def xhh_feed_items(offset=0, limit=20, pull="0"):
 
 
 _xhh_cursor = 0   # 小黑盒帖流偏移游标
+_XHH_POOL_MIN_GAP = 90   # 后台补池最小间隔(秒): 和贴吧同因, 不跟着每轮构建反复打
+_xhh_pool_last_ts = 0.0
 _xhh_fetch_total = 0   # 小黑盒累计条目(状态面板用)
 _xhh_last_fetch = 0
 
 
 def xhh_post(path, query, body=None):
     """签名POST小黑盒API: query+body 均带 x_xhh_tokenid。返回 (json_dict, err)。"""
+    _net_pace("xhh-api", 0.8)
     t = int(time.time())
     n = xhh_nonce()
     hk = xhh_hkey(path, t, n)
@@ -3873,9 +3891,13 @@ def xhh_post(path, query, body=None):
 def fetch_xhh_pool(quick=False):
     """小黑盒采集: 帖流翻页(每轮偏移+limit, 覆盖更多)。返回 (items, errors)。
     full: 每轮抓2页(offset + offset+30, 各30条), 单轮最多~60条, 满足高权重下小黑盒的供给。"""
-    global _xhh_cursor, _xhh_fetch_total, _xhh_last_fetch
-    if sget("xhh_weight") == "0":
-        return [], []
+    global _xhh_cursor, _xhh_fetch_total, _xhh_last_fetch, _xhh_pool_last_ts
+    if xhh_weight() <= 0:
+        return [], []   # 占比=0: 后台完全停抓(显式搜索不受影响)
+    now_ts = time.time()
+    if now_ts - _xhh_pool_last_ts < _XHH_POOL_MIN_GAP * random.uniform(1.0, 1.4):
+        return [], []   # 距上次抓取太近: 这次不抓(不是失败, 不写 xhh_error)
+    _xhh_pool_last_ts = now_ts
     items, errs = [], []
     if quick:
         its, err = xhh_feed_items(offset=_xhh_cursor, limit=10)
@@ -3886,9 +3908,11 @@ def fetch_xhh_pool(quick=False):
             errs.append(err[:200])
     else:
         limit = 30
-        offsets = [(_xhh_cursor + k * limit) % 400 for k in range(4)]
-        # 独立页请求并发，保留固定合并顺序和部分成功结果。
-        for its, err in _FX.map(lambda offset: xhh_feed_items(offset=offset, limit=limit), offsets):
+        # v0.4.2: 由"4 页并发"改成"2 页顺序" —— 并发齐发是小黑盒风控样本里最显眼的形状,
+        # 而 2 页 × 30 条对信息流已经够用; xhh_get 里的 _net_pace 再把两页拉开。
+        offsets = [(_xhh_cursor + k * limit) % 400 for k in range(2)]
+        for offset in offsets:
+            its, err = xhh_feed_items(offset=offset, limit=limit)
             if its:
                 seen = {x["key"] for x in items}
                 items += [x for x in its if x["key"] not in seen]
@@ -3934,18 +3958,20 @@ def fetch_pool(quick=False):
             serious_search_futures.append(("bili", kw, _SERIOUS_X.submit(search_items, kw, 1)))
             if i < 4:
                 serious_search_futures.append(("bili", kw, _SERIOUS_X.submit(search_items, kw, 2)))
-        for fname in tb_users():
-            for kw in ser_terms[:4]:
-                serious_search_futures.append(("tb", fname, _SERIOUS_X.submit(tb_search_items, kw, 20, fname)))
-        tb_future = _SERIOUS_X.submit(fetch_tieba_pool, False)
-        xhh_future = _SERIOUS_X.submit(fetch_xhh_pool, False)
+        if tb_weight() > 0:
+            for fname in tb_users():
+                for kw in ser_terms[:4]:
+                    serious_search_futures.append(("tb", fname, _SERIOUS_X.submit(tb_search_items, kw, 20, fname)))
+            tb_future = _SERIOUS_X.submit(fetch_tieba_pool, False)
+        if xhh_weight() > 0:
+            xhh_future = _SERIOUS_X.submit(fetch_xhh_pool, False)
         local_serious_future = _SERIOUS_X.submit(_local_pool_hits, ser_terms[:8], set(), 160)
         if sget("bili_follow_emph") == "1":
             fol_future = _SERIOUS_X.submit(fetch_following_videos)
     elif quick:
         if tb_weight() > 0:
             tb_future = _FX.submit(fetch_tieba_pool, True)
-        if int(sget("xhh_weight") or 15) > 0:
+        if xhh_weight() > 0:
             xhh_future = _FX.submit(fetch_xhh_pool, True)
         if int(sget("live_weight") or 25) > 0:
             live_future = _FX.submit(fetch_live_pool, True)
@@ -3970,7 +3996,7 @@ def fetch_pool(quick=False):
         # 非严肃完整构建: 与B站榜单阶段同时启动独立平台和关注投稿抓取。
         if tb_weight() > 0:
             tb_future = _FX.submit(fetch_tieba_pool, False)
-        if int(sget("xhh_weight") or 15) > 0:
+        if xhh_weight() > 0:
             xhh_future = _FX.submit(fetch_xhh_pool, False)
         if int(sget("live_weight") or 25) > 0:
             live_future = _FX.submit(fetch_live_pool, False)
@@ -4112,7 +4138,9 @@ def fetch_pool(quick=False):
     # --- 贴吧/小黑盒/关注的人: 放在 B站 相关链/搜索洪水之前抓取,
     #    避免被"相关链×300+"先灌满条目上限而整批丢弃(否则贴吧/小黑盒永远出不来)。
     #    quick 首屏也少量抓取非B站平台, 否则高权重平台只能等 full 补全后才出现。 ---
-    if (not quick) or tb_weight() > 0 or int(sget("xhh_weight") or 15) > 0:
+    # v0.4.2: 贴吧/小黑盒各自按权重独立门控 —— 旧版一个总的 if 会在 full 构建时
+    # 绕过 0 权重继续调用 fetch_tieba_pool, 用户把比例调到 0 仍在被抓。
+    if tb_weight() > 0:
         if tb_future:
             tb_items, tb_errs = tb_future.result()
         else:
@@ -4126,6 +4154,7 @@ def fetch_pool(quick=False):
         elif tb_errs and not quick:
             errors += tb_errs
 
+    if xhh_weight() > 0:
         if xhh_future:
             xhh_items, xhh_errs = xhh_future.result()
         else:
@@ -9618,6 +9647,144 @@ def _local_pool_hits(terms, seen, limit=100, platforms=("贴吧", "小黑盒")):
     return [it for _, it in scored[:limit]]
 
 
+# ---------------- 显式搜索: 相关度排序 + BV 号直达 (v0.4.2) ----------------
+# 旧版第一波完全按 B站搜索接口的翻页顺序返回, 再把贴吧/本地 3:1 插进来; 搜原标题时,
+# 真正的原视频可能在第 3 页, 用户却在首屏看到一堆标题里只沾了几个字的搬运/切片。
+# 现在按"命中强度"稳定排序: 标题完全一致 > UP主名完全一致 > 标题前缀 > 标题包含 >
+# 查询词覆盖, 同一档内热的靠前 —— 只调整顺序, 不增删条目, 也不改变跨平台来源。
+_MATCH_NOISE = set("""视频 一个 什么 怎么 为什么 如何 这个 那个 我们 你们 他们
+自己 就是 不是 可以 已经 没有 真的 还是 但是 因为 所以 如果 然后 最新 完整 官方
+合集 教程 分享 推荐 高清 中文 字幕""".split())
+_BVID_RE = re.compile(r"(?i)(?<![0-9a-z])bv([0-9a-z]{10})(?![0-9a-z])")
+
+
+def _extract_bvid(q):
+    """从查询里抠出 BV 号(支持整段 URL / 前后带说明文字); 没有则返回空串。"""
+    m = _BVID_RE.search(q or "")
+    return ("BV" + m.group(1)) if m else ""
+
+
+def _match_norm(s):
+    s = unicodedata.normalize("NFKC", str(s or "")).lower()
+    return re.sub(r"[\s\W_]+", "", s)
+
+
+def _match_terms(q):
+    """查询词元: 拉丁词 + 中文二元组(整句去标点后再切, 防空格/全角符号隔断)。"""
+    raw = unicodedata.normalize("NFKC", str(q or "")).lower()
+    raw = re.sub(r"(?<=\d)[.\-_](?=\d)", "", raw)
+    terms = [w for w in re.split(r"[\s\W_]+", raw) if len(w) >= 2]
+    zh = re.sub(r"[^\u4e00-\u9fff]", "", _match_norm(q))
+    if len(zh) == 1:
+        terms.append(zh)
+    else:
+        terms += [zh[i:i + 2] for i in range(max(0, len(zh) - 1))]
+    return list(dict.fromkeys(t for t in terms if t and t not in _MATCH_NOISE))
+
+
+def _search_rel_score(q, it):
+    """单条搜索结果的相关度分(纯排序用, 不参与过滤)。
+    严格分档: 标题完全一致 > UP主名完全一致 > 标题前缀 > 标题包含 > UP主名包含。
+    档位固定隔 1000, 档内加成(词元覆盖≤400 + 热度≤8)跨不过去 —— 旧版直接相加时,
+    "标题前缀+词覆盖"能反超"UP主名完全一致", 搜 UP 主会被别人的仿制标题压过去。"""
+    qn = _match_norm(q)
+    if not qn:
+        return 0.0
+    tn = _match_norm(it.get("title") or "")
+    an = _match_norm(it.get("author") or "")
+    if tn == qn:
+        tier = 5
+    elif an == qn:
+        tier = 4
+    elif tn.startswith(qn):
+        tier = 3
+    elif qn in tn:
+        tier = 2
+    elif an and qn in an:
+        tier = 1
+    else:
+        tier = 0
+    score = tier * 1000.0
+    terms = _match_terms(q)
+    if terms:
+        score += 280.0 * sum(1 for t in terms if t in tn) / len(terms)
+        score += 80.0 * sum(1 for t in terms if t in an) / len(terms)
+        extra = _match_norm((it.get("tag") or "") + " " + (it.get("desc") or "")[:120])
+        score += 40.0 * sum(1 for t in terms if t in extra) / len(terms)
+    if tier >= 2:   # 同一档内用热度决胜, 绝不越过档位
+        score += min(8.0, math.log10(max(1, int(it.get("views") or 0))))
+    return score
+
+
+def _rerank_search(q, items):
+    """稳定排序: 同分保持抓取顺序(跨平台交错结构不被破坏)。"""
+    if not items:
+        return items
+    ranked = sorted(enumerate(items), key=lambda p: (-_search_rel_score(q, p[1]), p[0]))
+    return [it for _, it in ranked]
+
+
+def bili_video_by_bvid(bvid):
+    """BV号直达: 用公开 view 接口取这一条(免登录); 失败返回 None。"""
+    if not _net_guard("bili", 0.35, 110, wait=1.5):
+        return None
+    try:
+        url = "https://api.bilibili.com/x/web-interface/view?bvid=" + urllib.parse.quote(bvid)
+        req = urllib.request.Request(
+            url, headers=dict(HEADERS, Cookie=account_cookie()) if account_cookie() else HEADERS)
+        d = json.loads(urllib.request.urlopen(req, timeout=10).read().decode("utf-8"))
+        if d.get("code") != 0:
+            try:
+                code = int(d.get("code"))
+            except Exception:
+                code = 0
+            if code in (-352, -412, -403, -509, 412):
+                _net_penalty("bili", 900, 2.0)
+            return None
+        data = d.get("data") or {}
+        if not data.get("bvid"):
+            return None
+        it = normalize(data)
+        it["gid"] = "search"
+        it["src"] = "BV直达"
+        return it
+    except Exception:
+        return None
+
+
+def _search_bvid(q, bvid, offset, limit, apply_blocks):
+    """BV 查询只返回这一条: 不做近义词扩波(用户要的就是"这个视频")。"""
+    def _empty():
+        return {"ok": True, "q": q, "items": [], "offset": offset, "total": 0,
+                "next_offset": offset, "end": True, "has_more": False,
+                "deep_terms": [], "building": False, "platform_hits": 0}
+    if offset > 0:
+        return _empty()
+    it = bili_video_by_bvid(bvid)
+    if not it:
+        return _empty()
+    found = rules_filter([it], skip_age=True, apply_blocks=apply_blocks, skip_windows=True)
+    if found:
+        _annotate_following(found)
+    chunk = found[:max(1, int(limit))]
+    if chunk:
+        now = time.time()
+        try:
+            with _db_lock:
+                for x in chunk:
+                    db().execute("INSERT INTO items(key,json,fetched_at,score_at) VALUES(?,?,?,0) "
+                                 "ON CONFLICT(key) DO UPDATE SET json=excluded.json,fetched_at=excluded.fetched_at",
+                                 (x["key"], json.dumps(x, ensure_ascii=False), now))
+                db().commit()
+        except Exception:
+            pass
+        _request_bg_score(chunk)
+    return {"ok": True, "q": q, "items": chunk, "offset": offset + len(chunk),
+            "next_offset": offset + len(chunk), "total": len(found), "end": True,
+            "has_more": False, "deep_terms": [], "building": False,
+            "platform_hits": len(chunk)}
+
+
 def _search_first_wave(q, apply_blocks=True):
     """搜索第一波: B站WBI直搜(≤5页, 空页即止) + 贴吧全站实时搜索(与B站翻页并行)
     + 本地沉淀池分词命中 → 跨平台3:1交错 → 机器规则过滤。"""
@@ -9645,7 +9812,11 @@ def _search_first_wave(q, apply_blocks=True):
                 tb.append(x)
     except Exception:
         pass
-    local = _local_pool_hits([q], seen)
+    # 分平台各自按相关度排, 再 3:1 交错 —— 不能对交错后的整表再重排: 否则同档同覆盖时,
+    # B站靠热度就能把贴吧/本地整段挤到 30 条之后, 搜索首屏又变回"只有B站"(跨平台混排回归)。
+    bili = _rerank_search(q, bili)
+    tb = _rerank_search(q, tb)
+    local = _rerank_search(q, _local_pool_hits([q], seen))
     candidates = _interleave3(bili, tb + local)
     _annotate_following(candidates)
     return rules_filter(candidates, skip_age=True, apply_blocks=apply_blocks,
@@ -9685,6 +9856,7 @@ def _search_expand_wave(q, used_terms, apply_blocks=True):
             seen.add(k)
             out.append(x)
     out.extend(_local_pool_hits(terms, seen))
+    out = _rerank_search(q, out)
     _annotate_following(out)
     return rules_filter(out, skip_age=True, apply_blocks=apply_blocks,
                         skip_windows=True), terms
@@ -9740,6 +9912,9 @@ def search_all(q, offset=0, limit=30, refresh=False, sort="default"):
     if not q:
         return {"ok": True, "q": q, "items": [], "offset": 0, "total": 0,
                 "end": True, "deep_terms": [], "building": False, "platform_hits": 0}
+    bvid = _extract_bvid(q)
+    if bvid:
+        return _search_bvid(q, bvid, offset, limit, apply_blocks)
     with _search_wave_lock:
         if refresh:
             _search_wave.pop(raw, None)
@@ -10236,14 +10411,51 @@ def mix_sources(kept):
 # 不入计划 —— 随着已看内容被消费, 后续构建的全局重混会把它们分批"填回来"(视觉降重)。
 AUTHOR_PLAN_QUOTA = 3
 _AUTHOR_SPACING_GAP = 6   # 同作者/同指纹标题在计划中的最小间隔(尽力满足, 不丢失条目)
+_SERVE_SPACING_GAP = 6    # 实际吐出的流里, 最近 N 条参与相似度防扎堆(跨页接缝也算)
+
+_SIM_NOISE = set("""视频 一个 什么 怎么 为什么 如何 这个 那个 我们 你们 他们 自己
+就是 不是 可以 已经 没有 真的 还是 但是 因为 所以 如果 然后 最新 完整 官方 合集
+教程 分享 推荐 高清 中文 字幕""".split())
+
+
+def _sim_tokens(title):
+    """近重复标题的 shingle: 拉丁词 + 中文二元组, 去掉高频通用词(它们会把无关标题拉到一起)。"""
+    t = unicodedata.normalize("NFKC", title or "").lower()
+    t = re.sub(r"(?<=\d)[.\-_](?=\d)", "", t)   # 4.2 / 4-2 / 4_2 都归一成 42
+    toks = [w for w in re.findall(r"[a-z0-9]{2,}", t) if w not in _SIM_NOISE]
+    zh = re.sub(r"[^\u4e00-\u9fff]", "", t)
+    toks += [zh[i:i + 2] for i in range(max(0, len(zh) - 1))
+             if zh[i:i + 2] not in _SIM_NOISE]
+    return toks
+
+
+def _sim_bands(title, bands=4):
+    """MinHash 分带: 近重复标题(增减几个字/换一版措辞)至少共享一个 band 键。
+    与 f: 指纹互补 —— 指纹要排序后的前 28 个 token 完全一致, 对"同一个新闻换个说法"太严;
+    band 只要大部分 shingle 相同就会撞上, 又几乎不会误伤无关内容。"""
+    toks = _sim_tokens(title)
+    if len(toks) < 6:   # 短标题(7 个中文二元组)也要能判近重复; 6 个仍有足够的区分度
+        return []
+    out = []
+    for b in range(bands):
+        salt = str(b) + ":"
+        out.append("s:%d:%08x" % (b, min(zlib.crc32((salt + t).encode("utf-8")) & 0xffffffff
+                                        for t in toks)))
+    return out
 
 
 def _spacing_keys(it):
-    """视觉降重的间距键(多维): 同作者任意标题算同类; 同指纹标题跨作者也算同类。"""
-    keys = ["a:" + (it.get("author") or "")]
-    fp = _title_fp(it.get("title") or "")
-    if fp:
-        keys.append("f:" + fp)
+    """视觉降重的间距键(多维): 同作者任意标题算同类; 同/近指纹标题跨作者也算同类。"""
+    keys = []
+    author = it.get("author") or ""
+    if author:
+        keys.append("a:" + author)
+    title = it.get("title") or ""
+    if title.strip():
+        fp = _title_fp(title)
+        if fp:
+            keys.append("f:" + fp)
+        keys.extend(_sim_bands(title))
     return keys
 
 
@@ -10270,20 +10482,24 @@ def _space_same_author(items, gap=_AUTHOR_SPACING_GAP):
     实在避不开时重置窗口放行(宁相邻不丢失), 保持各平台混排比例不变。"""
     recent = collections.deque()
     recent_set = set()
-    pool = list(items)
+    # 间距键现在含 MinHash 分带, 重算不便宜 —— 预计算一次, 别在 O(n²) 扫描里反复算。
+    pool = []
+    for it in items:
+        ks = _spacing_keys(it)
+        pool.append((it, ks, set(ks)))
     out = []
     while pool:
         pick_idx = None
-        for i, it in enumerate(pool):
-            if not (set(_spacing_keys(it)) & recent_set):
+        for i, (_, _, kset) in enumerate(pool):
+            if not (kset & recent_set):
                 pick_idx = i
                 break
         if pick_idx is None:
             pick_idx = 0       # 剩余全是同作者/相似标题: 放最前并重置窗口, 避免死循环
             recent.clear()
             recent_set.clear()
-        it = pool.pop(pick_idx)
-        for k in _spacing_keys(it):
+        it, ks, _ = pool.pop(pick_idx)
+        for k in ks:
             recent.append(k)
             recent_set.add(k)
         while len(recent) > gap * 2:
@@ -11235,7 +11451,7 @@ def _session_state(sid):
             if len(_session_served) >= 8:
                 for old in sorted(_session_served, key=lambda k: _session_served[k]["ts"])[:len(_session_served) - 7]:
                     del _session_served[old]
-            s = {"keys": set(), "cursor": 0, "seq": 0, "ts": time.time()}
+            s = {"keys": set(), "cursor": 0, "seq": 0, "ts": time.time(), "spacing": []}
             _session_served[sid] = s
         s["ts"] = time.time()
         return s
@@ -11247,7 +11463,7 @@ _BUILD_PENDING = False    # v0.3.1.55: 构建忙时收到的补池请求, 合并
 # 就会因为"未送出条目不够"再拉一次补池(旧日志实测 5 秒一次), 每次都要把贴吧/小黑盒/
 # 搜索源全打一遍。这既是贴吧风控的源头, 也让缓存里明明有存货时反复空转。
 # 现在非用户发起的补池有最小间隔; 连续几次什么都没抓到时按 streak 退避。
-_BUILD_MIN_GAP = 25
+_BUILD_MIN_GAP = 40
 _next_build_ts = 0.0
 _build_empty_streak = 0
 
@@ -11255,7 +11471,7 @@ _build_empty_streak = 0
 def _build_backoff(added_n):
     """一次构建结束后决定下一次最早什么时候能再补。
 
-    added_n 为 0(全重复/全部源失败)时越退越远, 最多 3 分钟 —— 这时候快速重试
+    added_n 为 0(全重复/全部源失败)时越退越远, 最多 4 分钟 —— 这时候快速重试
     只会继续打已有且已经被拒的源, 除了喂风控没有别的作用。"""
     global _next_build_ts, _build_empty_streak
     now = time.time()
@@ -11267,7 +11483,7 @@ def _build_backoff(added_n):
         _next_build_ts = now + _BUILD_MIN_GAP
         return
     _build_empty_streak = min(_build_empty_streak + 1, 6)
-    _next_build_ts = now + min(_BUILD_MIN_GAP + 25 * _build_empty_streak, 180)
+    _next_build_ts = now + min(_BUILD_MIN_GAP + 25 * _build_empty_streak, 240)
 
 
 def kick_build(quick=True, pending=False):
@@ -11687,36 +11903,63 @@ def serve_chunk(offset=0, limit=30, q="", request_id="", plat=""):
         # 单平台池不启用(否则吞吐退化为每页2条轮询)。
         plat_multi = len({(it.get("platform") or "B站") for it in acts}) > 1
         spaced_defer = 0
-        deferred = []
         last_p, run = sess.get("last_p"), sess.get("last_run", 0)   # 跨页持续: 上页末尾的连排不算清零
+        # 相似内容防扎堆(v0.4.2): 计划层已经按作者/标题指纹打散过, 但会话游标跳过"已返回"
+        # 条目后, 实际吐出的流仍可能把同一作者/近重复标题接连送出(尤其是跨页接缝)。
+        # 这里记住最近 6 条内容的间距键, 撞键的先暂缓, 留到后面再出。
+        spacing_recent = sess.setdefault("spacing", [])
+        spacing_set = set()
+        for ks in spacing_recent:
+            spacing_set |= ks
         while idx < len(acts) and len(chunk) < limit:
             it = acts[idx]
             if it.get("key") not in sess["keys"]:
                 p = it.get("platform") or "B站"
-                if plat_multi and p == last_p and run >= 2:
+                keys = set(_spacing_keys(it))
+                if (plat_multi and p == last_p and run >= 2) or (spacing_set and (keys & spacing_set)):
                     spaced_defer += 1
-                    deferred.append(idx)
                     idx += 1
                     continue
                 chunk.append(it)
                 sess["keys"].add(it.get("key"))
                 last_p, run = (p, run + 1) if p == last_p else (p, 1)
+                spacing_recent.append(keys)
+                if len(spacing_recent) > _SERVE_SPACING_GAP:
+                    del spacing_recent[:len(spacing_recent) - _SERVE_SPACING_GAP]
+                spacing_set = set()
+                for ks in spacing_recent:
+                    spacing_set |= ks
             idx += 1
-        # 救急: 暂缓把本页压到只剩一两条时, 宁可放宽连排也要把池里已有的内容发出去。
-        # 池子见底/只剩单平台新批时, 死守"同平台最多连2条"会让每页只吐 1-2 条, 用户看到的
-        # 是一直"正在准备内容", 而池子里明明还有几十条没发 —— 这就是"有时候抓不到信息"。
-        # 正常情况(本页能吐满)不走这里, 间距规则照旧。
-        if spaced_defer and len(chunk) <= 2:
-            for k in deferred:
-                if len(chunk) >= limit:
-                    break
-                it = acts[k]
-                if it.get("key") in sess["keys"]:
-                    continue
+        # 救急: 本页被暂缓压得只剩一两条, 或已扫到计划末尾仍凑不满一页 —— 此时宁可放宽
+        # 连排/相似度限制, 也要把池里已有的内容发出去。候选是**本会话所有未送出**的条目
+        # (不只本次暂缓的那批): 旧实现只回捞本次暂缓, 小池里本页吐 3 条、其余甩到游标之后,
+        # 下一页从尾部扫描一条都看不到, 会一直空转到补池 —— 表现为"抓不到内容"。
+        # 贪心挑不与最近 6 条撞间距键的; 实在全撞就清空窗口放行(宁相邻不丢失)。
+        if len(chunk) < limit and (len(chunk) <= 2 or idx >= len(acts)):
+            pending = [it for it in acts if it.get("key") not in sess["keys"]]
+            pkeys = [set(_spacing_keys(it)) for it in pending]
+            while pending and len(chunk) < limit:
+                pick = None
+                for j, ks in enumerate(pkeys):
+                    if not (ks & spacing_set):
+                        pick = j
+                        break
+                if pick is None:
+                    pick = 0
+                    spacing_recent.clear()
+                    spacing_set.clear()
+                it = pending.pop(pick)
+                keys = pkeys.pop(pick)
                 p = it.get("platform") or "B站"
                 chunk.append(it)
                 sess["keys"].add(it.get("key"))
                 last_p, run = (p, run + 1) if p == last_p else (p, 1)
+                spacing_recent.append(keys)
+                if len(spacing_recent) > _SERVE_SPACING_GAP:
+                    del spacing_recent[:len(spacing_recent) - _SERVE_SPACING_GAP]
+                spacing_set = set()
+                for ks in spacing_recent:
+                    spacing_set |= ks
         sess["last_p"], sess["last_run"] = last_p, run
         consumed_end = idx
         sess["cursor"] = consumed_end

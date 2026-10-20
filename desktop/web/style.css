@@ -93,6 +93,10 @@ input[type=range]:hover::-webkit-slider-thumb,input[type=range]:focus-visible::-
 #topSearch .ic{color:var(--fg3)}
 #topSearch input{flex:1;min-width:0;background:transparent;border:none;padding:5px 0;font-size:12.5px}
 #topSearch input:focus{outline:none}
+/* 搜索按钮: 与主按钮同一套强调色实底 + 白字; 只在这个输入框里出现一次, 不抢顶部视觉重心 */
+#topSearch .searchBtn{flex:none;background:var(--accent-strong);border-color:var(--accent-strong);
+  color:#fff;border-radius:6px;padding:3px 10px;font-size:12px;line-height:1.5}
+#topSearch .searchBtn:hover{filter:brightness(1.1);border-color:var(--accent-strong)}
 #topRightWrap{flex:1;display:flex;align-items:center;gap:8px;justify-content:flex-end;min-width:0}
 #listTools{display:flex;align-items:center;gap:8px;flex:none;min-width:0}
 #listTools.hidden{display:none !important}

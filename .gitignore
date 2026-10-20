@@ -115,3 +115,12 @@ desktop/_vis/fasttext_demo/*.json
 !desktop/_test_update_v041.py
 !desktop/_test_update_ui_v041.js
 !desktop/_verify_exe_v041.py
+
+# v0.4.2dsk: search/fetch/anti-clustering regression assets
+!desktop/_test_v042.py
+!desktop/_verify_exe_v042.py
+
+# v0.4.3dsk: 搜索按钮避让头像（逻辑 + 无头布局）与反解校验
+!desktop/_verify_searchbtn_v043.js
+!desktop/_verify_layout_v043.py
+!desktop/_verify_exe_v043.py

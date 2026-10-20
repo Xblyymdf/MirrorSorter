@@ -1213,20 +1213,62 @@
     applyListCols();    // 窗口变宽变窄, 大图模式的列数跟着重算
   });
 
-  // 搜索常驻顶栏：没有开合动作了，清空输入 = 退出搜索回到信息流
-  let searchTimer = null;
-  $("#searchInput").oninput = () => {
-    clearTimeout(searchTimer);
-    searchTimer = setTimeout(() => {
-      S.q = $("#searchInput").value.trim();
-      S.offset = 0;
-      S.view = "feed";
-      saveState();
-      $$(".nav[data-nav]").forEach((b) => b.classList.toggle("on", b.dataset.nav === "feed"));
-      loadFeed(false);   // 搜索不该带 refresh=1：原来每敲一次字都可能让后端去重建内容池
-    }, 450);
-  };
-  $("#searchInput").addEventListener("keydown", (e) => { if (e.key === "Enter") $("#searchInput").blur(); });
+  // 搜索常驻顶栏：显式触发。输入过程中**不搜** —— 每敲一个字就打一次 B站接口，
+  // 既慢又喂风控；点右侧「搜索」或按 Enter 才发。清空输入自动退回信息流。
+  function runSearch() {
+    const q = $("#searchInput").value.trim();
+    if (!q) { exitSearch(); return; }
+    if (S.view !== "feed") setView("feed");   // 从设置/历史切回来（setView 会清空输入，下面写回）
+    $("#searchInput").value = q;
+    S.q = q;
+    S.emptyMsg = "";
+    saveState();
+    $$(".nav[data-nav]").forEach((b) => b.classList.toggle("on", b.dataset.nav === "feed"));
+    restartFeed();   // 作废在途请求 + 立刻重取一屏（搜索不带 refresh=1）
+  }
+  function exitSearch() {
+    if (!S.q) return;
+    S.q = "";
+    S.emptyMsg = "";
+    saveState();
+    restartFeed();
+  }
+  $("#btnSearch").onclick = runSearch;
+  $("#searchInput").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); runSearch(); $("#searchInput").blur(); }
+    else if (e.key === "Escape") { $("#searchInput").value = ""; exitSearch(); }
+  });
+  // 只处理"清空即退出搜索"；有词时不自动搜，等按钮/回车（用户要求的显式搜索）。
+  $("#searchInput").addEventListener("input", () => {
+    if (S.q && !$("#searchInput").value.trim()) exitSearch();
+  });
+
+  // 顶栏右侧组空间不够时会整组向左溢出(justify-content:flex-end), 画到搜索框右端上。
+  // 溢出宽度随窗口宽度/登录头像数量/「只看某平台」芯片变化, 写死偏移必然有的窗口不适用。
+  // 量出被压住的宽度, 等量补到搜索框右内边距 —— 输入框和按钮一起左让, 空间够了自动归位。
+  let fitPad0 = 0;
+  function fitSearchBtn() {
+    const box = $("#topSearch"), btn = $("#btnSearch"), wrap = $("#topRightWrap");
+    if (!box || !btn || !wrap) return;
+    if (!fitPad0) fitPad0 = parseFloat(getComputedStyle(box).paddingRight) || 9;
+    let left = Infinity;
+    Array.from(wrap.children).forEach((el) => {
+      if (!el.getClientRects().length) return;
+      left = Math.min(left, el.getBoundingClientRect().left);
+    });
+    const br = box.getBoundingClientRect();
+    const cover = Number.isFinite(left) ? Math.max(0, br.right - left) : 0;
+    const room = Math.max(0, br.width - 100);      // 再挤也要留出图标、按钮和一点输入区
+    const next = (fitPad0 + Math.min(Math.ceil(cover), room)) + "px";
+    if (box.style.paddingRight !== next) box.style.paddingRight = next;
+  }
+  fitSearchBtn();
+  window.addEventListener("resize", fitSearchBtn);
+  if (window.ResizeObserver) {
+    const ro = new ResizeObserver(fitSearchBtn);
+    [$("#topbar"), $("#topRightWrap")].forEach((el) => el && ro.observe(el));
+    $$("#topRightWrap > *").forEach((el) => ro.observe(el));
+  }
 
   $$(".nav[data-nav]").forEach((b) => (b.onclick = () => {
     const v = b.dataset.nav;
@@ -1385,6 +1427,7 @@
     const box = $("#topAvatars");
     if (!box) return;
     box.hidden = !$$("#topAvatars .tava").some((b) => !b.hidden);
+    fitSearchBtn();
   }
   // 点头像 = 进「设置 → 平台账号」（旧版点头像也是去账号页）
   $("#topAvatars").onclick = (e) => {

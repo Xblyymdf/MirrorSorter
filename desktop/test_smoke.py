@@ -1414,21 +1414,23 @@ try:
     finally:
         app.xhh_get = old_xhh_get
         app.sset("xhh_heybox_id", "")
-    # 小黑盒完整采集: 四页并发请求且跨页去重。
+    # 小黑盒完整采集: 两页顺序请求(风控收敛, v0.4.2)且跨页去重。
     old_xhh_feed, old_xhh_cursor = app.xhh_feed_items, app._xhh_cursor
+    old_xhh_pool_ts = app._xhh_pool_last_ts
     try:
         calls = []
         def fake_xhh_feed(offset=0, limit=20, pull="0"):
             calls.append((offset, limit))
-            time.sleep(0.02)
             return ([{"key": "xhh-%d" % (offset // 30), "platform": "小黑盒"}], "")
         app.xhh_feed_items = fake_xhh_feed
         app._xhh_cursor = 0
+        app._xhh_pool_last_ts = 0   # 清掉池抓取冷却, 否则会直接空返回(不是本用例要测的)
         xitems, xerrs = app.fetch_xhh_pool(quick=False)
-        check("小黑盒采集: 多页并发且去重", len(calls) == 4 and len(xitems) == 4 and not xerrs,
+        check("小黑盒采集: 两页顺序且去重", calls == [(0, 30), (30, 30)] and len(xitems) == 2 and not xerrs,
               {"calls": calls, "items": len(xitems)})
     finally:
         app.xhh_feed_items, app._xhh_cursor = old_xhh_feed, old_xhh_cursor
+        app._xhh_pool_last_ts = old_xhh_pool_ts
     # 小黑盒状态API
     dx = req("/api/xhh")
     check("小黑盒状态API", dx.get("ok") is True, dx)
