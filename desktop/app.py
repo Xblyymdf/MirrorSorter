@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-洞鉴虚明 · 基础版 (v0.4.10dsk)
+洞鉴虚明 · 基础版 (v0.4.11dsk)
 ==========================
 本地运行的洞鉴虚明：读取 B站 内容 → 黑白名单/AI 分拣 → 推荐流 + 数据源状态 + AI 聊天。
 
@@ -65,7 +65,7 @@ if _PORT_ENV:
         PORTS = (int(_PORT_ENV),)
     except Exception:
         pass
-APP_VER = "v0.4.10dsk"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
+APP_VER = "v0.4.11dsk"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
 # 本机回环请求必须绕过系统代理: 用户开着 Clash/V2Ray/公司代理时, 环境里的 http_proxy 会把
 # 127.0.0.1 的请求转给代理服务器, 轻则 502, 重则心跳连续失败 -> 悬浮球探活 2 轮不过自我了断,
 # 表现为「球莫名消失/点定位没反应」。这里建一个禁用代理的 opener 专供本地调用; 外网 API 仍走
@@ -193,10 +193,19 @@ _UPDATE_ALLOW_HOSTS = ("github.com", "objects.githubusercontent.com",
                        "github-releases.githubusercontent.com")
 # 国内直连 release-assets.githubusercontent.com 实测只有 30~40KB/s；公共镜像能到 MB/s。
 # 只有拿到官方 SHA256 才允许走镜像，下载完必须逐字节校验一致。
-_UPDATE_MIRRORS = ("https://ghfast.top/", "https://gh-proxy.com/")
-_UPDATE_CHUNK = 256 * 1024
-_UPDATE_SOCK_TIMEOUT = 20
+# v0.4.11: 先并发测速选源，再 4 路 Range 分段并发；单连接慢/断会换下一个源。
+_UPDATE_MIRRORS = ("https://gh-proxy.com/", "https://ghfast.top/",
+                   "https://gh-proxy.org/", "https://ghproxy.net/")
+_UPDATE_CHUNK = 512 * 1024
+_UPDATE_SOCK_TIMEOUT = 15
 _UPDATE_ROUNDS = 2
+_UPDATE_PROBE_BYTES = 128 * 1024
+_UPDATE_PROBE_TIMEOUT = 2
+_UPDATE_PROBE_BUDGET = 2.5
+_UPDATE_CONNS = 4
+_UPDATE_MIN_PARALLEL = 8 * 1024 * 1024
+_UPDATE_SLOW_WINDOW = 6.0
+_UPDATE_SLOW_BYTES = 96 * 1024
 
 
 def _update_ver(v):
@@ -376,6 +385,190 @@ def _update_stream(src, part, got, total):
     return got, total
 
 
+def _update_http_get(src, start, end, timeout):
+    """发一个闭区间 Range 请求并校验 206 + 起点，返回响应对象。"""
+    headers = {"User-Agent": "MirrorSorter/%s" % APP_VER,
+               "Range": "bytes=%d-%d" % (start, end)}
+    req = urllib.request.Request(src, headers=headers)
+    r = urllib.request.urlopen(req, timeout=timeout)
+    status = int(getattr(r, "status", 0) or r.getcode() or 0)
+    try:
+        if status != 206:
+            raise ValueError("源不支持分段下载")
+        m = re.match(r"bytes\s+(\d+)-", str(r.headers.get("Content-Range") or ""))
+        if not m or int(m.group(1)) != start:
+            raise ValueError("分段起点不一致")
+        return r
+    except Exception:
+        r.close()
+        raise
+
+
+def _update_rank_sources(sources):
+    """并发取每个源的前 128KB，按吞吐从快到慢排序；没测通的源留作兜底。"""
+    if len(sources) <= 1:
+        return list(sources)
+    out = []
+    lock = threading.Lock()
+
+    def one(src):
+        got = 0
+        t0 = time.time()
+        try:
+            r = _update_http_get(src, 0, _UPDATE_PROBE_BYTES - 1, _UPDATE_PROBE_TIMEOUT)
+            try:
+                while got < _UPDATE_PROBE_BYTES and time.time() - t0 < _UPDATE_PROBE_TIMEOUT:
+                    b = r.read1(_UPDATE_PROBE_BYTES - got)
+                    if not b:
+                        break
+                    got += len(b)
+            finally:
+                r.close()
+        except Exception:
+            return
+        dt = max(time.time() - t0, 0.001)
+        if got >= _UPDATE_PROBE_BYTES // 2:
+            with lock:
+                out.append((got / dt, src))
+
+    ths = [threading.Thread(target=one, args=(s,), daemon=True,
+                            name="update-probe-%d" % i)
+           for i, s in enumerate(sources)]
+    for t in ths:
+        t.start()
+    deadline = time.time() + _UPDATE_PROBE_BUDGET
+    for t in ths:
+        t.join(max(0.0, deadline - time.time()))
+    with lock:
+        out.sort(key=lambda x: x[0], reverse=True)
+        ranked = [s for _, s in out]
+    # 没测通的源不能丢：按原顺序排在后面兜底
+    return ranked + [s for s in sources if s not in ranked]
+
+
+def _update_seg_worker(srcs, seg_path, start, end):
+    """把一个闭开区间 [start,end) 续传到 seg_path；慢源/断线自动换下一个源。"""
+    if not srcs:
+        raise ValueError("没有可用的下载源")
+    want = end - start
+    pos = os.path.getsize(seg_path) if os.path.isfile(seg_path) else 0
+    if pos > want:
+        os.remove(seg_path)
+        pos = 0
+    if pos >= want:
+        return
+    last = ""
+    for i in range(max(1, len(srcs)) * 2):
+        if pos >= want:
+            return
+        src = srcs[i % len(srcs)]
+        host = urllib.parse.urlparse(src).hostname or src
+        try:
+            r = _update_http_get(src, start + pos, end - 1, _UPDATE_SOCK_TIMEOUT)
+            try:
+                with open(seg_path, "ab") as f:
+                    win_t, win_n = time.time(), 0
+                    while pos < want:
+                        # read1: 有多少先拿多少，慢源不会卡在一个大 read 里导致测速失灵
+                        chunk = r.read1(min(_UPDATE_CHUNK, want - pos))
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        pos += len(chunk)
+                        win_n += len(chunk)
+                        with _UPDATE_LOCK:
+                            _UPDATE_STATE["received"] = int(_UPDATE_STATE.get("received") or 0) + len(chunk)
+                            _UPDATE_STATE["source"] = host
+                        if time.time() - win_t >= _UPDATE_SLOW_WINDOW:
+                            if win_n < _UPDATE_SLOW_BYTES and want - pos > 1024 * 1024:
+                                raise TimeoutError("源太慢，换下一个")
+                            win_t, win_n = time.time(), 0
+            finally:
+                r.close()
+        except Exception as e:
+            last = "%s: %s" % (host, str(e)[:60])
+            try:
+                pos = os.path.getsize(seg_path) if os.path.isfile(seg_path) else 0
+            except OSError:
+                pos = 0
+            continue
+        if pos >= want:
+            return
+        last = "%s: 连接提前结束（%d/%d）" % (host, pos, want)
+    raise IOError(last or "分段下载未完成")
+
+
+def _update_parallel(srcs, part, prefix, total, info):
+    """从 prefix 起 4 路分段下载到临时段文件，全部完成后按序拼到 part。"""
+    want = total - prefix
+    n = max(1, min(_UPDATE_CONNS, int(math.ceil(want / float(2 * 1024 * 1024)))))
+    segdir = part + ".segs"
+    manifest = os.path.join(segdir, "manifest.json")
+    meta = {"latest": str(info.get("latest") or ""), "total": total,
+            "sha256": str(info.get("sha256") or ""), "prefix": prefix, "n": n}
+    reuse = False
+    try:
+        with open(manifest, "r", encoding="utf-8") as f:
+            old = json.load(f)
+        reuse = all(old.get(k) == meta[k] for k in meta)
+    except Exception:
+        reuse = False
+    if not reuse:
+        shutil.rmtree(segdir, ignore_errors=True)
+    os.makedirs(segdir, exist_ok=True)
+    if not reuse:
+        with open(manifest, "w", encoding="utf-8") as f:
+            json.dump(meta, f)
+
+    step = int(math.ceil(want / float(n)))
+    segs = []
+    cur = prefix
+    for i in range(n):
+        end = total if i == n - 1 else min(total, cur + step)
+        if end > cur:
+            segs.append((cur, end, os.path.join(segdir, "seg%d" % i)))
+        cur = end
+    got = prefix
+    for st, en, path in segs:
+        try:
+            sz = os.path.getsize(path)
+        except OSError:
+            sz = 0
+        if sz > en - st:
+            os.remove(path)
+            sz = 0
+        got += min(sz, en - st)
+    with _UPDATE_LOCK:
+        _UPDATE_STATE.update({"total": total, "received": got})
+
+    errors = []
+
+    def run(st, en, path):
+        try:
+            _update_seg_worker(srcs, path, st, en)
+        except Exception as e:
+            errors.append(str(e)[:100])
+
+    ths = [threading.Thread(target=run, args=(st, en, path), daemon=True,
+                            name="update-seg-%d" % i)
+           for i, (st, en, path) in enumerate(segs)]
+    for t in ths:
+        t.start()
+    for t in ths:
+        t.join()
+    if errors:
+        raise IOError(errors[0])
+    with open(part, "ab") as out:
+        for _st, _en, path in segs:
+            with open(path, "rb") as f:
+                shutil.copyfileobj(f, out, 1024 * 1024)
+    if os.path.getsize(part) != total:
+        raise IOError("拼接后大小不一致")
+    shutil.rmtree(segdir, ignore_errors=True)
+    with _UPDATE_LOCK:
+        _UPDATE_STATE["received"] = total
+
+
 def _update_download_worker(info):
     part = ""
     try:
@@ -391,6 +584,7 @@ def _update_download_worker(info):
                     os.remove(part)
                 except OSError:
                     pass
+            shutil.rmtree(part + ".segs", ignore_errors=True)
             size = os.path.getsize(final)
             with _UPDATE_LOCK:
                 _UPDATE_STATE.update({"phase": "ready", "path": final,
@@ -404,11 +598,26 @@ def _update_download_worker(info):
             _UPDATE_STATE["received"] = got
         sources = _update_sources(info)
         last_err = ""
-        if not total or got < total:
+        ranked = sources
+        if total and got < total:
+            ranked = _update_rank_sources(sources)
+            if total - got >= _UPDATE_MIN_PARALLEL:
+                try:
+                    _update_parallel(ranked, part, got, total, info)
+                    got = os.path.getsize(part)
+                except Exception as e:
+                    last_err = "并发下载失败: %s" % str(e)[:100]
+                    try:
+                        got = os.path.getsize(part)
+                    except OSError:
+                        got = 0
+                    with _UPDATE_LOCK:
+                        _UPDATE_STATE["received"] = got
+        if total and got < total:
             for _round in range(_UPDATE_ROUNDS):
                 if total and got >= total:
                     break
-                for src in sources:
+                for src in ranked:
                     try:
                         got, total = _update_stream(src, part, got, total)
                     except Exception as e:
@@ -435,6 +644,7 @@ def _update_download_worker(info):
         if want and _update_file_sha256(part).lower() != want:
             raise _UpdateCorrupt("文件校验失败（SHA256 不一致）")
         os.replace(part, final)
+        shutil.rmtree(part + ".segs", ignore_errors=True)
         with _UPDATE_LOCK:
             _UPDATE_STATE.update({"phase": "ready", "path": final,
                                   "received": got, "total": got})
@@ -444,6 +654,7 @@ def _update_download_worker(info):
                 os.remove(part)
             except OSError:
                 pass
+            shutil.rmtree(part + ".segs", ignore_errors=True)
         with _UPDATE_LOCK:
             _UPDATE_STATE.update({"phase": "error", "error": str(e)[:200]})
 
