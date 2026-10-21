@@ -162,8 +162,9 @@
     openModal("更新到 v" + esc(d.latest),
       "<p>正在下载更新包…</p>" +
       '<div class="updBar"><i id="updBarFill"></i></div>' +
-      '<div class="updMeta"><span id="updPct">0%</span><span id="updBytes"></span></div>',
-      []);
+      '<div class="updMeta"><span id="updPct">0%</span><span id="updBytes"></span></div>' +
+      '<p class="tip">下载期间此窗口会保持打开，完成后自动重启。</p>',
+      [], { locked: true });
     const paint = (st) => {
       const total = Number(st.total) || 0, got = Number(st.received) || 0;
       const pct = total ? Math.min(100, Math.round(got * 100 / total)) : 0;
@@ -2341,13 +2342,20 @@
     await save("/api/disclaimer/ack", { version: "2026-09-03" }, "确认免责声明");
   };
 
-  function openModal(title, html, buttons) {
+  let modalLocked = false;   // 更新下载/安装期间锁住: 点遮罩、×、Esc 都不能收起来
+  function setModalLock(on) {
+    modalLocked = !!on;
+    const x = $("#mClose");
+    if (x) x.style.display = modalLocked ? "none" : "";
+  }
+  function openModal(title, html, buttons, opts) {
     $("#modal").innerHTML =
       '<div class="mhead"><span>' + esc(title) + '</span><button class="x" id="mClose" aria-label="关闭">' + ic("x") + '</button></div>' +
       '<div class="mbody">' + html + "</div>" +
       '<div class="mfoot">' + (buttons || []).map((b, i) =>
         '<button data-i="' + i + '">' + esc(b.t) + "</button>").join("") + "</div>";
     $("#mask").classList.add("show");
+    setModalLock(opts && opts.locked);
     $("#mClose").onclick = closeModal;
     (buttons || []).forEach((b, i) => {
       const el = document.querySelector('#modal [data-i="' + i + '"]');
@@ -2408,6 +2416,7 @@
   // 关闭时必须把内容真的拆掉，不能只是藏起来：站内播放的 iframe 留在 DOM 里会继续出声，
   // 用户看到的就是"点了 × 还在后台播"。移除节点同时也会释放它的解码资源。
   function closeModal() {
+    if (modalLocked) return;   // 更新进行中: 不许把进度窗口关掉(否则 updBusy 永远回不来)
     $("#mask").classList.remove("show");
     $("#modal").classList.remove("wide");
     $("#modal").innerHTML = "";
