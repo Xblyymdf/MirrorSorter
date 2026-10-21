@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-洞鉴虚明 · 基础版 (v0.4.12dsk)
+洞鉴虚明 · 基础版 (v0.4.13dsk)
 ==========================
 本地运行的洞鉴虚明：读取 B站 内容 → 黑白名单/AI 分拣 → 推荐流 + 数据源状态 + AI 聊天。
 
@@ -65,7 +65,7 @@ if _PORT_ENV:
         PORTS = (int(_PORT_ENV),)
     except Exception:
         pass
-APP_VER = "v0.4.12dsk"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
+APP_VER = "v0.4.13dsk"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
 # 本机回环请求必须绕过系统代理: 用户开着 Clash/V2Ray/公司代理时, 环境里的 http_proxy 会把
 # 127.0.0.1 的请求转给代理服务器, 轻则 502, 重则心跳连续失败 -> 悬浮球探活 2 轮不过自我了断,
 # 表现为「球莫名消失/点定位没反应」。这里建一个禁用代理的 opener 专供本地调用; 外网 API 仍走
@@ -4282,10 +4282,21 @@ def fetch_xhh_pool(quick=False):
     return items, []
 
 
-def fetch_pool(quick=False):
+def fetch_pool(quick=False, _token=None):
     """轮换取源 + 页游标 + 相关推荐链 + 搜索词引擎 + 随机采样 + 贴吧(网络请求全部并行)。
-    quick=True: 只取2个源(快速开屏, 后续后台补全)。"""
+    quick=True: 只取2个源(快速开屏, 后续后台补全)。
+    _token: 构建令牌。清池/改设置会换令牌, 旧构建在阶段之间尽早退出 ——
+    否则用户清空后要等那次已经作废的 full(关注+相关链+随机词, 最坏一分钟)跑完才轮到新的 quick。"""
     global _src_cursor, _page_cursor, _kw_cursor, _kw_page, _fetch_count, _pref_cursor, _pref_page
+
+    def _stale():
+        return _token is not None and _token != _uni_token
+
+    def _aborted():
+        return {"ok": False, "offline": False, "source": "", "items": [], "error": "构建已作废"}
+
+    if _stale():
+        return _aborted()
     errors, seen, items, ok, names = [], {}, [], 0, []
     enabled = enabled_source_ids()
     avail = [s for s in BILI_SOURCES if s[1] in enabled] or BILI_SOURCES
@@ -4303,6 +4314,17 @@ def fetch_pool(quick=False):
     tb_future = xhh_future = fol_future = live_future = local_serious_future = None
     serious_search_futures = []
     quick_search_futures = []
+    # quick 首屏: 可选源最多再等 2 秒(从榜单消费完开始算), 慢的留给随后自动接力的 full。
+    # 旧实现无上限 .result(): 一次搜索超时(12s)+重试(1.2~3s)+再超时(12s) ≈ 27 秒,
+    # 偏好词+两个开屏搜索同时挂住时首屏就被拖到一分钟。full 构建不受影响(deadline=0)。
+    _q_deadline = 0.0
+
+    def _qresult(fut, default=None):
+        try:
+            return fut.result(timeout=max(0.0, _q_deadline - time.time()) if _q_deadline else None)
+        except Exception:
+            return default
+
     if ser_mode and not quick:
         ser_terms = serious_kw_pool(enabled)[:10]
         # B站严肃关键词搜索 + 允许吧内搜索统一 fan-out, 结果随后统一去重/门禁
@@ -4393,15 +4415,16 @@ def fetch_pool(quick=False):
         else:
             errors.append("%s: %s" % (shown, (data or {}).get("code") or err))
 
+    if _stale():
+        return _aborted()
+    _q_deadline = time.time() + 2.0 if quick else 0.0
+
     # --- 偏好词引擎(消费): 紧跟榜单之后、贴吧/相关链/词引擎之前收编, 预算必有富余 ---
     # 偏好备注是用户明写的主动意图, 优先级高于分区白名单与严肃模式硬拒(仍在 planned_feed 豁免);
     # 但时间窗是用户对"新鲜度"的硬设定, 不再豁免 —— 抓回即按偏好窗预过滤, 老视频不占池子名额。
     _pref_cut = pref_age_cut()   # 0=不限
     for kw, pg, fut in pref_futures:
-        try:
-            res = fut.result() or []
-        except Exception:
-            res = []
+        res = _qresult(fut) or []
         if len(res) > 1:
             random.shuffle(res)   # 同词同页返回结果顺序固定 → 打散, 不再每轮池顶同一批
         made = 0
@@ -4426,10 +4449,7 @@ def fetch_pool(quick=False):
     # --- 快速开屏: 消费与榜单同时发出的搜索词请求(见 quick 分支的提前提交) ---
     if quick:
         for kw, future in quick_search_futures:
-            try:
-                res = future.result() or []
-            except Exception:
-                res = []
+            res = _qresult(future) or []
             made = 0
             for x in res:
                 if not item_domain_ok(x, enabled):
@@ -4442,6 +4462,9 @@ def fetch_pool(quick=False):
                     made += 1
             if made:
                 names.append("搜索·%s×%d" % (kw, made))
+
+    if _stale():
+        return _aborted()
 
     if ser_mode and not quick:
         # 严肃模式 fan-out 结果统一汇总: B站严肃词 + 每个允许吧的严肃词。
@@ -4494,9 +4517,11 @@ def fetch_pool(quick=False):
     # 绕过 0 权重继续调用 fetch_tieba_pool, 用户把比例调到 0 仍在被抓。
     if tb_weight() > 0:
         if tb_future:
-            tb_items, tb_errs = tb_future.result()
+            tb_items, tb_errs = _qresult(tb_future, ([], []))
+        elif not quick:
+            tb_items, tb_errs = fetch_tieba_pool(quick=False)
         else:
-            tb_items, tb_errs = fetch_tieba_pool(quick=quick)
+            tb_items, tb_errs = [], []
         for x in tb_items:
             if x["key"] not in seen and len(items) < 400:
                 seen[x["key"]] = 1
@@ -4508,9 +4533,11 @@ def fetch_pool(quick=False):
 
     if xhh_weight() > 0:
         if xhh_future:
-            xhh_items, xhh_errs = xhh_future.result()
+            xhh_items, xhh_errs = _qresult(xhh_future, ([], []))
+        elif not quick:
+            xhh_items, xhh_errs = fetch_xhh_pool(quick=False)
         else:
-            xhh_items, xhh_errs = fetch_xhh_pool(quick=quick)
+            xhh_items, xhh_errs = [], []
         for x in xhh_items:
             if x["key"] not in seen and len(items) < 400:
                 seen[x["key"]] = 1
@@ -4524,9 +4551,11 @@ def fetch_pool(quick=False):
     # 与贴吧/小黑盒同批消费; 权重 0 时连抓取都不做(省一次直播接口请求)。
     if int(sget("live_weight") or 25) > 0:
         if live_future:
-            live_items, live_errs = live_future.result()
+            live_items, live_errs = _qresult(live_future, ([], []))
+        elif not quick:
+            live_items, live_errs = fetch_live_pool(quick=False)
         else:
-            live_items, live_errs = fetch_live_pool(quick=quick)
+            live_items, live_errs = [], []
         for x in live_items:
             if x["key"] not in seen and len(items) < 400:
                 seen[x["key"]] = 1
@@ -4536,6 +4565,8 @@ def fetch_pool(quick=False):
         elif live_errs and not quick:
             errors += live_errs
 
+    if _stale():
+        return _aborted()
     if sget("bili_follow_emph") == "1":
         if not quick:
             if fol_future:
@@ -4557,6 +4588,9 @@ def fetch_pool(quick=False):
             elif fol_err:
                 errors.append("关注的人: " + fol_err)
         # quick 首屏不做同步关注列表扫描；已有UID缓存会即时标注，完整补池随后异步抓取投稿。
+
+    if _stale():
+        return _aborted()
 
     # --- 相关推荐链: 种子 → 40相关 → 再开第二跳(每跳并行) ---
     # 产出率过低时整节跳过(相关链以老视频/重复居多, 常是"超时间窗"漏斗的最大来源);
@@ -4608,6 +4642,9 @@ def fetch_pool(quick=False):
                         items.append(item)
                         related_n += 1
             names.append("相关链×%d" % related_n)
+
+    if _stale():
+        return _aborted()
 
     # --- 搜索词引擎: 词池(LRU) × 多页翻页 × 自学习淘汰(并行; 严肃模式由严肃引擎替代) ---
     if items and not quick and not ser_mode:
@@ -4669,6 +4706,8 @@ def fetch_pool(quick=False):
     # --- 随机采样: 分区专属词库 × 随机深页 ---
     if not quick and len(items) < 420 and not ser_mode:
         for _ in range(2):
+            if _stale():
+                return _aborted()
             allw = serious_kw_pool(enabled) if ser_mode else random_word_candidates(enabled)
             candidates = [w for w in allw if w not in _recent_rand]
             if not candidates:
@@ -7613,7 +7652,10 @@ def _prewarm_loop():
                                  or time.time() - built_at > PREWARM_IDLE):
                 _prewarm_gen[0] += 1
                 # v0.3.1.55: 走 kick_build 的单飞/合并, 别让预热和用户刷新各起一个构建
-                kick_build(quick=False)
+                # v0.4.13: 空池的第一次必须 quick —— full 要 20 秒以上(关注列表+相关链),
+                # 旧实现启动第 10 秒就用 full 抢占首屏; 页面只能干等它跑完才开始出内容。
+                # quick 结束会自动接力 full, 内容不会少。
+                kick_build(quick=(n == 0))
         except Exception:
             pass
         time.sleep(PREWARM_TICK)
@@ -11812,7 +11854,7 @@ def _session_state(sid):
 
 
 _last_full_build_ts = 0   # 上次完整补池完成时间(节流冗余全量抓取)
-_BUILD_PENDING = False    # v0.3.1.55: 构建忙时收到的补池请求, 合并成"跑完再补一次"
+_BUILD_PENDING = None     # 忙时收到的补池请求("quick"/"full"), 合并成"跑完再补一次"; quick 优先
 # 构建节流(v0.3.1.59): 只有"忙/不忙"两个状态不够 —— 滚动时 serve_chunk 每 5~10 秒
 # 就会因为"未送出条目不够"再拉一次补池(旧日志实测 5 秒一次), 每次都要把贴吧/小黑盒/
 # 搜索源全打一遍。这既是贴吧风控的源头, 也让缓存里明明有存货时反复空转。
@@ -11857,7 +11899,8 @@ def kick_build(quick=True, pending=False):
             # 滚动补池/开屏轮询传 False —— 它们马上还会再来, 丢掉正好省一次抓取,
             # 也避免"构建刚结束又被轮询立刻拉起"的死循环。
             if pending:
-                _BUILD_PENDING = True
+                # quick 优先: 清池/刷新要的是"马上有内容", 不能被忙着的 full 合并成又一轮 full
+                _BUILD_PENDING = "quick" if (quick or _BUILD_PENDING == "quick") else "full"
             return False
         _universe["building"] = True          # 先占位, 线程里按已占位启动
         _universe["mode"] = "quick" if quick else "full"
@@ -11883,7 +11926,7 @@ def build_universe(quick=False, _claimed=False):
 
     added_n = None   # 本次真正新增的池内条目数(给节流退备用; None=作废/异常, 不算空转)
     try:
-        payload = fetch_pool(quick=quick)
+        payload = fetch_pool(quick=quick, _token=token)
         # 抓取期间设置变了/信息池被清空: 这份结果属于旧世代, 既不能落库也不许发布 ——
         # 旧实现只在入库之后才看令牌, 清池瞬间正在跑的构建会把刚删掉的内容整批写回 items,
         # 下一屏看到的还是"清空前那些东西"。
@@ -11976,10 +12019,10 @@ def build_universe(quick=False, _claimed=False):
         with _uni_lock:
             _universe["building"] = False
             again = _BUILD_PENDING
-            _BUILD_PENDING = False
+            _BUILD_PENDING = None
         _build_backoff(added_n)
         if again:
-            kick_build(quick=quick, pending=True)
+            kick_build(quick=(again == "quick"), pending=True)
 
 
 def feed_refresh_item(key, q=""):

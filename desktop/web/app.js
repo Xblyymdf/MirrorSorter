@@ -2200,9 +2200,24 @@
     try { await navigator.clipboard.writeText(t); $("#ioExpHint").textContent = "已复制到剪贴板"; }
     catch (e) { $("#ioExpText").select(); $("#ioExpHint").textContent = "浏览器不给复制，已帮你选中，按 Ctrl+C"; }
   };
-  $("#ioExpDownload").onclick = () => {
+  $("#ioExpDownload").onclick = async () => {
     const t = $("#ioExpText").value;
     if (!t) { toast("请先生成导出内容", true); return; }
+    // WebView2 壳里 <a download> 不触发(壳没接 DownloadStarting), 走原生「另存为」;
+    // 纯浏览器 / 桥未就绪时才用 Blob 下载兜底。
+    const nat = window.pywebview && window.pywebview.api;
+    if (nat && typeof nat.save_text === "function") {
+      try {
+        const r = String(await nat.save_text("mirrorsorter-settings.json", t) || "");
+        if (r === "cancel") return;
+        if (r.slice(0, 3) === "ok:") {
+          $("#ioExpHint").textContent = "已保存到：" + r.slice(3);
+          return;
+        }
+        toast("保存失败：" + r.replace(/^err:/, ""), true);
+        return;
+      } catch (e) { /* 桥异常 → 落到 Blob 兜底 */ }
+    }
     const a = document.createElement("a");
     a.href = URL.createObjectURL(new Blob([t], { type: "application/json" }));
     a.download = "mirrorsorter-settings.json";
