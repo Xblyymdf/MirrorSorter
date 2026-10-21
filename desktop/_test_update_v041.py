@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""v0.4.1dsk 自动更新自测（离线；不碰用户数据目录、不发真实网络请求）。
+"""自动更新自测（离线；不碰用户数据目录、不发真实网络请求）。
 
 覆盖：版本比较 / GitHub Releases 解析 / 更新包校验与替换脚本 / HTTP 路由 /
 桌面壳 install_update 桥 / 前端接线与版本同步。
@@ -46,10 +46,11 @@ JS_SRC = read(os.path.join(HERE, "web", "app.js"))
 CSS_SRC = read(os.path.join(HERE, "web", "style.css"))
 
 # ---------- 1. 版本与源码接线 ----------
-ok(app.APP_VER == "v0.4.1dsk", "APP_VER = v0.4.1dsk")
-ok(APP_SRC.count('洞鉴虚明 · 基础版 (v0.4.1dsk)') == 1, "app.py 头注释版本同步")
-ok(HTML_SRC.count("洞鉴虚明 v0.4.1dsk") == 2, "index.html 两处页脚版本同步")
-ok('APP_VER = "v0.4.1dsk"' in APP_SRC, "APP_VER 常量写死")
+NEW_VER = "v9.9.9dsk"          # 永远比当前版本新，测试不随版本号过期
+NEW_NUM = NEW_VER[1:]
+ok(APP_SRC.count("洞鉴虚明 · 基础版 (%s)" % app.APP_VER) == 1, "app.py 头注释版本同步")
+ok(HTML_SRC.count("洞鉴虚明 %s" % app.APP_VER) == 2, "index.html 两处页脚版本同步")
+ok(('APP_VER = "%s"' % app.APP_VER) in APP_SRC, "APP_VER 常量写死")
 ok(APP_SRC.count('if path == "/api/update/check":') == 1, "GET /api/update/check 路由")
 ok(APP_SRC.count('if path == "/api/update/progress":') == 1, "GET /api/update/progress 路由")
 ok(APP_SRC.count('if path == "/api/update/download":') == 1, "POST /api/update/download 路由")
@@ -93,33 +94,33 @@ def release(tag, assets, body="更新说明"):
             "published_at": "2026-10-20T00:00:00Z", "assets": assets}
 
 
-asset = {"name": "洞鉴虚明v0.4.2dsk.exe", "size": 78408159,
-         "browser_download_url": "https://github.com/Xblyymdf/MirrorSorter/releases/download/v0.4.2dsk/x.exe",
+asset = {"name": "洞鉴虚明%s.exe" % NEW_VER, "size": 78408159,
+         "browser_download_url": "https://github.com/Xblyymdf/MirrorSorter/releases/download/%s/x.exe" % NEW_VER,
          "digest": "sha256:" + "a" * 64}
 
-r = with_fetch(lambda u: release("v0.4.2dsk", [asset]), app.update_check)
+r = with_fetch(lambda u: release(NEW_VER, [asset]), app.update_check)
 ok(r.get("ok") and r.get("has_update") is True, "检测到新版本")
-ok(r.get("latest") == "0.4.2dsk", "新版本号去掉 v")
+ok(r.get("latest") == NEW_NUM, "新版本号去掉 v")
 ok(r.get("name", "").endswith(".exe"), "返回 exe 附件名")
 ok(r.get("sha256") == "a" * 64, "解析 digest 的 sha256")
 ok(r.get("supported") in (False, 0), "源码运行标记为不支持自替换")
 ok(app._UPDATE_LAST["info"] is not None, "新版本会缓存给下载用")
 
-r = with_fetch(lambda u: release("v0.4.1dsk", [asset]), app.update_check)
+r = with_fetch(lambda u: release(app.APP_VER, [asset]), app.update_check)
 ok(r.get("ok") and r.get("has_update") is False, "同版本不提示更新")
 ok(app._UPDATE_LAST["info"] is None, "无更新时清空缓存")
 
-r = with_fetch(lambda u: release("v0.4.2dsk", [
+r = with_fetch(lambda u: release(NEW_VER, [
     {"name": "说明.txt", "browser_download_url": "https://github.com/x/y.txt"},
     asset]), app.update_check)
 ok(r.get("ok") and r.get("has_update"), "跳过非 exe 附件")
 
-installer = {"name": "洞鉴虚明v0.4.2dsk_安装包.exe", "size": 280 * 1024 * 1024,
-             "browser_download_url": "https://github.com/Xblyymdf/MirrorSorter/releases/download/v0.4.2dsk/setup.exe"}
-r = with_fetch(lambda u: release("v0.4.2dsk", [installer, asset]), app.update_check)
+installer = {"name": "洞鉴虚明%s_安装包.exe" % NEW_VER, "size": 280 * 1024 * 1024,
+             "browser_download_url": "https://github.com/Xblyymdf/MirrorSorter/releases/download/%s/setup.exe" % NEW_VER}
+r = with_fetch(lambda u: release(NEW_VER, [installer, asset]), app.update_check)
 ok(r.get("ok") and r.get("name") == asset["name"], "同时有安装包时选独立 exe")
 
-r = with_fetch(lambda u: release("v0.4.2dsk", [
+r = with_fetch(lambda u: release(NEW_VER, [
     {"name": "x.exe", "browser_download_url": "https://evil.com/x.exe"}]), app.update_check)
 ok(r.get("ok") is False and "exe" in (r.get("error") or ""), "只认 GitHub 域名的 exe 附件")
 
@@ -211,7 +212,11 @@ DATA = b"MZ" + b"\x00" * (6 * 1024 * 1024 - 2)
 class _Resp:
     def __init__(self, data):
         self._data, self._pos = data, 0
+        self.status = 200          # v0.4.4 的 _update_stream 会读 status
         self.headers = {"Content-Length": str(len(data))}
+
+    def getcode(self):
+        return 200
 
     def read(self, n=-1):
         if n is None or n < 0:
@@ -250,18 +255,18 @@ try:
         raise AssertionError("download timeout")
 
     good = {"url": asset["browser_download_url"], "size": len(DATA),
-            "latest": "0.4.2dsk", "sha256": _hashlib.sha256(DATA).hexdigest()}
+            "latest": NEW_NUM, "sha256": _hashlib.sha256(DATA).hexdigest()}
     st = _run_download(good)
     ok(st["phase"] == "ready" and os.path.isfile(st.get("path") or ""),
        "下载 worker 落盘并进入 ready")
-    ok(st.get("path", "").endswith("洞鉴虚明0.4.2dsk.exe"), "下载文件按版本命名")
+    ok(st.get("path", "").endswith("洞鉴虚明%s.exe" % NEW_NUM), "下载文件按版本命名")
     ok(os.path.getsize(st["path"]) == len(DATA), "下载文件大小正确")
     ok(not os.path.exists(st["path"] + ".download"), "成功时清理 .download 临时文件")
 
     bad = dict(good, sha256="b" * 64)
     st = _run_download(bad)
     ok(st["phase"] == "error" and "SHA256" in (st.get("error") or ""), "SHA256 不符时报错")
-    ok(not os.path.exists(os.path.join(upd_root, "洞鉴虚明0.4.2dsk.exe.download")),
+    ok(not os.path.exists(os.path.join(upd_root, "洞鉴虚明%s.exe.download" % NEW_NUM)),
        "失败时清理 .download 临时文件")
 finally:
     app.urllib.request.urlopen = _real_urlopen

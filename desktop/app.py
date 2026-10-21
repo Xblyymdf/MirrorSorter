@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-洞鉴虚明 · 基础版 (v0.4.5dsk)
+洞鉴虚明 · 基础版 (v0.4.7dsk)
 ==========================
 本地运行的洞鉴虚明：读取 B站 内容 → 黑白名单/AI 分拣 → 推荐流 + 数据源状态 + AI 聊天。
 
@@ -65,7 +65,7 @@ if _PORT_ENV:
         PORTS = (int(_PORT_ENV),)
     except Exception:
         pass
-APP_VER = "v0.4.5dsk"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
+APP_VER = "v0.4.7dsk"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
 # 本机回环请求必须绕过系统代理: 用户开着 Clash/V2Ray/公司代理时, 环境里的 http_proxy 会把
 # 127.0.0.1 的请求转给代理服务器, 轻则 502, 重则心跳连续失败 -> 悬浮球探活 2 轮不过自我了断,
 # 表现为「球莫名消失/点定位没反应」。这里建一个禁用代理的 opener 专供本地调用; 外网 API 仍走
@@ -315,6 +315,33 @@ def _update_sources(info):
     return srcs
 
 
+def _update_file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def _update_file_ok(path, info):
+    """已下载完整的更新包直接复用；只认大小/文件头/官方 SHA256 全部对上的。"""
+    try:
+        if not os.path.isfile(path) or os.path.getsize(path) < 5 * 1024 * 1024:
+            return False
+        total = int(info.get("size") or 0)
+        if total and os.path.getsize(path) != total:
+            return False
+        with open(path, "rb") as f:
+            if f.read(2) != b"MZ":
+                return False
+        want = str(info.get("sha256") or "").lower()
+        if want and _update_file_sha256(path).lower() != want:
+            return False
+        return True
+    except OSError:
+        return False
+
+
 def _update_stream(src, part, got, total):
     """把 src 的字节续写到 part，返回 (已下载, 总量)。服务器忽略 Range 时从头重下。"""
     headers = {"User-Agent": "MirrorSorter/%s" % APP_VER}
@@ -357,6 +384,18 @@ def _update_download_worker(info):
         final = os.path.join(UPDATE_DIR, "洞鉴虚明%s.exe" % safe)
         part = final + ".download"
         total = int(info.get("size") or 0)
+        if _update_file_ok(final, info):
+            # 上次下完但没装成功（或用户重试）：直接用现成的，不再联网
+            if os.path.isfile(part):
+                try:
+                    os.remove(part)
+                except OSError:
+                    pass
+            size = os.path.getsize(final)
+            with _UPDATE_LOCK:
+                _UPDATE_STATE.update({"phase": "ready", "path": final,
+                                      "received": size, "total": size})
+            return
         got = os.path.getsize(part) if os.path.isfile(part) else 0
         if total and got > total:
             os.remove(part)
@@ -392,12 +431,8 @@ def _update_download_worker(info):
         with open(part, "rb") as f:
             if f.read(2) != b"MZ":
                 raise _UpdateCorrupt("下载的文件不是 Windows exe")
-            f.seek(0)
-            h = hashlib.sha256()
-            for b in iter(lambda: f.read(1 << 20), b""):
-                h.update(b)
         want = str(info.get("sha256") or "").lower()
-        if want and h.hexdigest().lower() != want:
+        if want and _update_file_sha256(part).lower() != want:
             raise _UpdateCorrupt("文件校验失败（SHA256 不一致）")
         os.replace(part, final)
         with _UPDATE_LOCK:
@@ -455,15 +490,20 @@ def update_script_text(old_exe, new_exe):
         'set "OLD=%s"' % _update_bat_quote(old_exe),
         'set "NEW=%s"' % _update_bat_quote(new_exe),
         'set "OLD_DIR=%s"' % _update_bat_quote(old_dir),
-        'if exist "%OLD%" copy /y "%OLD%" "%OLD%.bak" >/dev/null 2>nul',
+        'set "LOG=%~dp0apply_update.log"',
+        'echo [%date% %time%] start>>"%LOG%"',
+        'if exist "%OLD%" copy /y "%OLD%" "%OLD%.bak" >nul 2>nul',
         "for /l %%i in (1,1,180) do (",
         '  move /y "%NEW%" "%OLD%" >nul 2>nul && goto replaced',
         "  >nul 2>nul ping -n 2 127.0.0.1",
         ")",
+        'echo [%date% %time%] failed>>"%LOG%"',
         "goto failed",
         ":replaced",
+        'echo [%date% %time%] replaced>>"%LOG%"',
         'cd /d "%OLD_DIR%"',
         'start "" "%OLD%"',
+        'echo [%date% %time%] restarted>>"%LOG%"',
         'del "%~f0" >nul 2>nul',
         "exit /b 0",
         ":failed",
@@ -11480,7 +11520,9 @@ def _feed_plan(acts, new_session, gen):
              sget("dislike_note") or "", sget("tmp_blocks") or "",
              sget("explore_boost_ts") or "0",
              sget("feedback_sig") or "0")   # 负反馈信号: 点踩后强制重排, 计划中的不喜欢条目立即剔除
-    key = (len(acts), _uni_token, _score_epoch, stail)
+    # gen 必须进 key: 重建后条目总数常常不变(同一批内容删了又抓回), 只按长度判缓存会命中
+    # 旧计划, 新构建的条目永远排不进去 —— 清池/刷新后看起来像"没抓取"。
+    key = (len(acts), gen, _uni_token, _score_epoch, stail)
     with _plan_lock:
         c = _plan_cache
         if c["key"] == key:
@@ -11607,6 +11649,11 @@ def build_universe(quick=False, _claimed=False):
     added_n = None   # 本次真正新增的池内条目数(给节流退备用; None=作废/异常, 不算空转)
     try:
         payload = fetch_pool(quick=quick)
+        # 抓取期间设置变了/信息池被清空: 这份结果属于旧世代, 既不能落库也不许发布 ——
+        # 旧实现只在入库之后才看令牌, 清池瞬间正在跑的构建会把刚删掉的内容整批写回 items,
+        # 下一屏看到的还是"清空前那些东西"。
+        if token != _uni_token:
+            return None
         if not payload["offline"]:
             now = time.time()
             # 真实抓取路径就在这里: 状态面板的"上次抓取"必须由这里写。
@@ -11944,10 +11991,19 @@ def serve_chunk(offset=0, limit=30, q="", request_id="", plat=""):
     if not items:
         # 冷启动预缓存: 有缓存 → 注入空池并立即吐出(后台同时构建完整池); 没有才纯等待
         preheated = _cold_start_preheat()
+        started = False
         if not building:
-            kick_build(quick=True)
+            # 空池也要尊重 _next_build_ts 退避(连续空构建时最长 4 分钟): 绕过它等于在
+            # 源已被拒/被风控时每轮询一次就再打一遍站。退避到期后的轮询会自然补上。
+            started = kick_build(quick=True)
         if not preheated:
-            return {"ok": True, "items": [], "building": True, "gen": uni["gen"],
+            # building 必须如实回报: 旧实现被 _next_build_ts 挡住、根本没起线程也回 True,
+            # 前端于是永远"正在准备内容…"地静默轮询, 看起来就是信息流不抓取。
+            with _uni_lock:
+                building_now = _universe["building"]
+                uni = dict(_universe)
+            return {"ok": True, "items": [], "building": bool(started or building_now),
+                    "gen": uni["gen"],
                     "source": uni["source"], "offline": uni["offline"],
                     "ai": uni["ai"], "mode": uni["mode"], "account": uni["account"],
                     "partitions": uni.get("partitions", "全部"), "offset": offset,
@@ -12068,8 +12124,11 @@ def serve_chunk(offset=0, limit=30, q="", request_id="", plat=""):
         # 同样按缺量决定 quick/全量(池子见底时缺得多, 优先全量)。
         if not building and time.time() - uni["built_at"] > 5:
             need_full = time.time() - _last_full_build_ts > 90
-            kick_build(quick=not need_full)
-            building = True
+            if kick_build(quick=not need_full):
+                building = True
+            else:
+                with _uni_lock:
+                    building = _universe["building"]   # 可能刚被别的请求拉起; 别谎报
         if not chunk:
             # 最近发生过平台防扎堆暂缓: 构建补充中, 让前端继续轮询, 不误报"已到底"
             if (building or (sess and time.time() - sess.get("defer_ts", 0) < 120)) and not q:
@@ -14119,15 +14178,28 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/pool/clear":
             # 清空信息池(沉淀库+评分缓存)与已看记录, 并作废当前世代替换令牌
             # (不在此同步重建, 由前端 loadFeed(true)→/api/feed?refresh=1 触发重新收录)
-            global _uni_token
+            global _uni_token, _next_build_ts, _build_empty_streak, _last_full_build_ts
             with _db_lock:
-                db().execute("DELETE FROM items")
-                db().execute("DELETE FROM shown")
+                db().executescript("DELETE FROM items; DELETE FROM shown; "
+                                   "DELETE FROM item_presentation; DELETE FROM item_exposure_state")
                 db().commit()
             with _uni_lock:
                 _uni_token += 1
                 _universe["items"] = []
                 _universe["gen"] += 1
+                _universe["built_at"] = 0
+            # 清池必须连"会话已返回集合"和"规划缓存"一起清: 重建拉回的常常还是同一批内容,
+            # 会话去重会把它们全当成"本会话已经看过"跳过 → 用户看到的是清完永远刷不出来。
+            with _session_lock:
+                _session_served.clear()
+            with _plan_lock:
+                _plan_cache.update({"key": None, "order": [], "token": -1,
+                                    "epoch": -1, "stail": None, "seq": 0})
+            # 冷启动缓存里存的是旧池快照; 不清掉, 下一次空池预热会原样把旧内容注回来。
+            sset("cold_start_cache", "")
+            _next_build_ts = 0.0          # 清池是用户明确要求重建: 解掉补池退避
+            _build_empty_streak = 0
+            _last_full_build_ts = 0       # 让重建后的 quick 构建接力一次全量补全
             _fp_clear()   # 指纹记忆随池清空(重建拉回同内容不被误拦)
             return self.send_json({"ok": True})
 

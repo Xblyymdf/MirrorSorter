@@ -198,6 +198,7 @@
         return;
       }
       updBody("<p>下载完成，正在关闭程序并安装…</p>" +
+        '<p class="tip">安装包：' + esc(st.path || "") + "</p>" +
         '<p class="tip">程序会自动重启，请稍候。</p>');
       try {
         const rr = await a.install_update();
@@ -1178,11 +1179,17 @@
                  "重新收录需要十几秒，这期间列表会是空的。")) return;
     if (!(await save("/api/pool/clear", {}, "清空信息池"))) return;
     // 让"清空了"这件事在界面上真的看得见：列表变成空态并说明正在重收（空态文案由这里决定）
+    // 清池后必须退出搜索态并换一个会话：搜索路径根本不读池子（清了个寂寞），而会话 id 不变时
+    // 后端会把"重建后重新抓回的同一批内容"全算成本会话已返回 → 清完怎么刷都是空。
+    S.q = "";
+    const si = $("#searchInput"); if (si) si.value = "";
+    S.session = Math.random().toString(36).slice(2);
     S.offset = 0; S.done = false; S.waiting = false; S.refillTries = 0;
     S.emptyMsg = "正在按当前设置重新收录…";
     S.reqGen++;                     // 作废在途请求，免得旧数据把空态盖掉
     S.loading = false;
     $("#list").innerHTML = "";
+    saveState();
     loadFeed(true);
   };
 
@@ -3212,10 +3219,13 @@
   const v0 = VIEWS.indexOf(st0.view) >= 0 ? st0.view : "feed";
   if (v0 === "settings" && st0.sec) showSec(st0.sec);
   setView(v0);
-  if (st0.q) {                       // 上次在搜索：接着搜，不把结果丢掉
+  // 上次在搜索：接着搜，不把结果丢掉。这里必须用 restartFeed 而不是 loadFeed：
+  // setView 刚刚已经用空搜索词发了一屏，S.loading=true 会把这次的 loadFeed 直接挡掉，
+  // 之后 S.q 虽然挂上了、首屏却还是普通信息流 —— 搜索框和列表对不上。
+  if (v0 === "feed" && st0.q) {
     S.q = st0.q;
     $("#searchInput").value = st0.q;
-    loadFeed(false);
+    restartFeed();
   }
   loadBlacklist();
   loadMachine();

@@ -131,3 +131,11 @@ desktop/_vis/fasttext_demo/*.json
 
 # v0.4.5dsk: 版本号同步 + 反解校验
 !desktop/_verify_exe_v045.py
+
+# v0.4.6dsk: 无控制台安装回归 / 已下载包复用 / 反解校验
+!desktop/_test_apply_v046.py
+!desktop/_test_update_v046.py
+!desktop/_verify_exe_v046.py
+
+# v0.4.7dsk: 清池/信息流回归 + 反解校验
+!desktop/_verify_exe_v047.py

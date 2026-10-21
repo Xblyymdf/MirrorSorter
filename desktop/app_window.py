@@ -321,11 +321,14 @@ class ShellApi:
             res = app.update_prepare_install(st.get("path") or "")
             if not res.get("ok"):
                 raise ValueError(str(res.get("error") or "准备更新失败"))
-            flags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0)) | \
-                    int(getattr(subprocess, "DETACHED_PROCESS", 0))
+            # 无控制台 exe 里 DETACHED_PROCESS + 旧脚本(/dev/null) 会让 cmd 直接退出
+            # (实测 rc=1，批处理根本没跑)；只留 CREATE_NO_WINDOW 并显式 DEVNULL。
+            flags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
             subprocess.Popen(["cmd.exe", "/c", res["script"]],
                              cwd=os.path.dirname(res["script"]),
-                             creationflags=flags, close_fds=True)
+                             creationflags=flags, close_fds=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
         except Exception as e:
             with self._lock:
                 self._update_started = False
