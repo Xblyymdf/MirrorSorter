@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-洞鉴虚明 · 基础版 (v0.4.7dsk)
+洞鉴虚明 · 基础版 (v0.4.8dsk)
 ==========================
 本地运行的洞鉴虚明：读取 B站 内容 → 黑白名单/AI 分拣 → 推荐流 + 数据源状态 + AI 聊天。
 
@@ -65,7 +65,7 @@ if _PORT_ENV:
         PORTS = (int(_PORT_ENV),)
     except Exception:
         pass
-APP_VER = "v0.4.7dsk"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
+APP_VER = "v0.4.8dsk"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
 # 本机回环请求必须绕过系统代理: 用户开着 Clash/V2Ray/公司代理时, 环境里的 http_proxy 会把
 # 127.0.0.1 的请求转给代理服务器, 轻则 502, 重则心跳连续失败 -> 悬浮球探活 2 轮不过自我了断,
 # 表现为「球莫名消失/点定位没反应」。这里建一个禁用代理的 opener 专供本地调用; 外网 API 仍走
@@ -478,6 +478,19 @@ def _update_bat_quote(p):
     return s.replace("%", "%%")
 
 
+def update_child_env(base=None):
+    """更新脚本/重启进程要用的环境：清掉 PyInstaller onefile 的 _PYI_*，并让新 exe
+    强制重置环境。同名同路径的新 exe 如果继承了旧进程的 _PYI_APPLICATION_HOME_DIR，
+    会把自己当成旧进程的子进程、复用旧 _MEI；旧进程一退出就把它删了，新进程随即
+    "Failed to load Python DLL ...\\_MEIxxxx\\python314.dll"。"""
+    env = dict(os.environ if base is None else base)
+    for k in list(env):
+        if k.startswith("_PYI_") or k in ("_MEIPASS2", "PYINSTALLER_RESET_ENVIRONMENT"):
+            env.pop(k, None)
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    return env
+
+
 def update_script_text(old_exe, new_exe):
     """生成替换脚本：旧 exe 被占用时每秒重试（最长约 3 分钟），换好后从原目录重启。
     保留旧文件名 —— 用户的快捷方式/任务栏固定都指向这个路径，升级不能换名。"""
@@ -487,6 +500,14 @@ def update_script_text(old_exe, new_exe):
     return "\r\n".join([
         "@echo off",
         "setlocal",
+        # 旧进程是 PyInstaller onefile，它 spawn 的 cmd 会带着 _PYI_APPLICATION_HOME_DIR
+        # 等变量；不清掉的话，同名同路径的新 exe 会复用旧 _MEI（随后被旧进程删除）。
+        'set "_PYI_APPLICATION_HOME_DIR="',
+        'set "_PYI_ARCHIVE_FILE="',
+        'set "_PYI_PARENT_PROCESS_LEVEL="',
+        'set "_PYI_SPLASH_IPC="',
+        'set "_MEIPASS2="',
+        'set "PYINSTALLER_RESET_ENVIRONMENT=1"',
         'set "OLD=%s"' % _update_bat_quote(old_exe),
         'set "NEW=%s"' % _update_bat_quote(new_exe),
         'set "OLD_DIR=%s"' % _update_bat_quote(old_dir),
@@ -501,6 +522,9 @@ def update_script_text(old_exe, new_exe):
         "goto failed",
         ":replaced",
         'echo [%date% %time%] replaced>>"%LOG%"',
+        # 给旧 onefile 进程一点收尾时间；新 exe 已按上面的干净环境重新解压自己的 _MEI，
+        # 这里只是避免它和旧进程的退出清理挤在同一瞬间。
+        ">nul 2>nul ping -n 2 127.0.0.1",
         'cd /d "%OLD_DIR%"',
         'start "" "%OLD%"',
         'echo [%date% %time%] restarted>>"%LOG%"',

@@ -324,8 +324,12 @@ class ShellApi:
             # 无控制台 exe 里 DETACHED_PROCESS + 旧脚本(/dev/null) 会让 cmd 直接退出
             # (实测 rc=1，批处理根本没跑)；只留 CREATE_NO_WINDOW 并显式 DEVNULL。
             flags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            # 不能让 cmd/新 exe 继承本进程的 PyInstaller onefile 环境(_PYI_*)：
+            # 新 exe 与原 exe 同路径，bootloader 会把它当成子进程去复用旧 _MEI，
+            # 旧进程退出删除该目录后，新进程就报 Failed to load Python DLL。
             subprocess.Popen(["cmd.exe", "/c", res["script"]],
                              cwd=os.path.dirname(res["script"]),
+                             env=app.update_child_env(),
                              creationflags=flags, close_fds=True,
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                              stderr=subprocess.DEVNULL)
