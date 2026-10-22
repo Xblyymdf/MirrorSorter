@@ -516,12 +516,14 @@
         } catch (e) {}
       },
       /* 每帧主体: source = VideoFrame(worker) 或 <video> 元素(主线程回退路)。
-         meta: {force, paused, expectedDisplayTime} */
+         meta: {force, paused, expectedDisplayTime}
+         返回 true = 这一帧确实画上了(上层拿它当"画布是否还在更新"的看门狗信号)。 */
       kick: function (source, meta) {
         meta = meta || {};
-        if (!alive || lost || canvas.__msxAcnetCtxLost) return;
+        var painted = false;
         try {
-          if (!source || !vw) return;
+          if (!alive || lost || canvas.__msxAcnetCtxLost) return false;
+          if (!source || !vw) return false;
           var t0 = 0, frameGap = 0;
           try { t0 = meta.expectedDisplayTime || 0; } catch (e) { t0 = 0; }
           if (tPrev && t0) {
@@ -531,15 +533,10 @@
           if (t0) tPrev = t0;
 
           /* 上传当帧(VideoFrame 与 <video> 元素走同一 texImage2D 形态)。
-             VideoFrame 必须**无论成败都 close**: 泄漏的帧会占死解码器缓冲池,
-             表现就是"声音还在放、视频卡死、seek 也没用"(全屏真机复现过)。 */
+             帧的 close 统一放在函数级 finally —— 任何提前 return 的路径也不能漏。 */
           if (!vidTex) vidTex = makeVidTex();
           gl.bindTexture(gl.TEXTURE_2D, vidTex);
-          try {
-            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
-          } finally {
-            if (source.close) { try { source.close(); } catch (e) {} }
-          }
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
 
           var cw = canvas.width, chh = canvas.height;
           /* 画面在画布里的实际矩形(contain 居中) —— 宽高比不同留黑边不拉伸 */
@@ -648,9 +645,16 @@
             env.onFirst && env.onFirst();
           }
           if (frames % 30 === 1 || frames < 5) stats();
+          painted = true;
         } catch (e) {
           env.onFail && env.onFail("frame: " + e);
+        } finally {
+          /* VideoFrame 必须**无论成败都 close**, 包括上面所有提前 return 的路径:
+             泄漏的帧会占死解码器缓冲池, 表现就是"声音还在放、视频卡死、seek 也没用"
+             (全屏真机复现过)。<video> 元素没有 close, 这里自动跳过。 */
+          try { if (source && source.close) source.close(); } catch (e2) {}
         }
+        return painted;
       },
       stop: function () {
         alive = false;
@@ -678,8 +682,13 @@
     function drain() {
       if (!started || !core || !latest) return;
       var src = latest, meta = latestMeta;
-      latest = null;
-      try { core.kick(src, meta); } catch (e) { /* core 内部已上报 */ }
+      latest = null; latestMeta = null;
+      var ok = false;
+      try { ok = core.kick(src, meta) === true; } catch (e) { /* core 内部已上报 */ }
+      /* 回执 = 主线程的背压闸门与"画布还在更新"的时间戳。没有回执, 主线程就不再
+         构造新的 VideoFrame(见 __msxRunAcnet 的 feed) —— 慢 GPU 上宁可少超几帧,
+         也不能让解码器缓冲池被积压帧占死。 */
+      postMessage({ type: "drained", ok: ok });
     }
     self.onmessage = function (e) {
       var m = e.data || {};
@@ -707,6 +716,7 @@
         } else if (m.cmd === "frame") {
           if (!started || !core) {
             if (m.vf && m.vf.close) { try { m.vf.close(); } catch (e2) {} }
+            postMessage({ type: "drained", ok: false });
             return;
           }
           /* 只留最新帧: 网络忙时旧帧直接丢弃(运动闸门保证画面正确), 不积压 */
@@ -716,6 +726,8 @@
           setTimeout(drain, 0);
         } else if (m.cmd === "stop") {
           started = false;
+          if (latest && latest.close) { try { latest.close(); } catch (e2) {} }
+          latest = null; latestMeta = null;
           if (core) core.stop();
         }
       } catch (e) {
@@ -789,6 +801,11 @@
               statsIn(m.s || {});
             } else if (m.type === "fail") {
               try { window.__msxAcnetFail = m.msg; } catch (e2) {}
+            } else if (m.type === "drained") {
+              inFlight = false;                 // 背压闸门: 可以喂下一帧了
+              if (m.ok) {
+                try { canvas.__msxAcnetLastPaint = performance.now(); } catch (e2) {}
+              }
             }
           };
           w.postMessage({ cmd: "init", glsl: window.__MSX_ACNET_GLSL__, canvas: off,
@@ -806,16 +823,25 @@
         }
         var stopped = false;
         var lastFeed = performance.now();
-        /* 喂帧: new VideoFrame(零拷贝) → 转交 worker。转移失败也绝不泄漏 ——
-           泄漏的帧会占死解码器缓冲池 → "声音还在放、视频卡死、seek 没用"。 */
+        var inFlight = false;                // worker 手里还有一帧没啃完
+        /* 喂帧: new VideoFrame(零拷贝) → 转交 worker, **带背压**。
+           旧实现每来一个视频帧就 new + postMessage; worker 在全屏啃不动时(画布像素
+           ×4、网络满源宽), 未处理的消息队列会堆几十上百个 VideoFrame —— 解码器输出
+           缓冲池被占死 → 声音还在放、画面永远停在最后一帧、seek 也没用(真机复现过)。
+           现在最多只有一帧在途: 收到 worker 的 drained 回执才构造下一帧。 */
         function feed() {
+          if (stopped || video.__msxSrGen !== gen) return;
+          if (inFlight) return;
           var vf = null;
           try {
             vf = new VideoFrame(video);
+            inFlight = true;
             canvas.__msxAcnetWorker.postMessage({ cmd: "frame", vf: vf, meta: {} }, [vf]);
             vf = null;                        // 所有权已随消息转移
-          } catch (e) {}
-          if (vf && vf.close) { try { vf.close(); } catch (e2) {} }
+          } catch (e) {
+            inFlight = false;
+            if (vf && vf.close) { try { vf.close(); } catch (e2) {} }
+          }
           lastFeed = performance.now();
         }
         /* rVFC 泵: 每个呈现的视频帧喂一次。sr.user.js 已 patch rVFC(带世代门控),
@@ -849,6 +875,7 @@
         var stop = function () {
           if (stopped) return;
           stopped = true;
+          inFlight = false;
           try { clearInterval(revive); } catch (e) {}
           try { canvas.__msxAcnetWorker.postMessage({ cmd: "stop" }); } catch (e) {}
         };
@@ -858,12 +885,19 @@
         canvas.__msxAcnetPost = function (m) { try { canvas.__msxAcnetWorker.postMessage(m); } catch (e) {} };
         /* 暂停激活: rVFC 不会来 → 立刻转交一帧(force), worker 一口气成型 */
         canvas.__msxAcnetOnce = function () {
+          var vf = null;
           try {
-            var vf = new VideoFrame(video);
+            vf = new VideoFrame(video);
+            inFlight = true;
             canvas.__msxAcnetWorker.postMessage({ cmd: "frame", vf: vf,
                                                   meta: { force: true, paused: true } }, [vf]);
-          } catch (e) {}
+            vf = null;
+          } catch (e) {
+            inFlight = false;
+            if (vf && vf.close) { try { vf.close(); } catch (e2) {} }
+          }
         };
+        canvas.__msxAcnetLastPaint = performance.now();
         if (video.paused) { try { canvas.__msxAcnetOnce(); } catch (e) {} }
         try { window.__msxAcnetFail = null; } catch (e) {}
         return stop;
@@ -902,17 +936,28 @@
         core.stop();
       };
       canvas.__msxAcnetStop = stop2;
-      canvas.__msxAcnetOnce = function () { try { core.kick(video, { force: true, paused: true }); } catch (e) {} };
+      canvas.__msxAcnetLastPaint = performance.now();
+      canvas.__msxAcnetOnce = function () {
+        try {
+          if (core.kick(video, { force: true, paused: true })) {
+            canvas.__msxAcnetLastPaint = performance.now();
+          }
+        } catch (e) {}
+      };
       if (video.paused) { try { canvas.__msxAcnetOnce(); } catch (e) {} }
       if (o.sync) {
         /* 探针: 一次调用把 maxFrames 帧全部画完(独立计数防帧体抛错导致无限递归) */
-        for (var si = 0; si < (o.maxFrames || 1); si++) core.kick(video, { force: true });
+        for (var si = 0; si < (o.maxFrames || 1); si++) {
+          if (core.kick(video, { force: true })) canvas.__msxAcnetLastPaint = performance.now();
+        }
         return stop2;
       }
       try {
         video.requestVideoFrameCallback(function pump2(meta) {
           if (stopped2 || video.__msxSrGen !== gen) return;
-          core.kick(video, { expectedDisplayTime: meta && meta.expectedDisplayTime });
+          if (core.kick(video, { expectedDisplayTime: meta && meta.expectedDisplayTime })) {
+            canvas.__msxAcnetLastPaint = performance.now();
+          }
           video.requestVideoFrameCallback(pump2);
         });
       } catch (e) {}

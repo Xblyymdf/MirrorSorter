@@ -535,6 +535,7 @@
       if (!cur || cur.canvas !== c) return;
       cur.firstFrame = performance.now();
       window.__msxSrFirst = Math.round(cur.firstFrame - built);
+      c.__msxAcnetLastPaint = performance.now();
       try { c.style.display = "block"; } catch (e) {}
     };
 
@@ -589,32 +590,51 @@
        有进度(哪怕还没凑齐首帧标记)就继续等; 停滞/上下文丢失/暂停以外无进度才拆。 */
     if (p.kind === "acnet") {
       try { canvas.__msxAcnetCtxLost = 0; } catch (e) {}
-      var built0 = built, lastFrames = -1, stalls = 0;
+      var built0 = built, stalls = 0;
+      /* ⚠️ 判"画布还在更新"必须用**真的画上了**的时间戳(worker 的 drained.ok),
+         不能用 __msxAcnetFrames —— 后者每 30 帧才回报一次, 慢 GPU 上会把健康的
+         低帧率误判成停滞。 (用户报修: 全屏有概率卡死在一个画面, 声音还在放。) */
       var watchdog = setInterval(function () {
         if (!cur || cur.canvas !== canvas || cur.built !== built0) {
           clearInterval(watchdog); return;         // 已被更替: 本看门狗退役
         }
         if (document.hidden) return;
-        if (canvas.__msxAcnetCtxLost ||
-            String(window.__msxAcnetFail || "").indexOf("context-lost") >= 0) {
+        var err = String(window.__msxAcnetFail || "");
+        if (canvas.__msxAcnetCtxLost || err.indexOf("context-lost") >= 0 ||
+            err === "worker-error") {
           clearInterval(watchdog);
-          window.__msxSrFail = "webgl-context-lost";
-          teardown("stall:webgl-context-lost");    // reconcile 随后自动重建(新上下文)
+          window.__msxSrFail = err || "webgl-context-lost";
+          teardown("stall:" + window.__msxSrFail); // reconcile 随后自动重建(新上下文)
           return;
         }
-        var f = window.__msxAcnetFrames || 0;
-        if (video.paused) { lastFrames = f; stalls = 0; return; }   // 暂停: 无帧是正常的
-        if (f === lastFrames) {
-          if (++stalls >= 2) {                     // 播放中 ~4s 无任何画布帧 → 管线停了
+        if (video.paused) { stalls = 0; return; }  // 暂停: 无帧是正常的
+        var age = performance.now() - (canvas.__msxAcnetLastPaint || built0);
+        if (age > 1800) {
+          /* 画布停在最后一帧而视频还在走: 先把画布藏掉 —— 底层原视频立刻可见,
+             用户不会继续盯着一张冻住的画面; 下一拍还停就拆管重建。 */
+          try { canvas.style.display = "none"; } catch (e) {}
+          if (++stalls >= 2) {
             clearInterval(watchdog);
-            window.__msxSrFail = (window.__msxAcnetFail || "no-progress") + " frames=" + f;
-            console.warn("[msx] 超分管线停滞, 拆管重建:", window.__msxSrFail);
+            window.__msxSrFail = (window.__msxAcnetFail || "no-progress") +
+                                 " paintAge=" + Math.round(age);
+            console.warn("[msx] 超分画布停滞, 拆管重建:", window.__msxSrFail);
+            /* 30s 内反复停滞 = 不是偶发(多半 GPU 吃不下): 冷却 8s 再试,
+               避免"重建→立刻又冻"的高频重编把画面拖得更卡。 */
+            var nowT = Date.now(), prevT = window.__msxSrStallAt || 0;
+            window.__msxSrStallCount = (nowT - prevT < 30000)
+              ? (window.__msxSrStallCount || 0) + 1 : 1;
+            window.__msxSrStallAt = nowT;
+            window.__msxSrCooldownUntil = (window.__msxSrStallCount >= 2)
+              ? nowT + 8000 : 0;
             teardown("stall:" + window.__msxSrFail);
           }
           return;
         }
-        stalls = 0; lastFrames = f;
-      }, 2000);
+        stalls = 0;
+        if (canvas.style.display === "none") {
+          try { canvas.style.display = "block"; } catch (e) {}   // 恢复了: 把画布放回来
+        }
+      }, 1000);
     }
 
     /* 图层自检: 刚激活、以及全屏切换后各查几次(几何要等布局落定) —— 发现异常才弹面板 */
@@ -635,6 +655,10 @@
       var v = document.querySelector(VIDEO_SEL);
       if (!v) { if (cur) teardown("no-video"); return; }
       if (cur && (!cur.video.isConnected || cur.video !== v)) teardown("video-changed");
+      if (window.__msxSrCooldownUntil && Date.now() < window.__msxSrCooldownUntil) {
+        if (cur) teardown("stall-cooldown");
+        return;
+      }
       var p = plan(v, !!cur);
       if (!p) { if (cur) teardown("no-plan"); return; }
       if (cur && cur.video === v) {
