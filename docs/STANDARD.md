@@ -4,7 +4,7 @@
 exe 怎么构建、更新怎么发布、什么该进 git。改代码前先看第 3、4、5 节。
 
 - 仓库：<https://github.com/Xblyymdf/MirrorSorter>
-- 桌面当前版本：`v0.4.1dsk`
+- 桌面当前版本：以 `desktop/app.py` 的 `APP_VER` 为准（本文写作时为 `v0.4.13dsk`）
 - 数据目录：`%USERPROFILE%\AppData\LocalLow\MirrorSorter`
 - 本地服务：`127.0.0.1` 的 `8000 / 8010 / 8020`（被占用时依次回退）
 
