@@ -71,7 +71,7 @@ const sandbox = {
 };
 vm.createContext(sandbox);
 vm.runInContext(
-  block + "\n;globalThis.__upd = { updCheck, updDownload, updWireShell, busy: () => updBusy };\n",
+  block + "\n;globalThis.__upd = { updCheck, updDownload, updWireShell, mdlDownload, updBoth, busy: () => updBusy };\n",
   sandbox);
 
 async function flush() { await new Promise((r) => setTimeout(r, 0)); }
@@ -106,6 +106,7 @@ async function flush() { await new Promise((r) => setTimeout(r, 0)); }
       return { ok: true, has_update: true, current: "0.4.1dsk", latest: "0.4.2dsk",
                size: 10 * 1024 * 1024, notes: "修复 A\n修复 B" };
     }
+    if (path === "/api/model/check") return { ok: true, has_update: false, current: "1.0.0" };
     if (path === "/api/update/download") return { ok: true };
     if (path === "/api/update/progress") {
       if (state === "down") return { ok: true, phase: "downloading", received: 5 * 1024 * 1024, total: 10 * 1024 * 1024 };
@@ -114,11 +115,11 @@ async function flush() { await new Promise((r) => setTimeout(r, 0)); }
     return { ok: false, error: "unexpected " + path };
   };
   await sandbox.__upd.updCheck();
-  ok(modal.title.includes("发现新版本 v0.4.2dsk"), "弹窗显示新版本号");
-  ok(modal.html.includes("当前版本 <b>v0.4.1dsk</b>"), "弹窗显示当前版本");
+  ok(modal.title === "发现更新", "弹窗显示更新");
+  ok(modal.html.includes("程序：v0.4.1dsk → <b>v0.4.2dsk</b>"), "弹窗显示程序当前/新版本");
   ok(modal.html.includes("10.0 MB"), "弹窗显示安装包大小");
   ok(modal.html.includes("修复 A\n修复 B"), "弹窗显示 Release 说明");
-  ok(modal.buttons.length === 2 && modal.buttons[1].t === "立即更新", "有「稍后 / 立即更新」两个按钮");
+  ok(modal.buttons.length === 2 && modal.buttons[1].t === "更新程序", "有「稍后 / 更新程序」两个按钮");
 
   state = "down";
   const p = modal.buttons[1].fn();
@@ -138,9 +139,13 @@ async function flush() { await new Promise((r) => setTimeout(r, 0)); }
 
   /* ---------- 3. 已是最新版本 ---------- */
   modal.title = ""; modal.html = "";
-  apiImpl = async () => ({ ok: true, has_update: false, current: "0.4.1dsk" });
+  apiImpl = async (path) => {
+    if (path === "/api/update/check") return { ok: true, has_update: false, current: "0.4.1dsk" };
+    if (path === "/api/model/check") return { ok: true, has_update: false, current: "1.0.0" };
+    return { ok: false };
+  };
   await sandbox.__upd.updCheck();
-  ok(modal.title === "检测更新" && modal.html.includes("已是最新版本"), "无更新时明确提示已是最新");
+  ok(modal.title === "检测更新" && modal.html.includes("均为最新"), "无更新时明确提示均为最新");
 
   /* ---------- 4. 检查失败 ---------- */
   modal.title = ""; modal.html = "";
@@ -153,6 +158,7 @@ async function flush() { await new Promise((r) => setTimeout(r, 0)); }
   state = "down";
   apiImpl = async (path) => {
     if (path === "/api/update/check") return { ok: true, has_update: true, current: "0.4.1dsk", latest: "0.4.2dsk" };
+    if (path === "/api/model/check") return { ok: true, has_update: false, current: "1.0.0" };
     if (path === "/api/update/download") return { ok: true };
     return { ok: true, phase: "error", error: "下载文件太小，可能不是完整的 exe" };
   };
@@ -167,6 +173,7 @@ async function flush() { await new Promise((r) => setTimeout(r, 0)); }
   state = "ready";
   apiImpl = async (path) => {
     if (path === "/api/update/check") return { ok: true, has_update: true, current: "0.4.1dsk", latest: "0.4.2dsk" };
+    if (path === "/api/model/check") return { ok: true, has_update: false, current: "1.0.0" };
     if (path === "/api/update/download") return { ok: true };
     return { ok: true, phase: "ready", received: 10, total: 10 };
   };
@@ -175,6 +182,36 @@ async function flush() { await new Promise((r) => setTimeout(r, 0)); }
   await tickFn();
   await flush();
   ok(modal.title === "更新失败" && modal.html.includes("程序目录不可写"), "安装失败去掉 err: 前缀展示原因");
+
+  /* ---------- 7. 仅模型更新 → 下载 → 重新加载 ---------- */
+  modal.title = ""; modal.html = "";
+  let modelPhase = "down";
+  let reloadCalled = false;
+  apiImpl = async (path) => {
+    if (path === "/api/update/check") return { ok: true, has_update: false, current: "0.4.15dsk" };
+    if (path === "/api/model/check") {
+      return { ok: true, has_update: true, current: "1.0.0", latest: "1.0.1",
+               size: 200 * 1024 * 1024, notes: "更准" };
+    }
+    if (path === "/api/model/download") return { ok: true };
+    if (path === "/api/model/reload") { reloadCalled = true; return { ok: true }; }
+    if (path === "/api/model/progress") {
+      if (modelPhase === "down") return { ok: true, phase: "downloading", received: 50, total: 200 };
+      return { ok: true, phase: "ready", received: 200, total: 200 };
+    }
+    return { ok: false, error: "unexpected " + path };
+  };
+  await sandbox.__upd.updCheck();
+  ok(modal.buttons.length === 2 && modal.buttons[1].t === "更新模型", "仅模型更新时出现「更新模型」");
+  ok(modal.html.includes("模型：1.0.0 → <b>1.0.1</b>"), "模型弹窗显示版本");
+  const mp = modal.buttons[1].fn();
+  await flush();
+  modelPhase = "ready";
+  await tickFn();
+  await flush();
+  await mp;
+  ok(reloadCalled, "模型下载完成 → POST /api/model/reload");
+  ok(modal.title === "模型已更新", "模型更新完成提示");
 
   console.log("\n" + PASS + " PASS / " + FAIL.length + " FAIL");
   if (FAIL.length) { console.log("FAILED: " + FAIL.join("; ")); process.exit(1); }

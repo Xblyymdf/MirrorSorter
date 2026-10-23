@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-洞鉴虚明 · 基础版 (v0.4.14dsk)
+洞鉴虚明 · 基础版 (v0.4.19dsk)
 ==========================
 本地运行的洞鉴虚明：读取 B站 内容 → 黑白名单/AI 分拣 → 推荐流 + 数据源状态 + AI 聊天。
 
@@ -50,6 +50,11 @@ import zlib
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+try:
+    import bert_filter
+except Exception:   # 运行时缺失时整层自动降级为 fastText / 规则
+    bert_filter = None
+
 PORTS = (8000, 8010, 8020)
 # v0.3.1.34: 「信息以新窗口形式打开」(主题设置, 默认开) —— 点开信息弹**独立悬浮窗**,
 #           悬浮窗可塞回标签页, 标签页也能拖出成悬浮窗(控件实例跨窗迁移, 页面不重载)。
@@ -65,7 +70,7 @@ if _PORT_ENV:
         PORTS = (int(_PORT_ENV),)
     except Exception:
         pass
-APP_VER = "v0.4.14dsk"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
+APP_VER = "v0.4.19dsk"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
 # 本机回环请求必须绕过系统代理: 用户开着 Clash/V2Ray/公司代理时, 环境里的 http_proxy 会把
 # 127.0.0.1 的请求转给代理服务器, 轻则 502, 重则心跳连续失败 -> 悬浮球探活 2 轮不过自我了断,
 # 表现为「球莫名消失/点定位没反应」。这里建一个禁用代理的 opener 专供本地调用; 外网 API 仍走
@@ -125,7 +130,8 @@ _IO_IMPORTABLE = ({"mode", "ai_base", "ai_key", "ai_model", "ai_enabled", "ai_fu
                    "prefs_note", "dislike_note", "cf_blk_on", "cf_min_level",
                    "m_block_mystery_bio", "m_block_lottery",
                    "m_block_empty_space", "m_dm_on",
-                   "ft_on", "ft_video", "ft_dm", "ft_cf", "ft_thresh", "ft_labels"} | _IO_CRED_KEYS) - _IO_STATE_KEYS
+                   "ft_on", "ft_video", "ft_dm", "ft_cf", "ft_thresh", "ft_labels",
+                   "ft_point", "ft_bthr", "ft_engine"} | _IO_CRED_KEYS) - _IO_STATE_KEYS
 # 脱敏导出白名单(白名单, 不是黑名单): 只有列在这里的键才会进「只导出设置」的文件。
 # 将来新增设置项默认**不导出**, 必须显式加进来 —— 避免新字段悄悄把敏感信息带出去。
 _IO_SHAREABLE = frozenset(_IO_IMPORTABLE - _IO_CRED_KEYS)
@@ -184,6 +190,11 @@ if getattr(sys, "frozen", False):   # 一次性迁移: exe旁旧库 → 用户�
 # 源码运行也允许"检查"，但下载/替换只在 Windows 的 PyInstaller exe 里开放。
 UPDATE_REPO = os.environ.get("MIRRORSORTER_UPDATE_REPO") or "Xblyymdf/MirrorSorter"
 UPDATE_API = "https://api.github.com/repos/%s/releases/latest" % UPDATE_REPO
+try:
+    if bert_filter is not None:
+        bert_filter.init(DATA_DIR, APP_DIR, UPDATE_REPO)
+except Exception:
+    pass
 UPDATE_DIR = os.path.join(DATA_DIR, "update")
 _UPDATE_LOCK = threading.Lock()
 _UPDATE_LAST = {"info": None, "ts": 0.0}
@@ -981,8 +992,11 @@ DEFAULTS = {
     "ft_video": "1",       # 作用范围: 信息筛选(视频标题+简介/贴吧标题+摘要)
     "ft_dm": "1",          # 作用范围: 弹幕
     "ft_cf": "1",          # 作用范围: 评论
-    "ft_thresh": "70",     # 判定阈值(%), 越高越宽松(70=概率≥0.70 才拦)
-    "ft_labels": "flame,spam,clickbait,yy",   # 启用哪些标签(逗号分隔)
+    "ft_thresh": "70",     # fastText 回退阈值(%), 越高越宽松(70=概率≥0.70 才拦)
+    "ft_labels": "flame,spam,clickbait,yy,misinfo",  # 启用哪些标签(逗号分隔)
+    "ft_point": "strict",  # BERT 工作点: strict(严格)/standard(标准)/loose(宽松)
+    "ft_bthr": "",         # BERT 自定义阈值(%): 空=跟随工作点; 如 99.8
+    "ft_engine": "auto",   # auto=BERT 优先(模型缺失自动回落 fastText); fasttext=强制旧模型
     # v0.3.1.34 信息打开方式(桌面窗口壳): 1=点开信息弹独立悬浮窗(默认; 悬浮窗可塞回标签页,
     # 标签页也能拖出成悬浮窗) 0=旧的标签页内打开。仅桌面壳生效, 安卓/浏览器忽略。
     "ui_new_window": "1",
@@ -1121,7 +1135,7 @@ _FUNNEL_LABELS = {
     "blocklist": "拉黑名单", "help": "求助帖", "xhh": "小黑盒筛选", "dedup": "重复标题",
     "follow_window": "关注超强调窗", "cooldown": "展示冷却", "cooldown_relaxed": "冷却不足复用", "ai_gate": "AI门禁", "kept": "最终入池",
     "pref_fetch": "偏好·搜到", "pref_kept": "偏好·入池", "pref_drop": "偏好·被拦",
-    "pref_age": "偏好·超时间窗",
+    "pref_age": "偏好·超时间窗", "recency": "时效梯度",
     "build_full": "全量构建", "build_quick": "快速构建",
 }
 
@@ -1158,6 +1172,7 @@ SOURCE_GROUPS = [
 SOURCES_PER_FETCH = 6
 _src_cursor = 0
 _page_cursor = 0
+_recent_src_names = []   # 上一轮抓过的榜单源: 随机取源时优先避开, 防止每轮重抓同一批
 
 # 源产出率自学习: 记录每个数据源"抓回→机器筛选存活"的通过率(指数衰减)。
 # 通过率过低的源少抓/跳过, 把抓取预算让给高产源 —— 避免"抓1万条只剩几条"的漏斗浪费。
@@ -1327,25 +1342,38 @@ def fetch_related(seed):
 
 
 def pick_seeds(items):
-    """选高价值种子: 用户点过赞的 > 账号常看作者 > 高热兜底, 最多4个。"""
+    """选高价值种子: 用户点过赞的 > 账号常看作者 > 高热兜底, 最多4个。
+    同一优先级内随机取 —— 旧版固定取最近6条/前3个作者/播放量前4, 每轮相关链种子完全一样,
+    抓回来的相关视频自然高度重复(用户"抓取没有随机化"的一部分)。"""
     seeds = []
+    likes = []
     for (k,) in db().execute(
             "SELECT key FROM feedback WHERE action='like' ORDER BY ts DESC LIMIT 6").fetchall():
         r = db().execute("SELECT json FROM items WHERE key=?", (k,)).fetchone()
         if r:
             try:
-                seeds.append(json.loads(r[0]))
+                likes.append(json.loads(r[0]))
             except Exception:
                 pass
+    if likes:
+        random.shuffle(likes)
+        seeds = likes[:4]
     if not seeds:
-        acct = account_slim()
-        for a in (acct.get("authors") or [])[:3]:
-            for it in items:
-                if it["author"] == a["name"]:
-                    seeds.append(it)
-                    break
+        authors = [a.get("name") for a in (account_slim().get("authors") or [])[:8]
+                   if a.get("name")]
+        random.shuffle(authors)
+        by_author = {}
+        for it in items:
+            by_author.setdefault(it.get("author") or "", []).append(it)
+        for a in authors:
+            pool = by_author.get(a) or []
+            if pool:
+                seeds.append(random.choice(pool))
+            if len(seeds) >= 4:
+                break
     if not seeds:
-        seeds = sorted(items, key=lambda x: -x["views"])[:4]
+        top = sorted(items, key=lambda x: -x["views"])[:20]
+        seeds = random.sample(top, min(4, len(top)))
     out, seen_url = [], set()
     for s in seeds:
         if s.get("url") and s["url"] not in seen_url:
@@ -1482,6 +1510,7 @@ _pref_page = 0     # 偏好词翻页计数(保留兼容, 实际取页已改为�
 _pref_bag = []     # 偏好词洗牌袋: 一轮内全覆盖 + 顺序随机
 _pref_page_hist = []   # 最近用过的页码(防连续命中同一页)
 _PREF_PAGE_MAX = 4 # 偏好词翻页深度(4页×30条/词, 覆盖小众主题的近期供给)
+_PREF_PER_TERM_CAP = 12   # 单个偏好词每轮最多收编条数: 防一个词一次灌30条把池子刷成单主题
 PREF_LOOSE_BONUS_MONTHS = 6   # 宽松档: 偏好备注内容额外宽限月数(其余档位不加)
 
 
@@ -1558,10 +1587,11 @@ def _pref_pick_page():
 
 
 def _pref_search_terms(enabled, quick):
-    """本轮要搜的(偏好词, 页码): 完整构建取2词/快速开屏取1词。
+    """本轮要搜的(偏好词, 页码): 完整构建取3词/快速开屏取1词。
     词走洗牌袋、页码随机 —— 两者都随机才不会固定周期复现同一批视频
-    (旧版是双顺序游标, 每 N×4 轮就完整重放一轮)。"""
-    prefs = _pref_pick(pref_all_kws(), 1 if quick else 2)
+    (旧版是双顺序游标, 每 N×4 轮就完整重放一轮)。取3词(旧版2词)是为了让池子里
+    同时有更多主题, 而不是两个偏好轮流灌满。"""
+    prefs = _pref_pick(pref_all_kws(), 1 if quick else 3)
     return [(kw, _pref_pick_page()) for kw in prefs]
 
 
@@ -1675,9 +1705,18 @@ def ensure_kw_pool():
 
 
 def pick_kws(n=4):
-    """LRU 选词: 最久没用过的优先。"""
-    rows = db().execute("SELECT kw FROM kw ORDER BY last_used ASC LIMIT ?", (n,)).fetchall()
-    return [r[0] for r in rows]
+    """选词: 在最久没用过的一批里随机取 n 个。
+    纯 LRU 虽然覆盖均匀, 但每轮取词顺序固定, 内容会按词的顺序成块出现, 且几轮一个周期
+    完整复现(用户反馈"抓取没有随机化"); 候选放大到 4 倍再抽样, 兼顾覆盖与随机。"""
+    try:
+        rows = db().execute("SELECT kw FROM kw ORDER BY last_used ASC LIMIT ?",
+                            (max(24, n * 4),)).fetchall()
+    except Exception:
+        return []
+    kws = [r[0] for r in rows]
+    if len(kws) > n:
+        kws = random.sample(kws, n)
+    return kws
 
 
 def search_pushdown():
@@ -1714,6 +1753,56 @@ def search_pushdown():
     except Exception:
         pass
     return push
+
+
+# --- 时效梯度(v0.4.19dsk, 用户要求) ---
+# 允许的时间窗内不该是均匀分布: 越新的内容被抓到的概率越高, 越老按比例降低;
+# 窗口外照旧由 machine_filter / pref_age_cut 硬拦。平方衰减:
+#   刚发布 1.0 → 窗口过半 0.36 → 窗口末尾 0.15(仍有机会) → 窗外 0。
+_RECENCY_FLOOR = 0.15
+
+
+def _recency_prob(pubdate, window_months, now=None):
+    """某条内容在时效梯度下的保留概率(0~1)。0=不限时间窗; 发布时间未知给中性 0.5。"""
+    if not window_months:
+        return 1.0
+    if not pubdate:
+        return 0.5
+    now = now or time.time()
+    r = (now - pubdate) / (window_months * 30.44 * 86400.0)
+    if r >= 1.0:
+        return 0.0
+    if r <= 0.0:
+        return 1.0
+    return _RECENCY_FLOOR + (1.0 - _RECENCY_FLOOR) * (1.0 - r) ** 2
+
+
+def _recency_gate(items):
+    """抓取侧按时效梯度抽样: 同一轮里越老的内容越容易被丢掉。
+    关注/直播/非B站豁免(各有独立机制); 偏好内容用偏好时间窗。
+    全被抽掉时原样放行 —— 不能制造"空抓取"让上层退化成离线示例。"""
+    try:
+        mode = sget("mode")
+        win = int(sget("ser_max_age_months") if mode == "严肃"
+                  else (sget("m_max_age_months") or 0))
+    except Exception:
+        win = 0
+    pref_win = pref_age_months()
+    now = time.time()
+    kept, dropped = [], 0
+    for it in items:
+        if it.get("platform") != "B站" or it.get("following") or it.get("is_live"):
+            kept.append(it)
+            continue
+        p = _recency_prob(it.get("pubdate") or 0,
+                          pref_win if it.get("pref_kw") else win, now)
+        if p < 1.0 and random.random() >= p:
+            dropped += 1
+            continue
+        kept.append(it)
+    if dropped:
+        _funnel_bump("recency", dropped)
+    return kept or items
 
 
 # B站直搜最近一次失败的原因(进程内诊断用): 搜索"没有B站视频"时先看这里
@@ -4288,6 +4377,7 @@ def fetch_pool(quick=False, _token=None):
     _token: 构建令牌。清池/改设置会换令牌, 旧构建在阶段之间尽早退出 ——
     否则用户清空后要等那次已经作废的 full(关注+相关链+随机词, 最坏一分钟)跑完才轮到新的 quick。"""
     global _src_cursor, _page_cursor, _kw_cursor, _kw_page, _fetch_count, _pref_cursor, _pref_page
+    global _recent_src_names
 
     def _stale():
         return _token is not None and _token != _uni_token
@@ -4303,11 +4393,18 @@ def fetch_pool(quick=False, _token=None):
     n = len(avail)
     per = 2 if quick else SOURCES_PER_FETCH
     if n <= per:                        # 开启的分区很少时, 全部取
-        picked, _src_cursor = avail[:], 0
-    else:                                # 轮转全量列表 → 低产源裁剪(产出率自学习) → 取 per 个
-        rotated = [avail[(_src_cursor + i) % n] for i in range(n)]
-        picked = _src_yield_prune(rotated, per)
-        _src_cursor = (_src_cursor + per) % n
+        picked = avail[:]
+    else:
+        # 随机取源(用户反馈"抓取没有随机化"): 旧版按固定游标轮转, 每轮取到的源组合可预期,
+        # 榜单内容也就按固定周期复现。现在整体洗牌, 只尽量避开上一轮刚抓过的源;
+        # 低产源裁剪仍在其后, 通过率自学习不变。
+        cands = list(avail)
+        fresh = [s for s in cands if s[0] not in _recent_src_names]
+        if len(fresh) >= per:
+            cands = fresh
+        random.shuffle(cands)
+        picked = _src_yield_prune(cands, per)
+        _recent_src_names = [s[0] for s in picked]
 
     # --- 榜单源: 并行抓取(严肃模式跳过: 榜单内容非教程类, 抓了也全被滤掉) ---
     ser_mode = sget("mode") == "严肃"
@@ -4429,6 +4526,8 @@ def fetch_pool(quick=False, _token=None):
             random.shuffle(res)   # 同词同页返回结果顺序固定 → 打散, 不再每轮池顶同一批
         made = 0
         for x in res:
+            if made >= _PREF_PER_TERM_CAP:   # 单词限流: 防一个偏好词一次灌30条同主题内容
+                break
             bvid = (x.get("url") or "").rsplit("/", 1)[-1]
             if not bvid or bvid in seen or len(items) >= 450:
                 continue
@@ -4444,12 +4543,14 @@ def fetch_pool(quick=False, _token=None):
             names.append("偏好·%s×%d" % (kw, made))
             _funnel_bump("pref_fetch", made)
     if pref_terms:
-        _pref_cursor += 1 if quick else 2   # 严肃模式变体池仍按此游标轮换
+        _pref_cursor += len(pref_terms)   # 严肃模式变体池仍按此游标轮换
 
     # --- 快速开屏: 消费与榜单同时发出的搜索词请求(见 quick 分支的提前提交) ---
     if quick:
         for kw, future in quick_search_futures:
             res = _qresult(future) or []
+            if len(res) > 1:
+                random.shuffle(res)   # 搜索接口返回顺序固定 → 打散, 每轮池顶内容不再一样
             made = 0
             for x in res:
                 if not item_domain_ok(x, enabled):
@@ -4473,6 +4574,8 @@ def fetch_pool(quick=False, _token=None):
                 result = future.result() or []
             except Exception:
                 result = []
+            if len(result) > 1:
+                random.shuffle(result)
             made = 0
             for x in result:
                 if kind == "tb":
@@ -4611,6 +4714,7 @@ def fetch_pool(quick=False, _token=None):
         for raw in _FX.map(fetch_related, pick_seeds(items)):
             if related_n >= 120:   # 相关链封顶, 防止单节灌满池子挤掉其他来源
                 break
+            random.shuffle(raw)    # 相关接口顺序固定 → 打散, 不再每次都先收同一批
             for it in raw:
                 if len(items) >= 450:
                     break
@@ -4625,9 +4729,11 @@ def fetch_pool(quick=False, _token=None):
                     items.append(item)
                     related_n += 1
         if related_n:
-            hop2 = sorted([it for it in items if it.get("gid") == "related"],
-                          key=lambda x: -x["views"])[:4]
+            rel_pool = sorted([it for it in items if it.get("gid") == "related"],
+                              key=lambda x: -x["views"])[:12]
+            hop2 = random.sample(rel_pool, min(4, len(rel_pool)))
             for raw in _FX.map(fetch_related, hop2):
+                random.shuffle(raw)
                 for it in raw:
                     if len(items) >= 450:
                         break
@@ -4653,6 +4759,8 @@ def fetch_pool(quick=False, _token=None):
         _push = search_pushdown()
         jobs2 = [(kw, random.choice([1, 1, 2, 3])) for kw in kws]   # 随机页: 每词独立乱序
         for (kw, page), res in zip(jobs2, _FX.map(lambda a: search_items(a[0], a[1], order=_push.get("order"), duration=_push.get("duration")), jobs2)):
+            if len(res) > 1:
+                random.shuffle(res)   # 同一搜索词的结果顺序固定, 打散后再决定谁先进池
             keys = [x["key"] for x in res]
             if keys:
                 ph = ",".join("?" * len(keys))
@@ -4719,8 +4827,11 @@ def fetch_pool(quick=False, _token=None):
             if len(_recent_rand) > 6:
                 _recent_rand.pop(0)
             page = random.choice([1, 1, 2, 3, 4, 5, 6, 8, 10, 12, 15])
+            res = search_items(kw, page, **search_pushdown())
+            if len(res) > 1:
+                random.shuffle(res)
             made = 0
-            for x in search_items(kw, page, **search_pushdown()):
+            for x in res:
                 if not item_domain_ok(x, enabled):   # 分区白名单(严格)
                     continue
                 bvid = (x.get("url") or "").rsplit("/", 1)[-1]
@@ -4777,6 +4888,7 @@ def fetch_pool(quick=False, _token=None):
             if len(items) >= 300 or batch >= 1:
                 break
 
+    items = _recency_gate(items)   # 时效梯度: 窗口内越新越容易被留下(窗外仍由 machine_filter 硬拦)
     _fetch_count += 1
     if not items:
         return {"ok": False, "offline": True, "source": "内置示例(离线)",
@@ -9832,8 +9944,8 @@ def machine_filter(items):
         # v0.3.1.43dsk 快速文本分析: 规则层没抓到的语义垃圾(引战/低质/标题党/阴阳怪气)
         # 交给本地 fastText 兜一遍。词表命中的上面已经拦了, 这里只处理"词表覆盖不到"的。
         # 只在 m_emotion 之后跑 —— 省一次模型调用, 也让漏斗计数各归各的。
-        if not is_live and ft_enabled() and sget("ft_video") == "1":
-            _w = ft_scan([(it.get("title") or "") + " " + (it.get("desc") or "")], "video")[0]
+        if not is_live and sget("ft_on") == "1" and sget("ft_video") == "1":
+            _w = text_scan([(it.get("title") or "") + " " + (it.get("desc") or "")], "video")[0]
             if _w:
                 _funnel_bump("ft")
                 continue
@@ -10838,8 +10950,114 @@ def _sim_bands(title, bands=4):
     return out
 
 
+# ── 主题级降重(v0.4.19dsk) ──────────────────────────────────────────────
+# 用户反馈"一堆相似内容放一起": 作者/标题指纹只能抓同一个人/同一条内容, 抓不到
+# "同一个游戏/同一个系列换了几十个UP主" —— WARDROGS、战争雷霆这类主题一多就会成片。
+# 这里从标题+标签抽主题词(标签原词 / 拉丁词 / 中文2~4字组), 用文档频率滤掉太泛的词,
+# 再并入间距键, 计划层与服务层都会据此隔开。
+_TOPIC_STOP = set("""视频 教程 分享 推荐 合集 最新 完整 官方 中文 字幕 高清 实况
+游戏 内容 日常 动画 音乐 直播 回放 手机 电脑 世界 中国 日本 美国 生活 工作
+学习 知识 新闻 解说 评测 盘点 实测 对比 解析 入门 教学 攻略 实机 演示 预告
+更新 版本 第二赛季 第三赛季 新版本 赛季 比赛 赛事 精彩 集锦 第一 视角 搞笑
+原创 搬运 中字 字幕组 纪录片 电影 电视剧 综艺 动漫 二次元 单机 网游 网络
+单机游戏 网络游戏 手机游戏 射击游戏 电子竞技 游戏集锦 精彩集锦 游戏实况
+游戏解说 直播录像 第一视角 第三视角 创作激励 激励计划 必剪创作 高能 沙雕
+娱乐 混剪 剪辑 新手 科普 科技 数码 军事 美食 旅行 vlog
+fps rpg steam pc ps4 ps5 xbox switch 4k 8k hd diy ai app api bug mod
+我的 我们 你们 他们 自己 什么 怎么 为什么 如何 这个 那个 就是 不是 可以
+已经 没有 真的 还是 但是 因为 所以 如果 然后 一个 一次 一下 这些 那些
+系列 全部 全新 最强 顶级 大师 一口气 细思极恐
+坦克 载具 装甲 完全 新版""".split())
+_TOPIC_SKIP_CHARS = set("的了是在我你他她它这那和与就都也很吗吧啊呀哦么什怎为何把被")
+_TOPIC_MAX = 3
+
+
+def _topic_latin(w):
+    """拉丁词归一: wardogs / wardog 视为同一个主题。"""
+    w = w.lower()
+    if len(w) > 4 and w.endswith("s") and not w.endswith("ss"):
+        w = w[:-1]
+    return w
+
+
+def _topic_candidates(it):
+    """标题+标签 → 主题候选词(按可信度排序: 标签 > 拉丁词 > 长中文组)。"""
+    out, seen = [], set()
+
+    def _add(tok, prio):
+        tok = (tok or "").strip().lower()
+        if re.fullmatch(r"[a-z0-9]+", tok or ""):
+            tok = _topic_latin(tok)
+        if not tok or tok in seen or len(tok) < 2 or len(tok) > 16:
+            return
+        if tok in _TOPIC_STOP or tok.isdigit():
+            return
+        if not re.search(r"[a-z\u4e00-\u9fff]", tok):
+            return
+        seen.add(tok)
+        out.append((tok, prio))
+
+    for part in re.split(r"[,，、;；/|]+", it.get("tag") or "")[:20]:
+        p = re.sub(r"\s+", "", part)
+        _add(p, 0)
+        for run in re.findall(r"[\u4e00-\u9fff]{2,8}", p):
+            _add(run, 0)          # 标签"战狗WARDOGS"拆成中文/拉丁各自成键
+        for w in re.findall(r"[a-z][a-z0-9]{2,}", p.lower()):
+            _add(_topic_latin(w), 0)
+    title = unicodedata.normalize("NFKC", it.get("title") or "").lower()
+    for w in re.findall(r"[a-z][a-z0-9]{2,}", title):
+        _add(_topic_latin(w), 1)
+    zh = re.sub(r"[^\u4e00-\u9fff]", "", title)
+    for n, prio in ((4, 2), (3, 3), (2, 4)):
+        for i in range(max(0, len(zh) - n + 1)):
+            g = zh[i:i + n]
+            if any(ch in _TOPIC_SKIP_CHARS for ch in g):
+                continue
+            _add(g, prio)
+    return out
+
+
+def _assign_topics(items):
+    """给一批候选标注主题间距键(文档频率过滤 + 每项最多3个)。
+    df=1 是孤例(不需要降重), df 过高的太泛(游戏/教程) —— 只留 2 ≤ df ≤ 35% 的"真主题"。
+    上限用 35% 而不是更小: 尾部重混时某一主题可能占很大比例, 不能因此把它当成泛词。"""
+    n = len(items)
+    if n < 2:
+        for it in items:
+            it["_topics"] = []
+        return
+    cap = max(12, int(n * 0.35))
+    df = collections.Counter()
+    cands = []
+    for it in items:
+        cs = _topic_candidates(it)
+        cands.append(cs)
+        df.update({t for t, _ in cs})
+    valid = {t for t, c in df.items() if 2 <= c <= cap}
+    for it, cs in zip(items, cands):
+        picked = []
+        for t, _ in cs:
+            if t in valid and t not in picked:
+                picked.append(t)
+                if len(picked) >= _TOPIC_MAX:
+                    break
+        it["_topics"] = picked
+
+
+def _topic_tags_quick(it):
+    """没经过 _assign_topics 的零散条目(搜索/换一条)的廉价主题键: 只看标签。"""
+    out = []
+    for part in re.split(r"[,，、;；/|]+", it.get("tag") or "")[:10]:
+        t = re.sub(r"\s+", "", part).lower()
+        if 2 <= len(t) <= 16 and t not in _TOPIC_STOP:
+            out.append(t)
+        if len(out) >= 2:
+            break
+    return out
+
+
 def _spacing_keys(it):
-    """视觉降重的间距键(多维): 同作者任意标题算同类; 同/近指纹标题跨作者也算同类。"""
+    """视觉降重的间距键(多维): 同作者/同指纹标题/同主题(同游戏·同系列)都算同类。"""
     keys = []
     author = it.get("author") or ""
     if author:
@@ -10850,6 +11068,11 @@ def _spacing_keys(it):
         if fp:
             keys.append("f:" + fp)
         keys.extend(_sim_bands(title))
+    tops = it.get("_topics")
+    if tops is None:
+        tops = _topic_tags_quick(it)
+    for t in tops[:_TOPIC_MAX]:
+        keys.append("t:" + t)
     return keys
 
 
@@ -10872,15 +11095,16 @@ def _author_quota_hold(order):
 
 
 def _space_same_author(items, gap=_AUTHOR_SPACING_GAP):
-    """同作者/相似标题打散: 贪心重排, 优先取"间距键不在近期窗口"的条目;
-    实在避不开时重置窗口放行(宁相邻不丢失), 保持各平台混排比例不变。"""
-    recent = collections.deque()
-    recent_set = set()
-    # 间距键现在含 MinHash 分带, 重算不便宜 —— 预计算一次, 别在 O(n²) 扫描里反复算。
+    """同作者/相似标题/同主题打散: 贪心重排, 优先取"间距键不在近期窗口"的条目;
+    实在避不开时重置窗口放行(宁相邻不丢失), 保持各平台混排比例不变。
+    窗口按**条目**计数 —— 旧版把每条内容的 6~10 个键平铺进 deque、按 key 数裁剪,
+    gap=6 实际只隔开 1~2 条, 等于没生效(用户"一堆相似内容放一起"的根因之一)。"""
     pool = []
     for it in items:
         ks = _spacing_keys(it)
         pool.append((it, ks, set(ks)))
+    recent = collections.deque()   # 每个元素 = 一条内容的键集合
+    recent_set = set()
     out = []
     while pool:
         pick_idx = None
@@ -10889,21 +11113,21 @@ def _space_same_author(items, gap=_AUTHOR_SPACING_GAP):
                 pick_idx = i
                 break
         if pick_idx is None:
-            pick_idx = 0       # 剩余全是同作者/相似标题: 放最前并重置窗口, 避免死循环
+            pick_idx = 0       # 剩余全是同作者/相似标题/同主题: 放最前并重置窗口, 避免死循环
             recent.clear()
             recent_set.clear()
-        it, ks, _ = pool.pop(pick_idx)
-        for k in ks:
-            recent.append(k)
-            recent_set.add(k)
-        while len(recent) > gap * 2:
-            old = recent.popleft()
-            recent_set.discard(old)
+        it, ks, kset = pool.pop(pick_idx)
         out.append(it)
+        recent.append(kset)
+        recent_set |= kset
+        if len(recent) > gap:
+            recent.popleft()
+            # 不能 -= : 被弹出条目的键可能仍被窗口里其它条目持有, 简单删会误放行。
+            recent_set = set().union(*recent) if recent else set()
     return out
 
 
-def _declump_cat(items, win=5, win_max=3, look=8, max_run=2):
+def _declump_cat(items, win=5, win_max=3, look=8, max_run=2, keys=None):
     """同分类轻度去扎堆(有界局部换位, 不做全局重排)。
 
     用户反馈"一大堆同类型信息挤在一起": mix_sources 只管平台层间距(B站/贴吧/小黑盒),
@@ -10912,14 +11136,27 @@ def _declump_cat(items, win=5, win_max=3, look=8, max_run=2):
     的同类条目全挤到计划尾部 —— 尾部变成单平台长带, serve 层防扎堆只能把它们全部暂缓,
     一页吐不出几条, 反而变成"抓不到内容"(回归测试 '沉积带' 就是这么挂的)。
     这里只做局部交换: 同一分类在最近 win 条里已出现 win_max 次时, 到后面 look 条内找一个
-    不同类的条目换上来; 换位后必须仍满足平台连排 <= max_run, 否则跳过。只换位不重排,
-    计划整体排序/热度分层/尾部构成都不动。"""
+    不同类的条目换上来; 换位后必须仍满足平台连排 <= max_run, 且 i/j 附近不能出现新的
+    作者/标题/主题撞键(否则会把上一步的降重成果换没), 否则跳过。只换位不重排。"""
     n = len(items)
     if n < win or look < 1:
         return list(items)
     out = list(items)
     cat = [_cat_key(it) for it in out]
     plat = [(it.get("platform") or "B站") for it in out]
+    skeys = keys if keys is not None else [set(_spacing_keys(it)) for it in out]
+
+    def _near_conflict(p, gap=_AUTHOR_SPACING_GAP):
+        ks = skeys[p]
+        if not ks:
+            return False
+        for q in range(max(0, p - gap), p):
+            if skeys[q] & ks:
+                return True
+        for q in range(p + 1, min(n, p + gap + 1)):
+            if skeys[q] & ks:
+                return True
+        return False
 
     def _swap_ok(i, j):
         """交换 i/j 后, 两点附近的平台连排是否仍 <= max_run(连排只可能被局部改动影响)。"""
@@ -10933,7 +11170,11 @@ def _declump_cat(items, win=5, win_max=3, look=8, max_run=2):
             last = p
             if run > max_run:
                 return False
-        return True
+        a, b = skeys[i], skeys[j]
+        skeys[i], skeys[j] = b, a
+        ok = not (_near_conflict(i) or _near_conflict(j))
+        skeys[i], skeys[j] = a, b
+        return ok
 
     for i in range(n):
         c = cat[i]
@@ -10950,6 +11191,7 @@ def _declump_cat(items, win=5, win_max=3, look=8, max_run=2):
             out[i], out[j] = out[j], out[i]
             cat[i], cat[j] = cat[j], cat[i]
             plat[i], plat[j] = plat[j], plat[i]
+            skeys[i], skeys[j] = skeys[j], skeys[i]
             break
     return out
 
@@ -11343,6 +11585,155 @@ def ft_warmup():
         pass
 
 
+# ---------------------------------------------------------------- 智能语义筛选(BERT)
+# v0.4.16dsk: 本地 BERT(6层768, FP32 ONNX) 接管「这条内容说了什么」的判定，
+# 模型缺失或用户强制 fasttext 时回落到旧模型。复用 ft_* 开关，不新增一套 UI 语义：
+#   ft_on 总开关 / ft_video·ft_dm·ft_cf 作用范围 / ft_labels 勾选标签
+#   ft_point 是 BERT 工作点(严格/标准/宽松)，ft_engine=fasttext 可强制旧模型。
+_BERT_UI_LABELS = {
+    "flame": ("flame", "insult"),
+    "spam": ("spam", "low_quality"),
+    "clickbait": ("clickbait",),
+    "yy": ("sarcasm",),
+    "neg": ("disgust",),
+    "misinfo": ("misinfo",),
+    "antisocial": ("antisocial",),
+    "unpatriotic": ("antisocial",),   # 旧设置键(不爱国)兼容: 语义已改为反社会
+    "foreign_worship": ("foreign_worship",),
+}
+_BERT_POINTS = ("strict", "standard", "loose")
+
+
+def bert_point():
+    p = (sget("ft_point") or "strict").strip()
+    return p if p in _BERT_POINTS else "strict"
+
+
+def bert_thresh():
+    """自定义判定阈值(0~1)。界面按百分数存；空/越界 = 跟随工作点。"""
+    raw = (sget("ft_bthr") or "").strip()
+    if not raw:
+        return None
+    try:
+        v = float(raw) / 100.0
+    except Exception:
+        return None
+    return v if 0.5 <= v < 1.0 else None
+
+
+def _bert_ui_labels():
+    """把界面上的勾选(显示/低质/阴阳…)展开成 BERT 的细标签。"""
+    raw = (sget("ft_labels") or "").strip()
+    toks = [x.strip() for x in raw.split(",") if x.strip()]
+    if not toks:
+        toks = ["flame", "spam", "clickbait", "yy", "misinfo"]
+    out = []
+    for t in toks:
+        for lab in _BERT_UI_LABELS.get(t, (t,)):
+            if bert_filter is not None and lab in bert_filter.TOXIC and lab not in out:
+                out.append(lab)
+    return out
+
+
+def _bert_usable():
+    if bert_filter is None or sget("ft_on") != "1":
+        return False
+    if (sget("ft_engine") or "auto") == "fasttext":
+        return False
+    return bert_filter.available()
+
+
+def text_engine():
+    """当前实际会用的内容判定引擎: bert / fasttext / off（只看文件，不加载模型）。"""
+    if sget("ft_on") != "1":
+        return "off"
+    if _bert_usable():
+        return "bert"
+    return "fasttext" if _ft_path() else "off"
+
+
+def text_on(kind="video"):
+    if sget("ft_on") != "1":
+        return False
+    scope = {"video": "ft_video", "dm": "ft_dm", "cf": "ft_cf"}.get(kind, "ft_video")
+    return sget(scope) == "1"
+
+
+def _ctx_clean(ctx):
+    c = ctx if isinstance(ctx, dict) else {}
+    return {"title": str(c.get("title") or "")[:60], "up": str(c.get("up") or "")[:24],
+            "tags": str(c.get("tags") or "")[:16], "parent": str(c.get("parent") or "")[:80]}
+
+
+def _bert_scan(items, kind):
+    res = bert_filter.scan(items, kind, bert_point(), _bert_ui_labels(), bert_thresh())
+    return [r.get("why") or "" for r in res]
+
+
+def text_scan(texts, kind="video", ctx=None):
+    """统一入口: BERT 优先，fastText 回落；返回与 texts 等长的原因(空串=放行)。"""
+    n = len(texts)
+    if n == 0 or not text_on(kind):
+        return [""] * n
+    if _bert_usable():
+        c = _ctx_clean(ctx)
+        items = []
+        for t in texts:
+            it = {"text": t, "kind": kind}
+            it.update(c)
+            items.append(it)
+        try:
+            return _bert_scan(items, kind)
+        except Exception:
+            pass
+    if _ft_path():
+        try:
+            return ft_scan(texts, kind)
+        except Exception:
+            pass
+    return [""] * n
+
+
+def text_probe(text, ctx=None):
+    if _bert_usable():
+        try:
+            r = bert_filter.probe(text, "cf", _ctx_clean(ctx), bert_point(), _bert_ui_labels(),
+                                  bert_thresh())
+            if r.get("ok"):
+                r["engine"] = "bert"
+                return r
+        except Exception:
+            pass
+    r = ft_probe(text)
+    r["engine"] = "fasttext"
+    return r
+
+
+def bert_status():
+    if bert_filter is None:
+        return {"ok": False, "available": False, "ready": False, "err": "缺少 bert_filter 模块"}
+    st = bert_filter.status()
+    st["enabled"] = _bert_usable()
+    st["point"] = bert_point()
+    st["thresh"] = bert_thresh()
+    st["active_labels"] = _bert_ui_labels()
+    return st
+
+
+def bert_warmup():
+    """后台把 237MB 模型读进内存，避免用户点开视频后的第一批弹幕等加载。"""
+    def _run():
+        try:
+            if _bert_usable():
+                bert_filter.load()
+        except Exception:
+            pass
+    try:
+        threading.Thread(target=_run, name="bert-warmup", daemon=True).start()
+    except Exception:
+        pass
+
+
 def tmp_block_kws():
     """临时屏蔽词(聊天指令写入, 到点自动解封并清理)。"""
     raw = sget("tmp_blocks") or ""
@@ -11664,8 +12055,9 @@ def planned_feed(acts, new_session=False, exclude=None):
     order = _interleave_slots(buckets, weights)
     order = mix_sources(order)   # 最终出口再按平台权重重排, 避免槽位套餐冲淡贴吧/小黑盒比例
     order = _author_quota_hold(order)   # 同作者配额: 超出的留池, 后续构建分批放出(视觉降重)
-    order = _space_same_author(order)   # 同作者/相似标题打散: 不再相邻出现
-    order = _declump_cat(order)         # 同分类(分区/吧/话题)局部去扎堆: 不再"一堆同类挤在一起"
+    _assign_topics(order)               # 主题钉(同游戏/同系列…): 供下面两层防扎堆共用
+    order = _space_same_author(order)   # 同作者/相似标题/同主题打散: 不再相邻出现
+    order = _declump_cat(order)         # 同分类局部去扎堆(换位时不许破坏上面的间距)
     # 跨会话防重复: 新会话前5条强制避开上次会话末尾的类型
     if avoid and len(order) > 5:
         head, rest, used = [], [], set()
@@ -12570,6 +12962,25 @@ def read_json_body(handler):
     return json.loads(handler.rfile.read(n).decode("utf-8") or "{}")
 
 
+# 页面脚本 → 窗口壳的补呈现入口(app_window.bind_pages 注入)。页面在「滚动后画布
+# 停摆」时 POST /api/win/repaint；壳只做隐藏/显示 + 置顶 + 重绘, 不重载页面。
+_REPAINT_HOOK = {"fn": None}
+
+
+def set_repaint_hook(fn):
+    _REPAINT_HOOK["fn"] = fn
+
+
+def _win_repaint():
+    fn = _REPAINT_HOOK.get("fn")
+    if fn is None:
+        return {"ok": False, "error": "窗口未就绪"}
+    try:
+        return {"ok": bool(fn())}
+    except Exception as e:
+        return {"ok": False, "error": "%s: %s" % (type(e).__name__, str(e)[:80])}
+
+
 def _page_lease_shutdown_check(generation):
     global _PAGE_LEASE_GENERATION
     with _PAGE_LEASE_LOCK:
@@ -12937,7 +13348,8 @@ class Handler(BaseHTTPRequestHandler):
     # 只有这几个"不含任何凭据、只回开关键/布尔标记"的端点对 B 站源回显 ACAO,
     # 其余端点(含 ai_key 的)一律不给。
     _CORS_PATHS = ("/api/ui_settings", "/api/bili/flags", "/api/bili/dmflags",
-                   "/api/bili/dmmid", "/api/bili/names", "/api/textfilter")
+                   "/api/bili/dmmid", "/api/bili/names", "/api/textfilter",
+                   "/api/win/repaint")
 
     def _cors_headers(self):
         """对 B站源回显 ACAO。预检(OPTIONS)与实际请求(POST)必须回同一个值,
@@ -13265,12 +13677,14 @@ class Handler(BaseHTTPRequestHandler):
                     "m_cold_start_n", "cf_blk_on", "cf_min_level",
                     "m_block_mystery_bio", "m_block_lottery", "m_block_empty_space",
                     "m_dm_multicand", "m_filter_speed", "m_dm_on",
-                    "ft_on", "ft_video", "ft_dm", "ft_cf", "ft_thresh", "ft_labels")
+                    "ft_on", "ft_video", "ft_dm", "ft_cf", "ft_thresh", "ft_labels",
+                    "ft_point", "ft_bthr", "ft_engine")
             enabled = enabled_source_ids()
             blocked = [{"name": r[0], "ts": r[1]} for r in
                        db().execute("SELECT name, ts FROM ablock ORDER BY ts DESC").fetchall()]
             return self.send_json({"settings": {k: sget(k) for k in keys},
-                                   "ft": ft_status(),
+                                   "ft": ft_status(), "bert": bert_status(),
+                                   "text_engine": text_engine(),
                                    "source_groups": [{"id": g[0], "name": g[1], "on": g[0] in enabled}
                                                      for g in SOURCE_GROUPS],
                                    "blocked": blocked,
@@ -13508,7 +13922,10 @@ class Handler(BaseHTTPRequestHandler):
                               multi=max(0, min(2, _mc)))
             return self.send_json({"ok": True} | r)
         if path == "/api/textfilter/status":
-            return self.send_json({"ok": True} | ft_status())
+            st = ft_status()
+            st.update({"engine": text_engine(), "point": bert_point(),
+                       "bert": bert_status()})
+            return self.send_json({"ok": True} | st)
         if path == "/api/bili/dmmid":
             # 弹幕列表点「发送者」→ 逆推 midHash 找主页。点击场景可以等一两秒:
             # 完整逆推(2..10位) + card 接口验真; 多候选时原样回给前端让用户自己挑。
@@ -13551,6 +13968,16 @@ class Handler(BaseHTTPRequestHandler):
                                    "fields": [{"key": k, "label": lbl, "limit": lim}
                                               for k, lbl, lim in _PERSONA_FIELD],
                                    "max": _PERSONA_MAX, "items": persona_presets()})
+        if path == "/api/model/status":
+            return self.send_json(bert_status())
+        if path == "/api/model/check":
+            if bert_filter is None:
+                return self.send_json({"ok": False, "error": "缺少模型运行时"})
+            return self.send_json(bert_filter.check_update())
+        if path == "/api/model/progress":
+            if bert_filter is None:
+                return self.send_json({"ok": False, "error": "缺少模型运行时"})
+            return self.send_json(bert_filter.progress())
         self.send_error(404)
 
     def do_POST(self):
@@ -13570,32 +13997,75 @@ class Handler(BaseHTTPRequestHandler):
             ok = page_lease_alive(token) if action == "alive" else page_lease_leaving(token)
             return self.send_json({"ok": ok, "grace_seconds": PAGE_LEASE_GRACE_SECONDS})
 
+        if path == "/api/win/repaint":
+            # 页面脚本专用(只回开关键/不读设置)。无参数, 幂等; 失败也只是少一次自愈。
+            return self.send_json(_win_repaint())
+
         if path == "/api/update/download":
             return self.send_json(update_download())
 
+        if path == "/api/model/download":
+            if bert_filter is None:
+                return self.send_json({"ok": False, "error": "缺少模型运行时"})
+            return self.send_json(bert_filter.start_download())
+        if path == "/api/model/reload":
+            ok = bool(bert_filter is not None and bert_filter.reload())
+            return self.send_json({"ok": ok, "bert": bert_status()})
+
         if path == "/api/textfilter":
-            # v0.3.1.43dsk 快速文本分析: 页面脚本(弹幕/评论筛选)把本页的**文本**送过来,
-            # 问"这几条该不该拦"。纯本地 fastText 前向, 零联网、零 token。
-            # 关键路径约束: 这是弹幕/评论加载路径上的一次同步等待, 必须快 ——
-            # 纯 Python 运行时实测 5,000~9,000 条/秒(带缓存更快), 500 条 ≈ 50ms。
-            # 未开启/模型缺失 → on=False, 前端原样放行(绝不因为筛选功能坏掉而卡住页面)。
+            # 页面脚本(弹幕/评论筛选)把本页文本 + 视频上下文送过来问"该不该拦"。
+            # v0.4.16dsk: BERT 优先(带标题/UP/分区语境)，模型缺失时回落 fastText。
+            # 未开启/没有可用模型 → on=False，前端原样放行，绝不让筛选坏掉卡住页面。
             kind = (body.get("kind") or "dm")
             if kind not in ("video", "dm", "cf"):
                 kind = "dm"
-            texts = body.get("texts")
-            if not isinstance(texts, list):
-                texts = []
-            texts = [str(t)[:_FT_MAXLEN] for t in texts[:1200]]
-            if not ft_enabled():
-                return self.send_json({"ok": True, "on": False, "why": [""] * len(texts)})
-            whys = ft_scan(texts, kind)
-            return self.send_json({"ok": True, "on": True, "why": whys})
+            ctx = _ctx_clean(body.get("ctx"))
+            texts = []
+            items = None
+            raw_items = body.get("items")
+            if isinstance(raw_items, list) and raw_items and isinstance(raw_items[0], dict):
+                items = []
+                for it in raw_items[:600]:
+                    if not isinstance(it, dict):
+                        continue
+                    # 共享 ctx(标题/UP/分区)先铺底, 条目自带的 parent 再覆盖:
+                    # cfilter 的 items 只带 parent, 不能因此丢掉视频上下文。
+                    d = {"text": str(it.get("text") or "")[:200], "kind": kind}
+                    d.update(ctx)
+                    for k, v in _ctx_clean(it).items():
+                        if v:
+                            d[k] = v
+                    items.append(d)
+                    texts.append(d["text"])
+            else:
+                raw = body.get("texts")
+                if not isinstance(raw, list):
+                    raw = []
+                texts = [str(t)[:200] for t in raw[:1200]]
+            if not text_on(kind):
+                return self.send_json({"ok": True, "on": False, "engine": text_engine(),
+                                       "why": [""] * len(texts)})
+            if _bert_usable():
+                use_items = items or [dict({"text": t, "kind": kind}, **ctx) for t in texts]
+                try:
+                    return self.send_json({"ok": True, "on": True, "engine": "bert",
+                                           "why": _bert_scan(use_items, kind)})
+                except Exception:
+                    pass
+            if _ft_path():
+                try:
+                    return self.send_json({"ok": True, "on": True, "engine": "fasttext",
+                                           "why": ft_scan(texts, kind)})
+                except Exception:
+                    pass
+            return self.send_json({"ok": True, "on": False, "engine": text_engine(),
+                                   "why": [""] * len(texts)})
 
         if path == "/api/textfilter/probe":
-            # v0.3.1.43dsk 设置页「试一下」: 输入一句话, 看模型判成什么、多少概率。
-            # 同源(127.0.0.1 设置页)调用, 不需要 CORS。
+            # 设置页「试一下」: 输入一句话，看当前引擎判成什么、各标签概率多少。
             try:
-                return self.send_json({"ok": True, **ft_probe(body.get("text") or "")})
+                return self.send_json({"ok": True, **text_probe(body.get("text") or "",
+                                                               body.get("ctx") or {})})
             except Exception as e:
                 return self.send_json({"ok": False, "reason": "%s: %s" % (type(e).__name__, str(e)[:100])})
 
@@ -13754,13 +14224,15 @@ class Handler(BaseHTTPRequestHandler):
                     "m_cold_start_n", "cf_blk_on", "cf_min_level",
                       "m_block_mystery_bio", "m_block_lottery", "m_block_empty_space",
                       "m_dm_multicand", "m_filter_speed", "m_dm_on",
-                      "ft_on", "ft_video", "ft_dm", "ft_cf", "ft_thresh", "ft_labels"):
+                      "ft_on", "ft_video", "ft_dm", "ft_cf", "ft_thresh", "ft_labels",
+                      "ft_point", "ft_bthr", "ft_engine"):
                 if k in body:
                     sset(k, body[k])
             if "m_cold_start_n" in body:
                 persist_cold_cache(force=True)   # 上限改动立即重存当前池快照
-            if "ft_on" in body:
+            if "ft_on" in body or "ft_engine" in body:
                 ft_warmup()                      # 开关一动就在后台把模型读进来(或确认不需要)
+                bert_warmup()
             if "m_sources" in body:   # 允许的来源/分区 id 列表
                 sset("m_sources", json.dumps(body["m_sources"]))
                 n = purge_items_by_parts(enabled_source_ids())   # 切分区后清旧池

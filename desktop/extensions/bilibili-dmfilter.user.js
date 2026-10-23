@@ -293,8 +293,29 @@
    */
   var TXTWHY = Object.create(null);      // 弹幕文本 -> 原因标签(空串=放行)
   var TXTASKED = Object.create(null);
-  var TXT_OFF = 0, TXT_FAST = 1, TXT_WAIT = 400;
-  var TXT_N = 0, TXT_OID = "", TXT_TOTAL = 4000, TXT_PER = 700;   // 每视频配额 / 单次上限
+  var TXT_OFF = 0, TXT_FAST = 1, TXT_WAIT = Number(CF.ft_wait) || 400;
+  var TXT_N = 0, TXT_OID = "", TXT_TOTAL = 4000;
+  var TXT_PER = Number(CF.ft_batch) || 700;   // BERT 120 条/批；fastText 回退 700
+
+  /* 视频上下文: BERT 是靠「这句话在这个视频里是否阴阳/引战」判断的，
+     只送文本会把正常玩梗误杀。字段与训练时的 ctx_text 一致。 */
+  function videoCtx() {
+    var d = (window.__INITIAL_STATE__ && window.__INITIAL_STATE__.videoData) || {};
+    var t = d.title || document.title || "";
+    t = String(t).replace(/\s*[-_]?\s*哔哩哔哩.*$/, "").trim().slice(0, 60);
+    var up = (d.owner && d.owner.name) || "";
+    if (!up) {
+      var el = document.querySelector(".up-name, .up-info--name, .up-detail-top a");
+      up = el ? (el.textContent || "") : "";
+    }
+    var tags = "";
+    try {
+      var m = document.querySelector('meta[name="keywords"]');
+      tags = m ? (m.getAttribute("content") || "") : "";
+    } catch (e) {}
+    tags = String(tags).split(",").slice(0, 3).join(",").slice(0, 16);
+    return { title: t, up: String(up).replace(/\s+/g, " ").trim().slice(0, 24), tags: tags };
+  }
 
   function applyText(need, j) {
     if (!j || j.ok !== true) return;
@@ -324,7 +345,7 @@
       method: "POST", cache: "no-store", credentials: "omit",
       targetAddressSpace: "loopback",
       headers: { "Content-Type": "text/plain;charset=UTF-8" },
-      body: JSON.stringify({ kind: "dm", texts: need })
+      body: JSON.stringify({ kind: "dm", texts: need, ctx: videoCtx() })
     };
     function undo() { for (var k = 0; k < need.length; k++) delete TXTASKED[need[k]]; }
     if (!wait || !TXT_FAST) {                       // 只预热, 不等(不影响当次)

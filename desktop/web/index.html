@@ -176,7 +176,7 @@
         <button class="svItem" data-sec="data"><svg class="ic"><use href="#i-trash"/></svg>数据</button>
         <button class="svItem" data-sec="disclaimer"><svg class="ic"><use href="#i-inbox"/></svg>免责声明</button>
       </div>
-      <div class="svVer">洞鉴虚明 v0.4.14dsk</div>
+      <div class="svVer">洞鉴虚明 v0.4.19dsk</div>
     </nav>
   </aside>
 
@@ -490,18 +490,19 @@
 
         <section class="svPanel" data-sec="text">
           <h3>文本分析</h3>
-          <p class="tip">用内置的本地小模型判断「这条内容说了什么」——引战、低质、标题党、阴阳怪气。纯本地运行，不联网、不消耗 AI 额度，也不看发送者是谁。</p>
+          <p class="tip">本地语义模型判断「这条内容说了什么」——辱骂、阴阳怪气、引战、低质、标题党、明显错误、恶心人、反社会、刷屏广告；「反社会」「崇洋媚外」默认关闭。纯本地运行，不联网、不消耗 AI 额度，也不看发送者是谁。</p>
           <div class="mGroup">
-            <label class="mCheck"><input type="checkbox" id="ftOn"><span><b>快速文本分析总开关</b></span></label>
+            <label class="mCheck"><input type="checkbox" id="ftOn"><span><b>智能文本分析总开关</b></span></label>
             <p class="tip">与「弹幕屏蔽总开关」「评论筛选」完全独立：上面管「谁发的」，这里管「发了什么」，各开各的。上面关掉不影响这里，反之亦然。</p>
             <p class="tip" id="ftStatus">模型状态：读取中…</p>
+            <div class="row"><button id="ftModelCheck" class="alt">检查模型更新</button></div>
           </div>
           <div class="mGroup">
             <label class="lbl">试一下</label>
-            <div class="row"><input id="ftProbeIn" style="flex:1" maxlength="64"
+            <div class="row"><input id="ftProbeIn" style="flex:1" maxlength="200"
               placeholder="例：赢麻了，又是魂游 / 震惊！99%的人不知道">
               <button id="ftProbeBtn" class="alt">判定</button></div>
-            <p class="tip" id="ftProbeOut">模型只按「这句话说了什么」判断，跟谁发的无关。改完上面的设置后先点保存，再试。</p>
+            <p class="tip" id="ftProbeOut">模型会结合视频标题/UP/分区判断这句话。改完上面的设置后先点保存，再试。</p>
           </div>
           <div class="mGroup">
             <label class="lbl">作用范围（三个通道各自独立勾选，不勾的通道完全不受影响）</label>
@@ -515,11 +516,22 @@
             <label class="mCheck"><input type="checkbox" id="ftLabSpam"><span>低质 / 广告（垃圾营销、无信息量）</span></label>
             <label class="mCheck"><input type="checkbox" id="ftLabClickbait"><span>标题党（震惊体、悬念体、数字党）</span></label>
             <label class="mCheck"><input type="checkbox" id="ftLabYy"><span>阴阳怪气（赢麻了 / 典 / 急了 / 又是X）</span></label>
-            <label class="mCheck"><input type="checkbox" id="ftLabNeg"><span>负面情绪（纯抱怨、贩卖焦虑）</span></label>
-            <p class="tip">默认不勾「负面情绪」——正常吐槽也会被它命中，误伤偏多。</p>
+            <label class="mCheck"><input type="checkbox" id="ftLabNeg"><span>恶心人（纯抱怨、仇恨、贩卖焦虑）</span></label>
+            <label class="mCheck"><input type="checkbox" id="ftLabMisinfo"><span>明显错误（事实性错误、谣言、误导）</span></label>
+            <label class="mCheck"><input type="checkbox" id="ftLabUnpatriotic"><span>反社会（极端仇恨、反人类、危害公共安全，默认关闭）</span></label>
+            <label class="mCheck"><input type="checkbox" id="ftLabForeignWorship"><span>崇洋媚外（政治语境，默认关闭）</span></label>
+            <p class="tip">默认不勾「反社会」「崇洋媚外」。辱骂并入「引战 / 辱骂」，低质并入「低质 / 广告」。</p>
           </div>
           <div class="mGroup">
-            <label class="lbl">判定阈值（模型给出的概率超过该值才拦）</label>
+            <label class="lbl">判定灵敏度（智能模型工作点）</label>
+            <div class="segRow" id="ftPointRow">
+              <button class="seg" data-v="strict">严格</button><button class="seg" data-v="standard">标准</button>
+              <button class="seg" data-v="loose">宽松</button></div>
+            <p class="tip">严格（默认）只拦模型非常有把握的，正常内容误伤约 1%；标准更积极；宽松拦得最多，但实测正常内容误伤明显上升。</p>
+            <div class="mRow"><span class="lbl">自定义阈值</span><input id="ftBthr" type="number" min="50" max="99.99" step="0.1" class="num" placeholder="跟随档位"><span class="lbl">%（留空 = 跟随档位）</span></div>
+          </div>
+          <div class="mGroup">
+            <label class="lbl">旧模型阈值（未安装智能模型、回退 fastText 时使用）</label>
             <div class="segRow" id="ftThreshRow">
               <button class="seg" data-v="50">50 宽松</button><button class="seg" data-v="70">70 标准</button>
               <button class="seg" data-v="85">85 严格</button><button class="seg" data-v="93">93 极严</button></div>
@@ -570,7 +582,7 @@
           <h3>免责声明</h3>
           <div id="disclaimerBody" class="disc"></div>
           <button id="btnDisclaimer">我已阅读并同意</button>
-          <p class="tip" style="margin-top:14px">洞鉴虚明 v0.4.14dsk · 数据只存本机</p>
+          <p class="tip" style="margin-top:14px">洞鉴虚明 v0.4.19dsk · 数据只存本机</p>
         </section>
       </div>
     </div>

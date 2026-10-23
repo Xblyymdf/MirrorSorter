@@ -392,8 +392,32 @@
   var TXTWHY = Object.create(null);      // 评论正文 -> 原因文案(空串=放行)
   var TXTASKED = Object.create(null);
   var TXT_RPID = Object.create(null);    // 评论正文 -> [rpid_str...](同一句话可能多人发)
-  var TXT_OFF = 0, TXT_N = 0, TXT_TOTAL = 6000, TXT_PER = 900;
+  var TEXT_OF = Object.create(null);     // rpid_str -> 评论正文(查 parent 用)
+  var TXT_PARENT = Object.create(null);  // 评论正文 -> 被回复的上文
+  var TEXT_N = 0;
+  var TXT_OFF = 0, TXT_N = 0, TXT_TOTAL = 6000;
+  var TXT_PER = Number(CF.ft_batch) || 900;   // BERT 120 条/批；fastText 回退 900
   var TXT_CAP = 4000;                    // TXT_RPID 条目上限, 超了就整表重来(防长会话膨胀)
+
+  /* 视频上下文: BERT 是靠「这句话在这个视频里是否阴阳/引战」判断的，
+     只送文本会把正常玩梗误杀。字段与训练时的 ctx_text 一致。 */
+  function videoCtx() {
+    var d = (window.__INITIAL_STATE__ && window.__INITIAL_STATE__.videoData) || {};
+    var t = d.title || document.title || "";
+    t = String(t).replace(/\s*[-_]?\s*哔哩哔哩.*$/, "").trim().slice(0, 60);
+    var up = (d.owner && d.owner.name) || "";
+    if (!up) {
+      var el = document.querySelector(".up-name, .up-info--name, .up-detail-top a");
+      up = el ? (el.textContent || "") : "";
+    }
+    var tags = "";
+    try {
+      var m = document.querySelector('meta[name="keywords"]');
+      tags = m ? (m.getAttribute("content") || "") : "";
+    } catch (e) {}
+    tags = String(tags).split(",").slice(0, 3).join(",").slice(0, 16);
+    return { title: t, up: String(up).replace(/\s+/g, " ").trim().slice(0, 24), tags: tags };
+  }
 
   function msgOf(r) {
     try {
@@ -411,6 +435,15 @@
     var a = TXT_RPID[t];
     if (!a) { a = TXT_RPID[t] = []; }
     if (a.length < 40 && a.indexOf(k) < 0) a.push(k);
+    /* 上文: 楼中楼回复的 parent 指向被回复的 rpid。训练就是「标题+上文+语句」,
+       只送文本会让模型丢掉判断阴阳怪气最关键的那半句。 */
+    if (!TEXT_OF[k] && TEXT_N < 12000) { TEXT_OF[k] = t; TEXT_N++; }
+    if (!TXT_PARENT[t]) {
+      var pr = r.parent == null ? "" : String(r.parent);
+      var root = r.root == null ? "" : String(r.root);
+      var pt = (pr && pr !== "0" && TEXT_OF[pr]) || (root && root !== k && TEXT_OF[root]) || "";
+      if (pt && pt !== t) TXT_PARENT[t] = pt;
+    }
   }
   function applyText(need, j) {
     if (!j || j.ok !== true) return;
@@ -434,13 +467,17 @@
     if (TXT_N > TXT_CAP) {                         // 长会话: 整表重置, 重新开始记
       TXT_RPID = Object.create(null);
       TXTASKED = Object.create(null);
+      TEXT_OF = Object.create(null);
+      TXT_PARENT = Object.create(null);
+      TEXT_N = 0;
       TXT_N = 0;
     }
-    var need = [], t;
+    var need = [], items = [], t, i;
     for (t in TXT_RPID) {
       if (need.length >= TXT_PER) break;
       if (TXTASKED[t]) continue;
       TXTASKED[t] = 1; TXT_N++; need.push(t);
+      items.push({ text: t, parent: TXT_PARENT[t] || "" });
     }
     if (!need.length) return;
     var port = String(window.__MSX_PORT__ || "8000");
@@ -449,7 +486,7 @@
         method: "POST", cache: "no-store", credentials: "omit",
         targetAddressSpace: "loopback",
         headers: { "Content-Type": "text/plain;charset=UTF-8" },
-        body: JSON.stringify({ kind: "cf", texts: need })
+        body: JSON.stringify({ kind: "cf", texts: need, items: items, ctx: videoCtx() })
       }).then(function (r) { return r.json(); })
         .then(function (j) { applyText(need, j); })
         .catch(function () { for (var k = 0; k < need.length; k++) delete TXTASKED[need[k]]; });
@@ -597,18 +634,45 @@
    * 往下滚就停在当前页(组件 getList 只在 list 非空且未被拦截时才追加)。
    * 这里替组件盯着那个哨兵: 只要它还在视口里、组件又没在加载/没到底, 就替它翻下一页。 */
   var pumpBusy = false, pumpStall = 0, pumpLastLen = -1;
+  var pumpBegin = 0, pumpHoldAt = 0, pumpWakeAt = 0;
+  var PUMP_HOLD = 9000;   // getList 超过这么久不落地/加载态不消失 → 当卡死强拆
   function cfInst() {
     var c = cfCommentEl();
     return (c && typeof c.getList === "function") ? c : null;
   }
+  /* 用户一动滚动就复位「连续扑空」计数: 旧实现扑空 6 次后永久收手,
+     哪怕继续往下拉也不再补页 —— 这是「拉着拉着就卡死」的来源之一。 */
+  function wakePump() {
+    pumpStall = 0;
+    var now = Date.now();
+    if (now - pumpWakeAt < 350) return;
+    pumpWakeAt = now;
+    try { setTimeout(pump, 60); } catch (e) {}
+  }
   function pump() {
-    if (!hidMain || pumpBusy) return;
+    if (!hidMain) return;
+    var now = Date.now();
+    if (pumpBusy) {
+      if (now - pumpBegin < PUMP_HOLD) return;
+      pumpBusy = false;   // 组件 Promise 一直不落地 → 解锁, 下一轮重试
+      pumpStall++;
+    }
     var inst = cfInst();
     if (!inst) return;
-    if (inst.showEnd || inst.showSpinner || inst.showContinuations) return;
+    // 组件的加载态(showContinuations/showSpinner)可能因为一次失败请求永远挂住;
+    // 挂太久就替它清掉, 否则下面每一轮补泵都会被这行挡住。
+    if (inst.showSpinner || inst.showContinuations) {
+      if (!pumpHoldAt) pumpHoldAt = now;
+      if (now - pumpHoldAt < PUMP_HOLD) return;
+      try { inst.showSpinner = false; inst.showContinuations = false; } catch (e) {}
+      pumpHoldAt = 0;
+    } else {
+      pumpHoldAt = 0;
+    }
+    if (inst.showEnd) return;
     var cur = (inst.list && inst.list.length) || 0;
     if (cur !== pumpLastLen) { pumpLastLen = cur; pumpStall = 0; }   // 列表有长进 → 复位
-    if (pumpStall >= 6) return;                                      // 连续多次没长进 → 收手
+    if (pumpStall >= 6) return;                                      // 连续扑空 → 收手(滚动会复位)
     var trig = null;
     try { trig = inst.continueTrigger; } catch (e) {}
     if (!trig || trig.isConnected === false) return;
@@ -617,16 +681,27 @@
     var vh = window.innerHeight || document.documentElement.clientHeight || 0;
     if (!(rc.top < vh + 500)) return;      // 哨兵还在屏幕外 → 用户没滚到底, 不代劳
     pumpBusy = true;
+    pumpBegin = now;
     var before = cur;
     var done = function () {
-      pumpBusy = false;
-      var after = (inst.list && inst.list.length) || 0;
-      if (after > before) { pumpStall = 0; try { hint(); } catch (e) {} }
-      else pumpStall++;
+      // getList 可能同步返回、评论却稍后才追加; 等一拍再数, 避免把成功当扑空。
+      setTimeout(function () {
+        pumpBusy = false;
+        var after = (inst.list && inst.list.length) || 0;
+        if (after > before) { pumpStall = 0; try { hint(); } catch (e) {} }
+        else pumpStall++;
+      }, 320);
     };
     try { Promise.resolve(inst.getList()).then(done, done); }
     catch (e) { pumpBusy = false; }
   }
+  /* 捕获阶段监听滚动: 组件自己 stopPropagation 也不影响收到。 */
+  try {
+    window.addEventListener("scroll", function () {
+      if (!hidMain) return;
+      try { wakePump(); } catch (e) {}
+    }, { passive: true, capture: true });
+  } catch (e) {}
 
   /* 评论区最上方那一行: 「评论筛选：已屏蔽 N 条评论」+ 显示/隐藏开关 */
   function barHost() {
@@ -695,6 +770,7 @@
       TXT_N = 0;
       hidMain = 0; hid = 0;
       BLK_HOSTS = []; pumpStall = 0; pumpLastLen = -1;
+      pumpBusy = false; pumpBegin = 0; pumpHoldAt = 0; pumpWakeAt = 0;
     } catch (e) {}
   }
 

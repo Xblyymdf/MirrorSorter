@@ -870,6 +870,7 @@ def _build_inject_script(port):
             _cf_dmhash = app.dm_blocked_hashes() if _dm_on else []
         except Exception:
             _cf_dmhash = []
+        _text_engine = app.text_engine()
         cf_js = json.dumps({
             "dm_on": _dm_on,
             "blk_on": app.sget("cf_blk_on") != "0",
@@ -884,6 +885,11 @@ def _build_inject_script(port):
             "ft_on": app.sget("ft_on") == "1",
             "ft_dm": app.sget("ft_on") == "1" and app.sget("ft_dm") == "1",
             "ft_cf": app.sget("ft_on") == "1" and app.sget("ft_cf") == "1",
+            # v0.4.15dsk: BERT 单条约 13ms，页面需要收小批量并放宽首屏等待；
+            # fastText 回退保持原来的 700 条/400ms，行为不变。
+            "ft_engine": _text_engine,
+            "ft_batch": 120 if _text_engine == "bert" else 700,
+            "ft_wait": 1500 if _text_engine == "bert" else 400,
         }, ensure_ascii=True)
     except Exception:
         import traceback
@@ -898,6 +904,11 @@ def _build_inject_script(port):
     dmfilter = "" if os.environ.get("MSX_NO_INJECT") else _read_ext_file("bilibili-dmfilter.user.js")
     if dmfilter:
         parts.append('try {\n' + dmfilter + '\n} catch (e) { console.warn("[msx] dmfilter", e); }')
+    # 滚动停摆自愈(v0.4.18dsk): 播放页 rAF 停跳 → 页面脚本 POST /api/win/repaint,
+    # 壳做一次轻量"补呈现"(隐藏→显示 + 置顶 + 强制重绘), 不重载页面、不丢评论。
+    repaint = "" if os.environ.get("MSX_NO_INJECT") else _read_ext_file("bilibili-repaint.user.js")
+    if repaint:
+        parts.append('try {\n' + repaint + '\n} catch (e) { console.warn("[msx] repaint", e); }')
     # 播放页自有UI(评论区/右侧推荐替换为自建面板): 开关 ui_ownui(默认开), 环境变量
     # MSX_NO_OWNUI=1 可整体停用。脚本自身按 hostname+路径门控, 只在 /video/ 激活;
     # 播放器 DOM 一律不碰 —— 超分管线红线。
@@ -1774,6 +1785,21 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
             if c is None:
                 return False
             _represent(_ui, _Pool.ctrls, c, key, why or "represent")
+            return True
+
+        def rescue(self, key, why="scroll"):
+            """页面脚本报「滚动后画布停摆」时的补呈现入口(任意线程可调)。
+
+            只做一次隐藏→显示 + 置顶 + 强制重绘, **不校验 GDI**(停摆的是更新, 不是画面
+            有没有内容, 抓屏判不出来), 也不重载页面。页面侧如果还停着, 6 秒后会再问,
+            最多 3 次 —— 这样第一次就修好时不会再闪。全屏时退化为 gentle(不碰 Visible),
+            否则会把浏览器踢出全屏。
+            """
+            c = _Pool.ctrls.get(key)
+            if c is None:
+                return False
+            _represent(_ui, _Pool.ctrls, c, key, why or "scroll", taps=(0.0,),
+                       verify=False, gentle=bool(_Pool.fs.get("on")))
             return True
 
         def dispose(self, key):

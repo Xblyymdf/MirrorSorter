@@ -692,6 +692,11 @@ class ShellApi:
     def bind_pages(self, pages):
         """注入 WebView2 控件池(shell_pages.create_pool)并显示首页标签。"""
         self._pages = pages
+        try:
+            # 页面 rAF 停摆(评论区下拉卡死) → /api/win/repaint → 当前标签补呈现一次。
+            app.set_repaint_hook(lambda: pages.rescue(self._active_id(), "page-stall"))
+        except Exception:
+            pass
         self._activate(self._tabs[0])
         self._render()
 

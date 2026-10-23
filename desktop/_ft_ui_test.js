@@ -306,7 +306,7 @@ async function testDanmaku() {
     ok("字节流原样返回", out.length === seg.length, seg.length + " -> " + out.length);
   }
 
-  console.log("[7] 弹幕筛选 / 总开关 dm_on=false → 不请求且原样放行");
+  console.log("[7] 弹幕筛选 / 总开关 dm_on=false + 文本通道开 → 文本仍生效(v0.3.1.46 语义)");
   {
     const env = makeEnv(DM_SRC, "/video/BV1xx",
       { dm_on: false, blk_on: false, blk: [], lvl: 0, dmhash: [], ft_dm: true });
@@ -315,8 +315,8 @@ async function testDanmaku() {
     env.__FIX["https://api.bilibili.com/x/v2/dm/web/seg.so?type=1&oid=1&segment_index=1"] = seg;
     const res = await env.window.fetch("https://api.bilibili.com/x/v2/dm/web/seg.so?type=1&oid=1&segment_index=1");
     const out = new Uint8Array(await res.arrayBuffer());
-    ok("总开关关掉时不请求", env.__TXT_CALLS.length === 0, env.__TXT_CALLS.length);
-    ok("字节流原样返回", out.length === seg.length);
+    ok("总开关关掉但文本通道开 → 仍发文本请求", env.__TXT_CALLS.length === 1, env.__TXT_CALLS.length);
+    ok("被文本判定命中的弹幕已摘除", out.length < seg.length, out.length + " vs " + seg.length);
   }
 }
 

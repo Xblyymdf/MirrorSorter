@@ -129,30 +129,59 @@
     updBusy = true;
     const btn = $("#btnCheckUpdate");
     if (btn) btn.disabled = true;
-    openModal("检测更新", "<p>正在向 GitHub 查询最新版本…</p>", []);
+    openModal("检测更新", "<p>正在检查程序与模型更新…</p>", []);
+    let exe = null, mdl = null;
+    const errs = [];
     try {
       const d = await api("/api/update/check");
-      if (!d || d.ok === false) throw new Error((d && d.error) || "检查更新失败");
-      if (!d.has_update) {
-        openModal("检测更新", "<p>当前已是最新版本 <b>v" + esc(d.current) + "</b>。</p>",
+      if (d && d.ok !== false) exe = d;
+      else if (d && d.error) errs.push("程序：" + d.error);
+    } catch (e) { errs.push("程序：" + String((e && e.message) || e)); }
+    try {
+      const m = await api("/api/model/check");
+      if (m && m.ok !== false) mdl = m;
+      else if (m && m.error) errs.push("模型：" + m.error);
+    } catch (e) { errs.push("模型：" + String((e && e.message) || e)); }
+    updBusy = false;
+    if (btn) btn.disabled = false;
+    const hasExe = !!(exe && exe.has_update);
+    const hasMdl = !!(mdl && mdl.has_update);
+    if (!hasExe && !hasMdl) {
+      if (!exe && !mdl) {
+        openModal("检测更新", "<p>检查更新失败。</p>" +
+          (errs.length ? '<p class="tip">' + esc(errs.join("；")) + "</p>" : ""),
           [{ t: "知道了", fn: closeModal }]);
         return;
       }
-      const notes = String(d.notes || "").trim();
-      openModal("发现新版本 v" + esc(d.latest),
-        "<p>当前版本 <b>v" + esc(d.current) + "</b> → 新版本 <b>v" + esc(d.latest) + "</b>" +
-        (d.size ? "（" + esc(updSize(d.size)) + "）" : "") + "</p>" +
-        (notes ? '<div class="updNotes">' + esc(notes) + "</div>" : "") +
-        '<p class="tip">更新会先下载安装包，校验完成后自动关闭本程序、替换并重新启动。' +
-        "你的设置与数据都保留在本机。</p>",
-        [{ t: "稍后", fn: closeModal }, { t: "立即更新", fn: () => updDownload(d) }]);
-    } catch (e) {
-      openModal("检测更新", "<p>" + esc(String((e && e.message) || e)) + "</p>",
+      const parts = [];
+      if (exe) parts.push("程序 v" + (exe.current || "—"));
+      if (mdl) parts.push("模型 " + (mdl.current || "未安装") +
+        (mdl.message ? "（" + mdl.message + "）" : ""));
+      openModal("检测更新", "<p>" + esc(parts.join("、")) + "，均为最新。</p>" +
+        (errs.length ? '<p class="tip">' + esc(errs.join("；")) + "</p>" : ""),
         [{ t: "知道了", fn: closeModal }]);
-    } finally {
-      updBusy = false;
-      if (btn) btn.disabled = false;
+      return;
     }
+    let body = "";
+    if (hasExe) {
+      const notes = String(exe.notes || "").trim();
+      body += "<p>程序：v" + esc(exe.current) + " → <b>v" + esc(exe.latest) + "</b>" +
+        (exe.size ? "（" + esc(updSize(exe.size)) + "）" : "") + "</p>" +
+        (notes ? '<div class="updNotes">' + esc(notes) + "</div>" : "");
+    }
+    if (hasMdl) {
+      const notes = String(mdl.notes || "").trim();
+      body += "<p>模型：" + esc(mdl.current || "未安装") + " → <b>" + esc(mdl.latest) + "</b>" +
+        (mdl.size ? "（" + esc(updSize(mdl.size)) + "）" : "") + "</p>" +
+        (notes ? '<div class="updNotes">' + esc(notes) + "</div>" : "");
+    }
+    body += '<p class="tip">程序更新会下载 exe，校验后自动重启；模型更新只替换模型文件，设置与数据都保留。</p>';
+    if (errs.length) body += '<p class="tip">' + esc(errs.join("；")) + "</p>";
+    const btns = [{ t: "稍后", fn: closeModal }];
+    if (hasExe) btns.push({ t: "更新程序", fn: () => updDownload(exe) });
+    if (hasMdl) btns.push({ t: "更新模型", fn: () => mdlDownload(mdl) });
+    if (hasExe && hasMdl) btns.push({ t: "都更新", fn: () => updBoth(exe, mdl) });
+    openModal("发现更新", body, btns);
   }
 
   async function updDownload(d) {
@@ -211,6 +240,68 @@
         fail(String(e));
       }
     }, 500);
+  }
+
+  function mdlDownload(d, silent) {
+    if (updBusy) return Promise.resolve(false);
+    return new Promise((resolve) => {
+      updBusy = true;
+      updStopPoll();
+      openModal("更新模型 " + esc(d.latest || ""),
+        "<p>正在下载模型文件" + (d.size ? "（约 " + esc(updSize(d.size)) + "）" : "") + "…</p>" +
+        '<div class="updBar"><i id="updBarFill"></i></div>' +
+        '<div class="updMeta"><span id="updPct">0%</span><span id="updBytes"></span></div>' +
+        '<p class="tip">下载完成后会校验 SHA256 并原子替换；期间请保持程序打开。</p>',
+        [], { locked: true });
+      const paint = (st) => {
+        const total = Number(st.total) || 0, got = Number(st.received) || 0;
+        const pct = total ? Math.min(100, Math.round(got * 100 / total)) : 0;
+        const fill = $("#updBarFill"), p = $("#updPct"), b = $("#updBytes");
+        if (fill) fill.style.width = pct + "%";
+        if (p) p.textContent = total ? pct + "%" : "下载中";
+        if (b) b.textContent = updSize(got) + (total ? " / " + updSize(total) : "") +
+          (st.file ? " · " + st.file : "");
+      };
+      let settled = false;
+      const done = (ok, msg) => {
+        if (settled) return;
+        settled = true;
+        updStopPoll();
+        updBusy = false;
+        resolve(!!ok);
+        if (silent) return;
+        if (ok) {
+          openModal("模型已更新", "<p>模型 <b>" + esc(d.latest || "") + "</b> 已安装并加载。</p>" +
+            '<p class="tip">已经打开的B站页面要刷新一次，新的批量和上下文参数才会生效。</p>',
+            [{ t: "知道了", fn: closeModal }]);
+          try { loadMachine(); } catch (e) {}
+        } else {
+          openModal("模型更新失败", "<p>" + esc(String(msg || "下载失败")) + "</p>",
+            [{ t: "关闭", fn: closeModal }]);
+        }
+      };
+      (async () => {
+        try {
+          const r = await api("/api/model/download", { method: "POST", body: "{}" });
+          if (!r || r.ok === false) throw new Error((r && r.error) || "开始下载失败");
+        } catch (e) { done(false, (e && e.message) || e); return; }
+        updTimer = setInterval(async () => {
+          let st;
+          try { st = await api("/api/model/progress"); } catch (e) { return; }
+          if (!st || st.ok === false) return;
+          paint(st);
+          if (st.phase === "error") { done(false, st.error || "下载失败"); return; }
+          if (st.phase !== "ready") return;
+          try { await api("/api/model/reload", { method: "POST", body: "{}" }); } catch (e) {}
+          done(true);
+        }, 500);
+      })();
+    });
+  }
+  async function updBoth(exe, mdl) {
+    const ok = await mdlDownload(mdl, true);
+    if (!ok) return;
+    updDownload(exe);
   }
 
   function updWireShell() {
@@ -1545,6 +1636,7 @@
   segSelect("#cfMultiRow");
   segSelect("#cfSpeedRow");
   segSelect("#ftThreshRow");
+  segSelect("#ftPointRow");
   function segBind(sel, key, label) {
     const box = $(sel);
     if (!box) return;
@@ -1939,7 +2031,7 @@
       segPick("#cfLvlRow", st.cf_min_level || "2");
       segPick("#cfMultiRow", st.m_dm_multicand || "1");
       segPick("#cfSpeedRow", st.m_filter_speed || "2");
-      ftLoadPanel(st, d.ft);
+      ftLoadPanel(st, d.ft, d.bert);
       setC("#mFollowEmph", st.bili_follow_emph !== "0");
       const fm = $("#mFollowMonths");
       if (fm) { fm.value = st.bili_follow_months || "1"; $("#mFollowMonthsVal").textContent = fm.value; }
@@ -2088,16 +2180,25 @@
 
   /* ================= 快速文本分析（本地 fastText：管「说了什么」，与身份类规则独立）================= */
   const FT_LABELS = [["ftLabFlame", "flame"], ["ftLabSpam", "spam"], ["ftLabClickbait", "clickbait"],
-                     ["ftLabYy", "yy"], ["ftLabNeg", "neg"]];
-  function ftStatusText(f) {
+                     ["ftLabYy", "yy"], ["ftLabNeg", "neg"], ["ftLabMisinfo", "misinfo"],
+                     ["ftLabUnpatriotic", "antisocial"], ["ftLabForeignWorship", "foreign_worship"]];
+  function ftStatusText(f, b) {
     if (!f) return "模型状态：读取中…";
-    if (f.has_module === false) return "模型状态：本机缺少运行时（desktop/model/ 下应有 ftrt.py）";
+    if (b && b.available) {
+      const ver = b.version ? " v" + b.version : "";
+      const size = (b.size_mb || 0) + " MB";
+      if (b.ready) return "模型状态：智能模型" + ver + " 已加载 · " + size +
+        (b.infer_ms ? " · 最近一批 " + b.infer_ms + " ms" : "");
+      if (!b.enabled) return "模型状态：智能模型" + ver + " 已安装（" + size + "），开启总开关后加载";
+      return "模型状态：智能模型" + ver + " 加载中…" + (b.err ? "；" + b.err : "");
+    }
+    if (b && b.err) return "模型状态：智能模型不可用（" + b.err + "）";
+    if (f.has_module === false) return "模型状态：本机缺少运行时";
     if (!f.ready && f.on) return "模型状态：加载中…（首次要几秒）" + (f.err ? "；" + f.err : "");
-    if (!f.ready) return "模型状态：待机（" + (f.size_mb || 0) + " MB，开启后加载）";
-    return "模型状态：已加载 " + (f.size_mb || 0) + " MB · 标签 " + (f.labels || []).length +
-      " 个 · 缓存 " + (f.cache || 0) + " 条";
+    if (!f.ready) return "模型状态：未安装智能模型（fastText " + (f.size_mb || 0) + " MB 回退待机）";
+    return "模型状态：fastText 回退已加载 " + (f.size_mb || 0) + " MB";
   }
-  function ftLoadPanel(st, f) {
+  function ftLoadPanel(st, f, b) {
     if (st) {
       const sc = (id, v) => { const e = $(id); if (e) e.checked = !!v; };
       sc("#ftOn", st.ft_on === "1");
@@ -2105,14 +2206,22 @@
       sc("#ftDm", st.ft_dm !== "0");
       sc("#ftCf", st.ft_cf !== "0");
       const have = String(st.ft_labels || "").split(",").map((x) => x.trim()).filter(Boolean);
+      // 旧版「不爱国」的键是 unpatriotic, 现在这个槽位就是反社会 → 迁移显示
+      if (have.indexOf("unpatriotic") >= 0 && have.indexOf("antisocial") < 0) have.push("antisocial");
       FT_LABELS.forEach(([id, key]) => sc("#" + id, have.indexOf(key) >= 0));
       segPick("#ftThreshRow", st.ft_thresh || "70");
+      segPick("#ftPointRow", st.ft_point || "strict");
+      const bt = $("#ftBthr");
+      if (bt) bt.value = st.ft_bthr || "";
     }
     const el = $("#ftStatus");
-    if (el) el.textContent = ftStatusText(f);
+    if (el) el.textContent = ftStatusText(f, b);
   }
   async function ftRefreshStatus() {
-    try { ftLoadPanel(null, await api("/api/textfilter/status")); } catch (e) {}
+    try {
+      const s = await api("/api/textfilter/status");
+      ftLoadPanel(null, s, s && s.bert);
+    } catch (e) {}
   }
   $("#ftOn").onclick = async () => {
     const on = $("#ftOn").checked;
@@ -2125,12 +2234,19 @@
   $("#ftSave").onclick = async () => {
     const labs = FT_LABELS.filter(([id]) => $("#" + id).checked).map((x) => x[1]);
     const pick = $("#ftThreshRow .seg.on");
+    const pt = $("#ftPointRow .seg.on");
+    const bt = ($("#ftBthr").value || "").trim();
+    if (bt !== "" && !(Number(bt) >= 50 && Number(bt) <= 99.99)) {
+      toast("自定义阈值请填 50 ~ 99.99（留空 = 跟随档位）", true); return;
+    }
     const r = await save("/api/machine", {
       ft_video: $("#ftVideo").checked ? "1" : "0",
       ft_dm: $("#ftDm").checked ? "1" : "0",
       ft_cf: $("#ftCf").checked ? "1" : "0",
       ft_labels: labs.join(","),
       ft_thresh: (pick && pick.dataset.v) || "70",
+      ft_point: (pt && pt.dataset.v) || "strict",
+      ft_bthr: bt,
     }, "保存文本分析设置");
     if (r) { loadMachine(); restartFeed(); }
   };
@@ -2143,14 +2259,40 @@
     try { r = await api("/api/textfilter/probe", { method: "POST", body: JSON.stringify({ text: t }) }); }
     catch (e) { out.textContent = "判定失败：" + e; return; }
     if (!r || !r.ok) { out.textContent = "没判出来：" + ((r && r.reason) || "未知原因"); return; }
+    const pct = (v) => (Number(v || 0) * 100).toFixed(1) + "%";
     const verdict = r.hit ? " → 会拦"
-      : (r.picked ? " → 不拦（低于阈值 " + Math.round((r.thresh || 0) * 100) + "%）" : " → 不拦（该标签没勾）");
-    const top = (r.top || []).slice(0, 3).map((x) => x.name + " " + Math.round(x.score * 100) + "%").join(" · ");
-    out.textContent = "判成「" + (r.name || r.label) + "」" + Math.round((r.score || 0) * 100) + "%" + verdict +
+      : (r.picked ? " → 不拦（低于阈值 " + pct(r.thresh) + "）" : " → 不拦（该标签没勾）");
+    const top = (r.top || []).slice(0, 3).map((x) => x.name + " " + pct(x.score)).join(" · ");
+    out.textContent = "判成「" + (r.name || r.label) + "」" + pct(r.score) + verdict +
       "；前三：" + top;
   }
   $("#ftProbeBtn").onclick = ftProbe;
   $("#ftProbeIn").addEventListener("keydown", (e) => { if (e.key === "Enter") ftProbe(); });
+  async function ftModelCheck() {
+    openModal("模型更新", "<p>正在查询模型发布…</p>", []);
+    let d;
+    try { d = await api("/api/model/check"); }
+    catch (e) { openModal("模型更新", "<p>检查失败：" + esc(String(e)) + "</p>", [{ t: "知道了", fn: closeModal }]); return; }
+    if (!d || d.ok === false) {
+      openModal("模型更新", "<p>" + esc((d && (d.error || d.message)) || "检查失败") + "</p>",
+        [{ t: "知道了", fn: closeModal }]);
+      return;
+    }
+    if (!d.has_update) {
+      openModal("模型更新",
+        d.message ? "<p>" + esc(d.message) + "。</p>"
+          : "<p>当前模型 <b>" + esc(d.current || "未安装") + "</b> 已是最新。</p>",
+        [{ t: "知道了", fn: closeModal }]);
+      return;
+    }
+    openModal("发现模型更新",
+      "<p>" + esc(d.current || "未安装") + " → <b>" + esc(d.latest) + "</b>" +
+      (d.size ? "（" + esc(updSize(d.size)) + "）" : "") + "</p>" +
+      (d.notes ? '<div class="updNotes">' + esc(d.notes) + "</div>" : "") +
+      '<p class="tip">只替换模型文件，设置与数据都保留。下载完成后自动加载。</p>',
+      [{ t: "稍后", fn: closeModal }, { t: "下载并安装", fn: () => mdlDownload(d) }]);
+  }
+  $("#ftModelCheck").onclick = ftModelCheck;
 
   /* 黑白名单 */
   async function loadBlacklist() {
@@ -2243,7 +2385,8 @@
                   "tb_bars", "xhh_comm", "xhh_topic", "m_play_related", "m_cold_start_n"]],
     ["评论 / 弹幕筛选", ["cf_blk_on", "cf_min_level", "m_block_mystery_bio", "m_block_lottery",
                          "m_block_empty_space", "m_dm_on", "m_dm_multicand", "m_filter_speed"]],
-    ["快速文本分析", ["ft_on", "ft_video", "ft_dm", "ft_cf", "ft_thresh", "ft_labels"]],
+    ["快速文本分析", ["ft_on", "ft_video", "ft_dm", "ft_cf", "ft_thresh", "ft_labels",
+                       "ft_point", "ft_bthr"]],
     ["平台权重", ["bili_weight", "tb_weight", "xhh_weight"]],
     ["B站关注强调", ["bili_follow_emph", "bili_follow_months"]],
     ["偏好备注", ["prefs_note", "dislike_note"]],

@@ -2642,7 +2642,8 @@ try:
     # 补池必须只有一个入口(单飞 + 忙时合并), 否则刷新按钮/滚动补池/见底补池/预热各起一个构建,
     # 同时往贴吧发好几串请求; 而旧实现"令牌变了就不清 building"会把标志永久钉死。
     check("抓取:补池走单飞且忙时合并",
-          "def kick_build(" in _src and "_BUILD_PENDING = True" in _src
+          "def kick_build(" in _src and "_BUILD_PENDING = None" in _src
+          and '_BUILD_PENDING = "quick"' in _src
           and '_claimed": True' in _src
           and _src.count("threading.Thread(target=build_universe") == 1
           and "if token == _uni_token:   # 仍是最新设置版本才允许清标志" not in _src)

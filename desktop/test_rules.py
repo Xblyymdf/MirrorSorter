@@ -251,8 +251,8 @@ app.sset("prefs_note", "后朋克音乐, 器乐摇滚, 氛围电子")
 app._pref_bag = []
 app._pref_page_hist = []
 terms_full = app._pref_search_terms("", False)
-check("偏好供给: 完整构建搜2词",
-      len(terms_full) == 2 and all(k in ("后朋克音乐", "器乐摇滚", "氛围电子") for k, _ in terms_full),
+check("偏好供给: 完整构建搜3词",
+      len(terms_full) == 3 and all(k in ("后朋克音乐", "器乐摇滚", "氛围电子") for k, _ in terms_full),
       str(terms_full))
 check("偏好供给: 页码在翻页深度内",
       all(1 <= p <= app._PREF_PAGE_MAX for _, p in terms_full), str(terms_full))
