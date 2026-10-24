@@ -16,6 +16,7 @@
 import hashlib
 import json
 import os
+import queue
 import re
 import shutil
 import sys
@@ -572,6 +573,49 @@ def _http_json(url, timeout=15):
         return json.loads(r.read().decode("utf-8", "replace"))
 
 
+def _http_bytes(url, timeout=15):
+    req = urllib.request.Request(url, headers={"User-Agent": _UA})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def _fetch_manifest(url, sha="", timeout=8):
+    """并发请求镜像与官方地址取清单, 先到先得。
+
+    国内直连 release assets(对象存储域)常整段超时, 而 GitHub API 本身是通的 ——
+    exe 下载早就走镜像, 清单却一直是裸直连。只有 API 给出 sha256 时才允许镜像,
+    拿到字节必须与官方摘要一致, 否则丢弃; 没摘要就只走官方。"""
+    sha = str(sha or "").lower()
+    srcs = ([m + url for m in _MIRRORS] if sha else []) + [url]
+    q = queue.Queue()
+
+    def work(src):
+        try:
+            raw = _http_bytes(src, timeout=timeout)
+            if sha and hashlib.sha256(raw).hexdigest().lower() != sha:
+                raise ValueError("清单 sha256 校验失败")
+            q.put((raw, None))
+        except Exception as e:
+            q.put((None, e))
+
+    for src in srcs:
+        threading.Thread(target=work, args=(src,), daemon=True).start()
+    last = None
+    deadline = time.time() + timeout + 2
+    for _ in srcs:
+        remain = deadline - time.time()
+        if remain <= 0:
+            break
+        try:
+            raw, err = q.get(timeout=remain)
+        except queue.Empty:
+            break
+        if err is None:
+            return json.loads(raw.decode("utf-8", "replace"))
+        last = err
+    raise last or RuntimeError("清单请求超时")
+
+
 def _safe_name(n):
     n = os.path.basename(str(n or ""))
     return n if n in _ALLOWED_FILES else ""
@@ -606,8 +650,10 @@ def check_update():
         return {"ok": True, "current": cur, "latest": cur, "has_update": False,
                 "error": "", "message": "模型仓库暂无发布。"}
     rel, asset = cand
+    _dig = str(asset.get("digest") or "")
+    _sha = _dig[7:] if _dig.lower().startswith("sha256:") else ""
     try:
-        mf = _http_json(str(asset.get("browser_download_url")), timeout=20)
+        mf = _fetch_manifest(str(asset.get("browser_download_url")), _sha)
     except Exception as e:
         return {"ok": False, "current": cur, "error": "读取模型清单失败：%s" % str(e)[:140]}
     if not isinstance(mf, dict) or str(mf.get("name") or "") != MODEL_NAME:
@@ -635,7 +681,7 @@ def check_update():
     if not all(any(f["name"] == x for f in files) for x in _REQUIRED):
         return {"ok": False, "current": cur, "error": "模型清单缺少必需文件。"}
     info = {"ok": True, "current": cur, "latest": latest,
-            "has_update": bool(latest and _ver_newer(latest, cur)),
+            "has_update": bool(latest and (not cur or _ver_newer(latest, cur))),
             "size": total, "files": files, "manifest": mf,
             "notes": str(mf.get("notes") or rel.get("body") or "")[:3000],
             "page": str(rel.get("html_url") or ""), "name": MODEL_NAME}

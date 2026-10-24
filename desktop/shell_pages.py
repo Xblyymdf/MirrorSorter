@@ -502,18 +502,31 @@ _REP_LOCK = threading.Lock()
 
 
 def _fs_soft():
-    """全屏补呈现用哪种手段: 默认**硬补**, MSX_FS_SOFT=1 退化轻补。
+    """全屏补呈现用哪种手段: 默认**轻补**; MSX_FS_HARD=1 才用旧的硬补。
 
-    为什么默认硬补: 网页一进 HTML 全屏, WebView2 的合成层就会被打断(画面整块停住,
-    而且是 #0f1115 那种"什么都没画"的停法) —— 只 Invalidate/置顶**不会**让它重新挂上,
-    必须一次"隐藏→显示"才会重新出图(m02002 的实测结论)。
-    为什么硬补是安全的: 实验台 `_fs_lab.py` 实测这一次 toggle **不会**把浏览器踢出全屏
-    (toggle 之后 ContainsFullScreenElement 仍为 true)。真正把人搞死的是以前那套
-    "补 8 次 + 摘挂父容器(reparent) + GDI 校验", 不是这一次 toggle。
-    个别机器若 toggle 会退出全屏(看日志 `fs tap done ... fs=False`), 设 MSX_FS_SOFT=1
-    退化成"只置顶+重绘"。
+    为什么默认改成轻补(证据来自用户真机 shell_debug.log, 不是推测):
+      同一分钟连续 6 次进全屏, 其中 4 次在 0.0s/0.6s 两拍"隐藏→显示"之后 1 秒内出现
+      `fullscreen=False` —— 隐藏 WebView2 控件会把浏览器踢出 HTML 全屏, 紧接着画面
+      停在上一次呈现(音频走另一条进程, 照常出声)。用户报的"全屏后画布卡住/弹回"
+      就是这个。实验台(`_fs_lab.py`)当初只测到 toggle 不会退全屏, 没覆盖这条路径。
+
+    "隐藏→显示"确实能在 m02002 那类老 GPU/混合显卡上重挂合成层, 所以保留为逃生口:
+    画面真黑时设 MSX_FS_HARD=1 换回旧行为, 不必发版。
     """
-    return os.environ.get("MSX_FS_SOFT", "0") == "1"
+    return os.environ.get("MSX_FS_HARD", "0") != "1"
+
+
+def _fs_taps():
+    """全屏进入后的补呈现节拍: (秒, 是否轻补)。
+
+    轻补(默认)两拍都不碰 Visible, 被顶掉全屏的风险为零:
+      0.35s 赶在宿主窗体最大化之后、1.2s 赶在标签栏/导航栏收起之后 —— 这两次布局
+      落定才是"合成层没跟上"的源头, 把绘制请求压在它们之后即可。
+    硬补(MSX_FS_HARD=1)沿用 v0.4.21 的三拍: 0/0.6s 硬补 + 1.6s 轻补兜底。
+    """
+    if os.environ.get("MSX_FS_HARD", "0") == "1":
+        return ((0.0, False), (0.6, False), (1.6, True))
+    return ((0.35, True), (1.2, True))
 
 
 def _rep_level(i):
@@ -623,10 +636,10 @@ def _rep_tap(ui, ctrls, cc, key, hwnd_box, level, gentle=False):
       1 隐藏→显示→置顶(与旧实现一致)
       2 加一次强制重绘(Invalidate+Update)
 
-    gentle=True: **绝不碰 Visible**, 只置顶 + 重绘。视频全屏期间必须用它 ——
-    对正在全屏的 WebView2 做一次 隐藏→显示, 浏览器会认为全屏元素已被移除而**退出全屏**,
-    于是 ContainsFullScreenElementChanged 再触发一次"进入", 窗口跟着反复最大化/还原,
-    画面永远出不来(用户报修: 点全屏就卡死、画布没视频, 就是这么来的)。
+    gentle=True: **绝不碰 Visible**, 只置顶 + 重绘。全屏时的兜底拍用它。
+    全屏首拍仍走硬补: `_fs_soft` 的实验台实测一次"隐藏→显示"不会退出全屏, 而且是重挂
+    合成层的唯一手段; 但个别机器会退出, 所以全屏路径带 fs_guard —— 一旦发现 fs=False
+    立刻收工, 不会像旧版那样一路 toggle, 把"卡一下"放大成"卡死"。
     """
     def _do():
         try:
@@ -662,13 +675,20 @@ def _rep_tap(ui, ctrls, cc, key, hwnd_box, level, gentle=False):
                     cc.Update()
                 except Exception:
                     pass
+                # DwmFlush: 让 DWM 立刻把这一帧合完。轻补不能切 Visible, 只能靠
+                # "重绘 + 刷新合成"把停住的画面推一下; 失败无所谓(纯兜底)。
+                try:
+                    import ctypes as _ct
+                    _ct.windll.dwmapi.DwmFlush()
+                except Exception:
+                    pass
         except Exception:
             pass
     ui(_do)
 
 
 def _represent(ui, ctrls, cc, key=None, why="", taps=None, settle=None,
-               gentle=False, verify=None):
+               gentle=False, verify=None, fs_guard=False):
     """补呈现看门狗(模块级, 便于离线测试)。
 
     到点补呈现 → 校验是否真出图 → 出图即收工; 还黑就继续补并加重手段, 直到 deadline。
@@ -678,9 +698,15 @@ def _represent(ui, ctrls, cc, key=None, why="", taps=None, settle=None,
     gentle=True: 只"置顶+重绘", 不切 Visible(全屏那条路默认是**硬补**, gentle 只是
     MSX_FS_SOFT=1 时的退化形态)。
 
+    taps 的元素可以是秒数, 也可以是 (秒数, gentle) —— 逐拍指定手段。全屏那条路要
+    "第一拍立刻硬补、后面兜底不碰 Visible", 靠的就是它。
+
     verify=False: 不做 GDI 抓屏校验。**视频全屏必须关掉校验** —— 视频层是 DComp 独立
     平面, GDI 抓到的是平色, 校验必然误判"没出图", 于是一直补到 deadline(8 秒), 期间
     反复打扰合成器, 用户体感就是卡死。None = 自动(gentle/legacy 时不校验)。
+
+    fs_guard=True: 每次补完复核浏览器是否还在全屏; 被踢出来就立刻收工。
+    以前只在 gentle 时查, 硬补把全屏顶掉了还会继续补 —— 越补越糟。
     """
     try:
         legacy = os.environ.get("MSX_NO_REPRESENT") == "1"
@@ -700,16 +726,20 @@ def _represent(ui, ctrls, cc, key=None, why="", taps=None, settle=None,
         def worker():
             t0 = time.time()
             n = 0
-            for i, at in enumerate(sched):
+            for i, item in enumerate(sched):
+                if isinstance(item, (tuple, list)):
+                    at, g = float(item[0]), bool(item[1])
+                else:
+                    at, g = float(item), gentle
                 if ev.wait(max(0.0, at - (time.time() - t0))):
                     return                       # 被取消(控件已换/已隐藏)
                 if time.time() - t0 > _REP_DEADLINE:
                     break
                 n += 1
-                _rep_tap(ui, ctrls, cc, key, hb, _rep_level(i), gentle)
+                _rep_tap(ui, ctrls, cc, key, hb, _rep_level(i), g)
                 if ev.wait(wait):
                     return
-                if gentle and hb.get("fs") is False:
+                if fs_guard and hb.get("fs") is False:
                     _dbg_log("represent STOP why=%s (补呈现把浏览器踢出了全屏 → 立刻收工)"
                              % why)
                     return
@@ -981,6 +1011,10 @@ def _build_inject_script(port):
             if os.environ.get("MSX_ACNET_MAXPASS"):
                 _acnet_body += ('window.__MSX_ACNET_MAXPASS__ = %s;\n'
                                 % json.dumps(os.environ["MSX_ACNET_MAXPASS"]))
+            # 运动区域弱超分权重(0~1): 0 = 旧行为(运动区不超分), 缺省 0.28
+            if os.environ.get("MSX_ACNET_MF"):
+                _acnet_body += ('window.__MSX_ACNET_MF__ = %s;\n'
+                                % json.dumps(os.environ["MSX_ACNET_MF"]))
             if os.environ.get("MSX_ACNET_WANTW"):
                 _acnet_body += ('window.__MSX_ACNET_WANTW__ = %s;\n'
                                 % json.dumps(os.environ["MSX_ACNET_WANTW"]))
@@ -1231,6 +1265,32 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
             import traceback
             traceback.print_exc()
 
+    def _ui_later(fn):
+        """总是投递到 UI 消息队列(即使当前就在 UI 线程, 也不内联执行)。
+
+        网页全屏的回调(ContainsFullScreenElementChanged)里**不能**直接最大化窗口 /
+        改 WebView2 几何: 那是在浏览器的全屏切换回调里重入 SetWindowPos + Resize,
+        合成器偶发停摆 —— 用户体感就是"点全屏后画面卡住半天"。投递一拍, 让浏览器
+        先把本次全屏切换收尾, 我们下一拍再动窗口。
+        """
+        form = box.get("form")
+        if form is None:
+            fn()
+            return
+
+        def go():
+            try:
+                fn()
+            except Exception:
+                import traceback
+                traceback.print_exc()
+        try:
+            if form.IsDisposed:
+                return
+            form.BeginInvoke(WinForms.MethodInvoker(go))
+        except Exception:
+            pass
+
     def _retext_later(cc, key=None, why="", **kw):
         """补呈现看门狗(见模块级 _represent)。
 
@@ -1370,20 +1430,24 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
                 if last is on:
                     return          # 同状态重复事件: 不去重就会反复最大化/还原
                 _Pool._fs_last[tab_key] = on
-                try:
-                    self.set_fullscreen(tab_key, on)
-                except Exception:
-                    pass
-                cb = box.get("on_fs")
-                if cb is not None:
-                    # bug6: 只有主窗口里的页面全屏才动窗口壳的标签栏/导航栏 ——
-                    # 悬浮窗里的全屏由 set_fullscreen 自己藏迷你标题栏与贴边热区,
-                    # 不该顺手把主窗口的chrome也摘掉。
-                    if _Pool.float_of.get(tab_key) is None:
-                        try:
-                            cb(tab_key, on)
-                        except Exception:
-                            _dbg_log("on_fs callback FAILED tab=%s" % tab_key)
+
+                def _apply_fs():
+                    try:
+                        self.set_fullscreen(tab_key, on)
+                    except Exception:
+                        pass
+                    cb = box.get("on_fs")
+                    if cb is not None:
+                        # bug6: 只有主窗口里的页面全屏才动窗口壳的标签栏/导航栏 ——
+                        # 悬浮窗里的全屏由 set_fullscreen 自己藏迷你标题栏与贴边热区,
+                        # 不该顺手把主窗口的chrome也摘掉。
+                        if _Pool.float_of.get(tab_key) is None:
+                            try:
+                                cb(tab_key, on)
+                            except Exception:
+                                _dbg_log("on_fs callback FAILED tab=%s" % tab_key)
+                # 不在 WebView2 的事件回调里直接改窗口几何(见 _ui_later 的说明)
+                _ui_later(_apply_fs)
 
             def on_core_ready(_s, _a):
                 try:
@@ -1724,11 +1788,13 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
                         # Page.captureScreenshot 超时), 且不会自己恢复(0.7~3.1s 五次采样全黑);
                         # 而在同一控件上补一次"隐藏→显示→置顶"立刻有画面(0.75s 起就正常)。
                         # 与最大化/Dock/chrome 隐藏/--disable-direct-composition-video-overlays 都无关。
-                        # 全屏必须 gentle: 不切 Visible(切了浏览器会退出全屏), 只置顶+重绘一次。
-                        # 慢 GPU / 冷启动的差异不该靠反复 toggle 硬补 —— 那会把"黑一下"
-                        # 变成"一直黑 + 卡死"。
+                        # ⚠️ 默认**不碰 Visible**(取证见 _fs_soft / _fs_taps): 隐藏 WebView2
+                        # 控件会把浏览器踢出 HTML 全屏, 之后画面停住(声音还在), 用户只能自己
+                        # 退出全屏。轻补只把重绘压在那两次布局落定之后。
                         _retext_later(c, key, "fullscreen", gentle=_fs_soft(),
-                                      verify=False, taps=(0.4,))
+                                      verify=False, fs_guard=True, settle=0.25,
+                                      taps=_fs_taps())
+                        _dbg_log("fs taps key=%s hard=%s" % (key, not _fs_soft()))
                         _dbg_log("fs enter done key=%s state=%s %s"
                                  % (key, host.WindowState, self._fs_desc(c)))
                     except Exception:

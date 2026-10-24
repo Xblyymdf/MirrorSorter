@@ -24,7 +24,9 @@
  *    gain = 1 + (yNew − blur4(yNew))/yRef × conf × w —— 只注入网络输出的高频细节
  *    (低频亮度偏置被高通滤除, 任何内容都不会"开超分更暗"); conf 是梯度比置信度闸门
  *    (结构保证"不会比不超分更糊"); w 是运动闸门(当帧亮度 vs SNAP_OUT 逐像素比,
- *    静止区域沿用网络细节, 运动区域退回原画 —— 跳帧/分片都不闪烁不重影)。
+ *    静止区域 w=1 吃满网络细节, 运动区域按**下限 MF**(默认 0.28)弱注入 ——
+ *    动态物体也有超分, 只是权重低; 快动作不重影。MF=0 回到"运动区不超"的旧行为,
+ *    窗口里设 MSX_ACNET_MF 可覆盖)。
  * D) 上下文丢失自愈: GPU 被压垮/驱动重置后 GL 调用静默无效("超分忽然没了") ——
  *    webglcontextlost 登记 → kick 自停 → 上层看门狗(播放中帧计数停滞)拆管重建。
  * 前置: window.__MSX_ACNET__ = 1 且 window.__MSX_ACNET_GLSL__ = 上游 glsl 文本(由壳注入) */
@@ -142,9 +144,19 @@
       return LEVELS[name] || LEVELS["高"];
     }
 
+    /* 运动区弱超分权重: 环境变量 MSX_ACNET_MF(0~1) 覆盖, 缺省 0.28。
+       -1 = 用缺省值(parseFloat 失败/负数/未设置都走这里)。 */
+    var _mfEnv = parseFloat(env.motionFloor);
+    var MF_FIX = (isFinite(_mfEnv) && _mfEnv >= 0) ? Math.min(1, _mfEnv) : -1;
+
     function combineFrag(P, wMode) {
+      /* 运动闸门: 静止 → 1(完整网络细节); 运动 → MF(弱超分, 而不是 0)。
+         ⚠️ 网络细节来自"周期开始时的输入快照", 运动区全量注入会拖影; 0 又等于
+         动态物体完全不超。取一个下限: 权重低到看不出重影, 但仍有细节提升。
+         MF=0 = 旧行为; MSX_ACNET_MF 可整体覆盖(见 MF_FIX)。 */
+      var mf = (MF_FIX >= 0 ? MF_FIX : 0.28).toFixed(3);
       var wExpr = wMode === 1 ? "1.0"
-        : "(1.0 - smoothstep(0.045, 0.10, min(abs(yCur - ySnap), 1.0)))";
+        : ("(mix(" + mf + ", 1.0, 1.0 - smoothstep(0.045, 0.10, min(abs(yCur - ySnap), 1.0))))");
       return "#version 300 es\nprecision highp float;\nuniform vec2 u_outSize;\n" +
         "const vec3 WC = vec3(0.2126, 0.7152, 0.0722);\n" +
         "uniform vec4 u_rect;\nuniform vec2 u_vidSize;\n" +
@@ -477,7 +489,8 @@
     }
 
     function gateString() {
-      return "lvl=" + level + " iw=" + curIw +
+      return "lvl=" + level + " mf=" + (MF_FIX >= 0 ? MF_FIX : 0.28) +
+             " iw=" + curIw +
              " pass=" + Math.min(cyclePass, 12) + "/12" +
              " passCost=" + Math.round(passCostEma * 100) / 100 +
              " cycles=" + cycleCount + " frames=" + frames;
@@ -501,7 +514,11 @@
           return false;
         }
         if (!ensureGL()) return false;
-        if (needRebuild || !c) {
+        /* ⚠️ 还必须判纹理是否还在: stop() 会释放 T(退出超分时省显存), 再次激活时
+           iw/ih 往往没变(同一视频/同一档位) —— 只判 needRebuild 会跳过 ensureAssets,
+           T 保持 null, 之后每帧 kick 在 T.LUMA 上抛异常, 画布永远停在上一帧
+           (用户体感: 进全屏画布卡住半天, 声音还在放), 直到看门狗拆管重建才恢复。 */
+        if (needRebuild || !c || !canvas.__msxAcnetTex) {
           if (!ensureAssets()) return false;
           cyclePass = 12;                        // 尺寸/档位变了: 旧周期作废, 下帧开新周期
         }
@@ -697,7 +714,7 @@
           core = __msxAcnetCore({
             glsl: m.glsl, canvas: m.canvas, preserve: m.preserve,
             oldReuse: m.oldReuse, debugSrc: m.debugSrc, maxPass: m.maxPass,
-            tickBudget: m.tickBudget,
+            tickBudget: m.tickBudget, motionFloor: m.motionFloor,
             onFirst: function () { postMessage({ type: "first" }); },
             onStats: function (s) { postMessage({ type: "stats", s: s }); },
             onFail: function (msg) { postMessage({ type: "fail", msg: String(msg).slice(0, 300) }); },
@@ -708,6 +725,10 @@
           started = true;
         } else if (m.cmd === "params") {
           if (!core) return;
+          /* 重新参数化 = 上一代喂帧链作废: 手里攥着的旧帧必须还给解码器,
+             否则它永远不会被 close, 背压闸门也在等一个不会来的回执 */
+          if (latest && latest.close) { try { latest.close(); } catch (e2) {} }
+          latest = null; latestMeta = null;
           core.params(m);
           core.reset(m.gen || 0);
           started = true;
@@ -802,10 +823,12 @@
             } else if (m.type === "fail") {
               try { window.__msxAcnetFail = m.msg; } catch (e2) {}
             } else if (m.type === "drained") {
-              inFlight = false;                 // 背压闸门: 可以喂下一帧了
-              if (m.ok) {
-                try { canvas.__msxAcnetLastPaint = performance.now(); } catch (e2) {}
-              }
+              /* ⚠️ 回执必须交给**当前激活**的回调。worker 在同一块画布上跨世代复用,
+                 onmessage 只在第一次创建时装一次; 旧实现把回执写进"首次激活"闭包里的
+                 inFlight —— 退出全屏再进入后, 新世代的闸门永远解不开 → 只喂第一帧,
+                 画面定格而声音继续(用户报修: 第一次进全屏正常, 退出再进就卡死)。 */
+              var dn = canvas.__msxAcnetDrained;
+              if (dn) { try { dn(m); } catch (e3) {} }
             }
           };
           w.postMessage({ cmd: "init", glsl: window.__MSX_ACNET_GLSL__, canvas: off,
@@ -814,6 +837,7 @@
                           debugSrc: window.__MSX_ACNET_DEBUG__ || "",
                           maxPass: window.__MSX_ACNET_MAXPASS__ || "",
                           tickBudget: window.__MSX_ACNET_TICK_BUDGET__ || "",
+                          motionFloor: window.__MSX_ACNET_MF__ || "",
                           iw: o.iw, ih: o.ih, vw: o.vw, vh: o.vh, level: o.level, gen: gen,
                           w: canvas.width, h: canvas.height }, [off]);
         } else {
@@ -824,6 +848,14 @@
         var stopped = false;
         var lastFeed = performance.now();
         var inFlight = false;                // worker 手里还有一帧没啃完
+        /* 每次激活都替换: drained 回执解的必须是**这一代**的闸门(见 onmessage 处说明)。
+           同一 worker 被复用时, 上一代闭包里的 inFlight 已无人读取, 往那里写等于丢回执。 */
+        canvas.__msxAcnetDrained = function (d) {
+          inFlight = false;                  // 背压闸门: 可以喂下一帧了
+          if (d && d.ok) {
+            try { canvas.__msxAcnetLastPaint = performance.now(); } catch (e2) {}
+          }
+        };
         /* 喂帧: new VideoFrame(零拷贝) → 转交 worker, **带背压**。
            旧实现每来一个视频帧就 new + postMessage; worker 在全屏啃不动时(画布像素
            ×4、网络满源宽), 未处理的消息队列会堆几十上百个 VideoFrame —— 解码器输出
@@ -918,6 +950,7 @@
           debugSrc: window.__MSX_ACNET_DEBUG__ || "",
           maxPass: window.__MSX_ACNET_MAXPASS__ || "",
           tickBudget: window.__MSX_ACNET_TICK_BUDGET__ || "",
+          motionFloor: window.__MSX_ACNET_MF__ || "",
           onFirst: function () { try { window.__msxSrFirstFrame && window.__msxSrFirstFrame(canvas); } catch (e) {} },
           onStats: statsIn,
           onFail: function (m) { try { window.__msxAcnetFail = m; } catch (e) {} },

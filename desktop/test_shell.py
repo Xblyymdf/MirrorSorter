@@ -280,12 +280,17 @@ check("补呈现手段最多两级(隐藏→显示→置顶 / 强制重绘) —�
       and "return 1 if i < 2 else 2" in _sp_src
       and "cc.Visible = False" in _sp_src and "cc.Invalidate(True)" in _sp_src
       and "par.Controls.Remove(cc)" not in _sp_src)
-check("全屏补呈现: 默认硬补一次、关掉 GDI 校验、留 MSX_FS_SOFT 逃生口",
+check("全屏补呈现: 默认轻补(不碰 Visible)、关掉 GDI 校验、MSX_FS_HARD 才是硬补逃生口",
+      # 用户报修: 全屏看视频有概率卡住画布(声音还在)。真机日志里硬补(隐藏→显示)
+      # 把浏览器踢出了 HTML 全屏 —— 所以默认只置顶+重绘+DwmFlush, 硬补留作逃生口。
       "def _rep_tap(ui, ctrls, cc, key, hwnd_box, level, gentle=False)" in _sp_src
       and "if not gentle:" in _sp_src
       and 'key, "fullscreen", gentle=_fs_soft(),' in _sp_src
-      and "verify=False, taps=(0.4,)" in _sp_src
-      and "def _fs_soft()" in _sp_src and "MSX_FS_SOFT" in _sp_src
+      and "verify=False, fs_guard=True, settle=0.25," in _sp_src
+      and "taps=_fs_taps()" in _sp_src
+      and "def _fs_taps()" in _sp_src
+      and 'return os.environ.get("MSX_FS_HARD", "0") != "1"' in _sp_src
+      and "DwmFlush" in _sp_src
       and "if not verify:" in _sp_src)
 # 用户报修(白屏第二轮): 主窗口被误判成悬浮窗 → 不最大化、不 Dock=Fill, 全屏只能靠页面自己铺满。
 # 根因是 `host is not box["form"]` —— pywebview 的 native 每次访问可能返回新包装对象。

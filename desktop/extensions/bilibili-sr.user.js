@@ -229,8 +229,12 @@
       }
       var vc = getComputedStyle(video), vr = video.getBoundingClientRect();
       var cr = canvas.getBoundingClientRect();
-      var diff = Math.abs(vr.left - cr.left) + Math.abs(vr.top - cr.top) +
-                 Math.abs(vr.width - cr.width) + Math.abs(vr.height - cr.height);
+      /* 画布被停滞自愈藏起来时 rect 全是 0, 拿它比几何只会误报一次"图层异常" */
+      var shown = String(getComputedStyle(canvas).display) !== "none";
+      var diff = shown
+        ? Math.abs(vr.left - cr.left) + Math.abs(vr.top - cr.top) +
+          Math.abs(vr.width - cr.width) + Math.abs(vr.height - cr.height)
+        : 0;
       var info = { canvases: all.length, visibleCanvases: vis.length, list: vis,
                    videoOpacity: vc.opacity, videoVisibility: vc.visibility,
                    videoDisplay: vc.display, videoObjectFit: vc.objectFit,
@@ -250,7 +254,7 @@
       if (info.visibleCanvases > 1) bad.push("可见画布 " + info.visibleCanvases + " 块: " + vis.join(" / "));
       /* 2026-10(晚): 原视频**永久保持可见**(不再 opacity:0) —— 藏视频会让B站播放器
          截图(drawImage(video))间歇性黑帧。画布同框覆盖, 视频可见是预期状态, 无异常可报 */
-      if (diff > 3) bad.push("画布与视频框不重合 " + info.rectDiffPx + "px");
+      if (shown && diff > 3) bad.push("画布与视频框不重合 " + info.rectDiffPx + "px");
       if (bad.length) {
         _layerBadRun++;
         window.__msxSrBadRun = _layerBadRun;
@@ -383,7 +387,12 @@
     try {
       var c = video.__msxSrCanvas;
       if (!c) return;
-      if (c.style.display !== "block") c.style.display = "block";
+      /* ⚠️ 被"停滞自愈"藏起来的画布(__msxSrHold), 只有**真的画出新帧**才许放回来。
+         这里过去是无条件 display:block, 而 reconcile 每 900ms 就会调到它 —— 于是看门狗
+         刚藏掉的、冻在最后一帧的画布, 1 秒内又盖回正在播放的原视频上。用户看到的就是
+         "全屏后画面卡住不动、声音还在放; 退出全屏才好"(退出全屏 need 掉到门槛下 →
+         超分退场 → 露出原视频)。 */
+      if (c.style.display !== "block" && !c.__msxSrHold) c.style.display = "block";
       var rw = Math.max(2, geo.rw), rh = Math.max(2, geo.rh);
       var left = geo.mx + "px", top = geo.my + "px";
       var wid = rw + "px", hei = rh + "px";
@@ -459,6 +468,17 @@
     if (!geo) return;
     var canvas = ensureCanvas(video);
     syncCanvasBox(video, geo);
+    /* 重新激活时画布上还留着上一次的最后一帧; 首帧出来前先藏起来, 否则它会盖着
+       原视频"冻住"(用户看到的"全屏后画面卡住不动")。首帧到达时放回来。
+       ⚠️ 必须同时立 hold: 否则 900ms 的 reconcile → syncCanvasBox 会把这块残帧又显示
+       出来, 而冷启动(worker 里编译 16 趟 program)最长 3s, 这段时间用户看到的就是冻屏。 */
+    try {
+      if (canvas.__msxSrPainted) {
+        canvas.__msxSrHold = 1;
+        canvas.__msxSrHoldAt = performance.now();
+        canvas.style.display = "none";
+      }
+    } catch (e) {}
 
     /* patch video.requestVideoFrameCallback: 让每条链带上"注册时的世代", 换代即自退 */
     if (!video.__msxSrPatched) {
@@ -536,6 +556,8 @@
       cur.firstFrame = performance.now();
       window.__msxSrFirst = Math.round(cur.firstFrame - built);
       c.__msxAcnetLastPaint = performance.now();
+      c.__msxSrPainted = 1;
+      c.__msxSrHold = 0;                    // 真的有画面了: 才允许重新显示
       try { c.style.display = "block"; } catch (e) {}
     };
 
@@ -608,11 +630,23 @@
           return;
         }
         if (video.paused) { stalls = 0; return; }  // 暂停: 无帧是正常的
-        var age = performance.now() - (canvas.__msxAcnetLastPaint || built0);
+        /* 首次装配(worker 里编译 16 趟 program + 分配上百 MB 渲染目标)可能超过 1.8s,
+           这段时间本来就没帧, 不是"停了"。给 3s 冷启动豁免, 否则会把它判成停滞、
+           拆管重建, 又从头编译一遍(用户体感: 进全屏卡半天)。 */
+        var since = Math.max(canvas.__msxAcnetLastPaint || 0, built0 + 3000);
+        var age = performance.now() - since;
         if (age > 1800) {
           /* 画布停在最后一帧而视频还在走: 先把画布藏掉 —— 底层原视频立刻可见,
-             用户不会继续盯着一张冻住的画面; 下一拍还停就拆管重建。 */
-          try { canvas.style.display = "none"; } catch (e) {}
+             用户不会继续盯着一张冻住的画面; 下一拍还停就拆管重建。
+             ⚠️ hold 必须一起立: 900ms 的 reconcile 会调 syncCanvasBox, 不立 hold 它
+             1 秒内就把冻住的这一帧又盖回去(藏了等于没藏)。 */
+          try {
+            if (!canvas.__msxSrHold) canvas.__msxSrHoldAt = performance.now();
+            canvas.__msxSrHold = 1;
+            canvas.style.display = "none";
+          } catch (e) {}
+          /* 补喂一帧: 背压闸门若卡在 inFlight(回执丢了), 只有主动投一帧能解开 */
+          try { canvas.__msxAcnetOnce && canvas.__msxAcnetOnce(); } catch (e) {}
           if (++stalls >= 2) {
             clearInterval(watchdog);
             window.__msxSrFail = (window.__msxAcnetFail || "no-progress") +
@@ -631,8 +665,12 @@
           return;
         }
         stalls = 0;
-        if (canvas.style.display === "none") {
-          try { canvas.style.display = "block"; } catch (e) {}   // 恢复了: 把画布放回来
+        if (canvas.__msxSrHold) {
+          /* hold 只由"藏起来之后新画出来的帧"解除: 时间戳必须晚于 holdAt。 */
+          if ((canvas.__msxAcnetLastPaint || 0) > (canvas.__msxSrHoldAt || 0) + 100) {
+            canvas.__msxSrHold = 0;
+            try { canvas.style.display = "block"; } catch (e) {}   // 恢复了: 把画布放回来
+          }
         }
       }, 1000);
     }
