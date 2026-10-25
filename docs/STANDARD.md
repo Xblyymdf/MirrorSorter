@@ -139,6 +139,10 @@ node --check web/app.js
 - **拖动/滚动这类每帧都跑的处理器里，不许调会重排全文档的函数**。主界面分栏的卡顿根因就是
   每帧 `applyPrefs()`（内部重写 6 个颜色变量 + 强制重排）；正确做法是 `requestAnimationFrame`
   合帧、只写必要的 CSS 变量，松手再做一次完整收尾（`applyPrefs()` + 落库）。
+- **更强的一条：拖动期间连"真实宽度"都别改。** 只要宽度变了，grid 列宽就变、内容区就 resize，
+  里面几百张卡片要重新折行、封面重绘、canvas/视频按新尺寸重画 —— 合帧也救不了。
+  正确做法是拖动时只移动一条 `position:fixed` 的预览线（位置用 `transform` 表达，走合成层），
+  松手才把宽度一次性落地。原生控件同理：拖动只挪那条 2px 分栏线，松手才 `layout()`。
 
 ### 数据隔离
 
@@ -181,6 +185,8 @@ python app_window.py --e2e-ai http://127.0.0.1:18061/panel
 :: 打包态跑同一套: 日志和截图落在 exe 同级的 build/probe/ (exe 没有 stdout, 只能看文件)
 
 python _verify_exe_panel.py      :: 归档层: panel.* 字节一致 + shell_ai 真的进了 PYZ
+python app_window.py --e2e-split :: 量化: 拖动 30 帧内容区 resize 几次(自带旧做法对照组)
+                                   :: 产物 build/probe/split_perf_e2e.log
 ```
 
 跑真机 e2e 的三个坑：① 别先 `win.minimize()`（ClientSize 归零，几何全测不出来）；
