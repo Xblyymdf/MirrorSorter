@@ -915,8 +915,9 @@ class ShellApi:
             return
         try:
             with self._lock:
+                # url 供原生标签栏画站点图标(域名取色 + 首字母瓦片), 不影响切页逻辑
                 tabs = [{"id": t["id"], "title": t["title"] or "页面",
-                         "closable": not t["pinned"]}
+                         "closable": not t["pinned"], "url": t.get("url") or ""}
                         for t in self._tabs if not t.get("float")]
                 active = self._active
             if not any(t["id"] == active for t in tabs):
@@ -964,6 +965,7 @@ def main(argv=None):
         except IndexError:
             e2e_ai_url = None
     e2e_split = "--e2e-split" in argv   # 测试钩子: 量化拖动分栏时的布局/重绘次数
+    e2e_chrome = "--e2e-chrome" in argv  # 测试钩子: 真窗口渲染顶栏成 PNG + 结构断言
     e2e_float_resize_url = None
     if "--e2e-float-resize" in argv:  # 测试钩子: 真鼠标消息驱动悬浮窗八向缩放
         try:
@@ -997,7 +999,8 @@ def main(argv=None):
         return 0
     return shell_main(e2e_url=e2e_url, e2e_float_url=e2e_float_url,
                       e2e_float_resize_url=e2e_float_resize_url,
-                      e2e_ai_url=e2e_ai_url, e2e_split=e2e_split)
+                      e2e_ai_url=e2e_ai_url, e2e_split=e2e_split,
+                      e2e_chrome=e2e_chrome)
 
 
 def _install_mouse_side_buttons(api, win):
@@ -1517,6 +1520,140 @@ def _probe_dir():
     return os.path.join(HERE, "build", "probe")
 
 
+def _e2e_chrome_shot(form, strip_update, nav_update):
+    """真机自测: 把**真实窗口**里的标签条 + 导航栏渲染成 PNG, 并断言顶栏结构。
+
+    为什么不能只靠 `_shot_chrome.py`: 那是拿假数据单独渲染两个 Panel。真窗口里还有
+    页面推来的配色(ui_bg_scheme)、真实的标签集合、以及两个 Panel 的**真实贴合**——
+    "激活标签和工具栏连成一片"这件事只有在真窗口里才能证明(差 1px 就会露出接缝)。
+
+    断言:
+      1. 标签条/导航栏底色**不同**(深色框 + 浅色板, 结构对了才有这个层次);
+      2. 激活标签的**底行颜色 == 导航栏首行颜色** —— 连成一片的直接证据;
+      3. 整幅图不是纯色(自绘真的跑了, 没被异常吞掉)。
+
+    只在 `--e2e-chrome` 下跑, 产物 build/probe/chrome_real.png(打包态在 exe 同级)。
+    """
+    lines, fails = [], [0]
+
+    def say(m):
+        lines.append(str(m))
+        # ★ flush=True 不是洁癖: 收尾走 os._exit(0), 它**不刷缓冲**, 重定向到文件时
+        #   整段日志会凭空消失(第一次跑就踩了, 看起来像"e2e 根本没执行")。
+        print("[e2e-chrome] " + str(m), flush=True)
+
+    def ok(name, cond, extra=""):
+        if not cond:
+            fails[0] += 1
+        say("%s  %s%s" % ("PASS" if cond else "FAIL", name,
+                          ("  " + str(extra)) if extra else ""))
+
+    try:
+        from System.Drawing import Bitmap, Graphics, Rectangle
+        import System.Windows.Forms as WinForms
+
+        strip = getattr(strip_update, "strip", None)
+        nav = getattr(nav_update, "bar", None)
+        ok("0 拿到真实标签条与导航栏控件", strip is not None and nav is not None,
+           "%s / %s" % (strip, nav))
+        if strip is None or nav is None:
+            return fails[0]
+
+        def _shot():
+            sw, sh = int(strip.Width), int(strip.Height)
+            nw, nh = int(nav.Width), int(nav.Height)
+            b1 = Bitmap(sw, sh)
+            strip.DrawToBitmap(b1, Rectangle(0, 0, sw, sh))
+            b2 = Bitmap(nw, nh)
+            nav.DrawToBitmap(b2, Rectangle(0, 0, nw, nh))
+            img = Bitmap(max(sw, nw), sh + nh)
+            g = Graphics.FromImage(img)
+            g.DrawImageUnscaled(b1, 0, 0)
+            g.DrawImageUnscaled(b2, 0, sh)
+            g.Dispose()
+            return img, b1, b2
+
+        holder = {}
+
+        def _grab():
+            try:
+                holder["v"] = _shot()
+            except Exception as ex:      # noqa: BLE001 —— 必须让主线程看到原因
+                holder["err"] = repr(ex)[:300]
+
+        # UI 线程画(Panel 的 Paint 必须在自己的线程上跑), 调用线程等结果
+        strip.BeginInvoke(WinForms.MethodInvoker(_grab))
+        for _ in range(40):
+            if "v" in holder or "err" in holder:
+                break
+            time.sleep(0.1)
+        if "err" in holder:
+            ok("1 DrawToBitmap 顶栏", False, holder["err"])
+            return fails[0]
+        img, b1, b2 = holder["v"]
+
+        st_s, st_n = strip_update.st, nav_update.st
+        c_strip, c_nav = st_s["bar"], st_n["bar"]
+        c_act = st_s["tab_active"]
+        say("geom strip=%dx%d nav=%dx%d bar_h=%s scale=%s" % (
+            strip.Width, strip.Height, nav.Width, nav.Height,
+            getattr(strip_update, "bar_h", None),
+            getattr(form, "_scale", None)))
+        say("colors strip=%s nav=%s active=%s" % (c_strip.Name, c_nav.Name, c_act.Name))
+        ok("1 标签条与工具栏是两种底色(深框 + 浅板)", c_strip.ToArgb() != c_nav.ToArgb())
+        ok("2 工具栏底色 == 激活标签底色", c_nav.ToArgb() == c_act.ToArgb(),
+           "%s vs %s" % (c_nav.Name, c_act.Name))
+
+        # 在标签条底行找激活标签的横向范围(底行是齐平的, 不会被圆角影响)
+        sh, nh = int(b1.Height), int(b2.Height)
+        y = sh - 1
+        xs = [x for x in range(int(b1.Width)) if b1.GetPixel(x, y).ToArgb() == c_act.ToArgb()]
+        ok("3 底行能找到激活标签(与工具栏齐平)", len(xs) >= 20, "命中 %d 像素" % len(xs))
+        if xs:
+            mid = xs[len(xs) // 2]
+            # ★ 真正要证的是**两张图相邻两行同色**: 标签条最后一行 == 导航栏第一行。
+            #   只比"导航栏首行 == 导航栏底色"是同义反复, 差 1px 接缝也照样 PASS。
+            p_last = b1.GetPixel(mid, sh - 1).ToArgb()
+            p_top = b2.GetPixel(mid, 0).ToArgb()
+            ok("4 标签条末行 == 导航栏首行(连成一片, 没有接缝)",
+               p_last == p_top == c_nav.ToArgb(),
+               "%s / %s / %s" % (b1.GetPixel(mid, sh - 1).Name,
+                                 b2.GetPixel(mid, 0).Name, c_nav.Name))
+            p_deep = b2.GetPixel(mid, nh // 2).ToArgb()
+            ok("5 工具栏同列上下同色(没有横向色带切断)", p_deep == c_nav.ToArgb(),
+               b2.GetPixel(mid, nh // 2).Name)
+            # 反面: 激活标签两侧应该露出**标签条**底色, 证明不是整条染色
+            far = max(2, min(xs[0] - 30, int(b1.Width) - 3))
+            ok("6 激活标签左侧露出标签条底色", b1.GetPixel(far, y).ToArgb() == c_strip.ToArgb(),
+               b1.GetPixel(far, y).Name)
+
+        colors = set()
+        for xx in range(0, int(img.Width), 7):
+            for yy in range(0, int(img.Height), 3):
+                colors.add(img.GetPixel(xx, yy).ToArgb())
+        ok("7 顶栏不是纯色(自绘确实执行了)", len(colors) >= 8, "%d 种颜色" % len(colors))
+
+        out = os.path.join(_probe_dir(), "chrome_real.png")
+        try:
+            os.makedirs(_probe_dir(), exist_ok=True)
+            img.Save(out)
+            say("shot -> " + out)
+        except Exception as ex:      # noqa: BLE001
+            ok("8 截图落盘", False, repr(ex)[:200])
+    except Exception as ex:          # noqa: BLE001
+        ok("异常", False, repr(ex)[:300])
+    finally:
+        try:
+            os.makedirs(_probe_dir(), exist_ok=True)
+            with io.open(os.path.join(_probe_dir(), "chrome_e2e.log"),
+                         "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        except Exception as ex:      # noqa: BLE001
+            print("[e2e-chrome] 日志落盘失败: %r" % (ex,))
+        say("RESULT: %s" % ("FAIL(%d)" % fails[0] if fails[0] else "PASS"))
+    return fails[0]
+
+
 def _e2e_ai_panel(api, panel, pages, url):
     """真机自测: 开一个标签页 → 面板停靠/让位 → 网页快照/查找/填写/滚动 → 开合。
 
@@ -1882,7 +2019,7 @@ def _e2e_drag_to_tabbar(api, tid, say):
 
 
 def shell_main(e2e_url=None, e2e_float_url=None, e2e_float_resize_url=None,
-               e2e_ai_url=None, e2e_split=False):
+               e2e_ai_url=None, e2e_split=False, e2e_chrome=False):
     """窗口壳主流程: 起/复用服务 → WebView2 检测 → 主窗口(含标签页) → 全关后收尾。
 
     e2e_url 仅测试用(_e2e_shell.py): 主窗口就绪后自动走一次 open_in_app 桥调用,
@@ -2102,6 +2239,28 @@ def shell_main(e2e_url=None, e2e_float_url=None, e2e_float_resize_url=None,
             finally:
                 try:
                     time.sleep(1)
+                    win.destroy()
+                except Exception:
+                    pass
+                try:
+                    app.shutdown(server)
+                except Exception:
+                    pass
+                os._exit(0)
+        if e2e_chrome:
+            # 顶栏视觉自测: 真窗口里把标签条+导航栏渲染成 PNG, 并断言"激活标签与工具栏
+            # 连成一片"。必须先等页面把配色推上来(ui_bg_scheme), 否则断言的是默认色。
+            try:
+                time.sleep(3)
+                _e2e_chrome_shot(api._win.native,
+                                 getattr(api, "_strip_update", None),
+                                 getattr(api, "_navbar_update", None))
+            except Exception:
+                import traceback
+                traceback.print_exc()
+            finally:
+                try:
+                    time.sleep(0.6)
                     win.destroy()
                 except Exception:
                     pass

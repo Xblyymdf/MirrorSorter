@@ -396,7 +396,7 @@ check("57 shell_pages: exec_js 只把发起投到 UI 线程(在 UI 线程等 Tas
 
 nb = src("shell_navbar.py")
 check("58 导航栏: AI 开关按钮 + set_ai 接口",
-      'AI_W = int(42 * scale)' in nb and "def set_ai(on)" in nb
+      'AI_W = int(' in nb and "def set_ai(on)" in nb
       and "update.set_ai = set_ai" in nb and 'api.toggle_ai_panel()' in nb
       and "def _ai_rect()" in nb)
 check("59 导航栏: 地址栏给 AI 按钮让位(不被压住)",

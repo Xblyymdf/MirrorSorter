@@ -168,10 +168,52 @@ python test_smoke.py       :: 后端主流程
 python test_rules.py       :: 规则引擎
 python test_chat.py        :: AI 聊天
 python test_ai_panel.py    :: 右侧 AI 面板（状态/桥/工具分派/宽度夹取/分栏修复）
+python _shot_chrome.py     :: 顶栏（标签条+导航栏）真渲染成 PNG：深/浅/悬停/窄窗四张
 node  _test_ai_page_js.js  :: 注入网页的助手脚本（vm + 假 DOM，断言真的发了哪些调用）
 ```
 
+`_shot_chrome.py` 是**原生自绘 UI 的验收工具**：顶栏是 WinForms GDI+ 画的，改一个半径/
+间距靠读代码判断不了好不好看，也判断不了弧线方向反了没有（不会报错，只会变丑）。它把
+`shell_tabstrip`/`shell_navbar` 装进一个**挪到屏幕外**的 Form，直接 `DrawToBitmap` 出图，
+不抢焦点、可重复。★ 必须真 `Show()` 一次：不 Show 时子控件 `Visible=False` 且没有句柄，
+`DrawToBitmap` 会把原生地址栏 TextBox 整个跳过，截出来的图里网址是空的。
+产物在 `build/probe/chrome_{dark,light,hover,narrow}.png`。
+
 `test_smoke.py` 要用系统 `C:\Python314\python.exe`（托管 3.13 无 tkinter，「体检:本机可跑悬浮窗」会 FAIL）。
+
+### 本版专项（v0.4.43dsk 顶栏视觉重做）
+
+```bat
+python _shot_chrome.py        :: 出图肉眼比对 Chrome/Edge；改顶栏必跑
+python test_shell.py          :: 其中「顶栏结构1~6」是这次的结构性约定
+:: 真窗口版: 打开真窗、真 WebView2、真配色, 渲染顶栏并断言"标签条末行 == 导航栏首行"
+set MIRRORSORTER_DATA_DIR=%TEMP%\msx-chrome-e2e
+set MIRRORSORTER_WV2_DATA=%TEMP%\msx-chrome-e2e-wv2
+set MIRRORSORTER_PORT=18062
+python app_window.py --e2e-chrome
+:: 产物 build/probe/chrome_real.png + chrome_e2e.log
+```
+
+`_shot_chrome.py` 与 `--e2e-chrome` 是**互补**的两层：前者拿假数据单独渲染两个 Panel（快、
+可重复、能造悬停/窄窗等极端态）；后者是唯一能证明"激活标签和工具栏真的连成一片"的地方——
+两个 Panel 的**真实贴合**差 1px 就会露出接缝，而这在假数据图里永远看不出来。
+本机 150% DPI 下实测 `bar_h=54`（= 36×1.5，`form._scale` 由 pywebview 给），
+断言必须按运行时的实际像素比，不能写死 36。
+
+对标 Chrome/Edge 的差距在**结构**不在配色，只调颜色救不回来：
+
+- 标签**相邻无缝隙**，激活标签顶角圆角 + 底边平直，左右各有向外张开的"脚"；
+- 激活标签**下沿与工具栏齐平且同色** → 视觉上与下方内容连成一片。所以工具栏底色必须取
+  scheme 的 `active`（激活标签色），标签条取 `bar`（更深一档）；收藏栏同理跟着 `active`。
+  旧版两者都用 `bar`，激活标签只能靠"更亮"区分 → 永远是浮在条上的小卡片。
+- 分隔线只画在两个"都非激活/非悬停"的相邻标签之间；
+- ✕ / + / ─ □ ✕ 全部改成 1px 矢量线（文字符号粗细不匀、基线乱飘）；
+- 悬停底色取 `active ↔ bar` 的中点，**不要**直接用页面给的 `hover`（深色下它比 `active`
+  还亮，悬停一个非激活标签会比激活标签更显眼，层次整个反了）；
+- 地址栏是**胶囊**（半径 = 半高），站点图标（https 给锁/其余给地球）画在胶囊**内**；
+  原生 TextBox 必须内缩在胶囊里，否则它这个不透明矩形会把圆角切方；
+- 每个标签带 16px 站点图标瓦片（域名取色 + 首字母，没有真实 favicon 时的兜底）——
+  为此 `app_window._render()` 的标签数据里加了 `url`。
 
 ### 本版专项（v0.4.42dsk 右侧 AI 面板）
 

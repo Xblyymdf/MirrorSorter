@@ -146,3 +146,6 @@ desktop/_vis/fasttext_demo/*.json
 # v0.4.42dsk: 面板归档层验收(局部 import 的 shell_ai 是否进 PYZ / panel.* 字节是否一致)。
 # 默认取 dist 下最新的 exe, 每版都能跑, 不用改。
 !desktop/_verify_exe_panel.py
+# v0.4.43dsk: 顶栏(标签条+导航栏)视觉验收。原生自绘的 UI 改一个半径/间距, 靠读代码
+# 判断不了好不好看, 也判断不了弧线方向反了没有(不报错, 只会变丑) —— 真渲染成 PNG 比对。
+!desktop/_shot_chrome.py

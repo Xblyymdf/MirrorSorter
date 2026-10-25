@@ -589,6 +589,48 @@ check("bug7 地址栏文字未悬停时 70% 不透明度(悬停/编辑回满)",
       and "def _set_tb_hover(v)" in _nb_src
       and "tb.MouseEnter" in _nb_src and "tb.MouseLeave" in _nb_src)
 
+# ---------- 3g. 顶栏视觉重做(v0.4.43dsk): 对标 Chrome/Edge 的结构性约定 ----------
+# 用户原话: "优化一下我们的顶栏, 我们做的实在是太差了, 完全不如谷歌和 edge"。
+# 差距不在配色而在**结构**: 旧版是"深色条上浮着一排独立圆角小卡片 + 用文字符号画
+# ✕/+/─□✕"。下面这些断言锁的是结构, 不是像素 —— 以后调色不会把它们改坏。
+check("顶栏结构1 激活标签与工具栏同色齐平(连成一片, 不是浮在条上的卡片)",
+      # 工具栏底色取 scheme 的 active(= 激活标签色), 标签条底色取 bar(更深一档)
+      'st["bar"] = _c("active", st["bar"])' in _nb_src
+      and 'st["strip"] = _c("bar", st["strip"])' in _nb_src
+      and "tab_h = bar_h - tab_top" in _st_src
+      and "g.FillPath(SolidBrush(st[\"tab_active\"])," in _st_src)
+check("顶栏结构2 标签相邻无缝隙 + 激活标签带向下张开的脚(压住左右邻居)",
+      "x += tw + gap" not in _st_src          # 旧版: 每个标签之间留 4px 间隙
+      and "return [(margin + i * tw, tw) for i in range(n)]" in _st_src
+      and "def _tab_path(x, y, w, hh, rad, foot)" in _st_src
+      and "p.AddArc(x + w, b - f * 2, f * 2, f * 2, 180, -90)" in _st_src
+      and "p.AddArc(x - f * 2, b - f * 2, f * 2, f * 2, 90, -90)" in _st_src
+      # 激活标签必须最后画, 否则它的脚会被后面的邻居盖掉
+      and 'key=lambda k: (st["tabs"][k]["id"] == act_id)' in _st_src)
+check("顶栏结构3 图标全部是 1px 矢量线(不再用 ✕ / + / ─ □ ✕ 文字符号)",
+      'g.DrawString("✕"' not in _st_src and 'g.DrawString("+"' not in _st_src
+      and '(("min", "─"), ("max", "□"), ("close", "✕"))' not in _st_src
+      and "g.DrawLine(xp, cx - s, cy - s, cx + s, cy + s)" in _st_src   # 标签 ✕
+      and "g.DrawLine(pp, acx - ps, acy, acx + ps, acy)" in _st_src     # 「+」的横
+      and "g.DrawRectangle(wp, cx - s, cy - s, s * 2, s * 2)" in _st_src)  # 最大化
+check("顶栏结构4 标签带站点图标瓦片(域名取色, 无 favicon 时用首字母兜底)",
+      "def _fav(t)" in _st_src and "FAV_COLORS" in _st_src
+      and 't.get("url")' in _st_src
+      and '"url": t.get("url") or ""' in _aw_src.replace("\r\n", "\n"))
+check("顶栏结构5 地址栏是胶囊(两端全圆) + 站点图标在胶囊内 + 聚焦给强调色描边",
+      "def _pill_rect()" in _nb_src
+      and "prad = ph // 2" in _nb_src
+      and "_rounded_path(px, py, pw, ph, prad)" in _nb_src
+      and "st[\"accent\"], max(1.0, 1.4 * scale)" in _nb_src
+      # 原生 TextBox 必须内缩在胶囊里, 否则它会把圆角切方
+      and "right = px + pw - rad - int(2 * scale)" in _nb_src)
+check("顶栏结构6 悬停底色取 active↔bar 中点(层次: 栏底 < 悬停 < 激活)",
+      "def _mix(c, base, k)" in _st_src
+      and 'st["tab_hover"] = _mix(st["tab_active"], st["bar"], 0.5)' in _st_src
+      # 页面给的 hover 在深色下比 active 还亮, 直接用会把层次弄反
+      and 'st["tab_hover"] = _c("hover", st["tab_hover"])' not in _st_src)
+
+
 # bug8 开启评论筛选屏蔽后评论偶发无法继续向下滚动
 check("bug8 主评论列表一条不删(只标记, 组件才会继续翻页) + 补泵翻页(屏蔽后仍能一路下滑)",
       "function isMainList(u)" in _cf_c and "/x/v2/reply/wbi/main" in _cf_c

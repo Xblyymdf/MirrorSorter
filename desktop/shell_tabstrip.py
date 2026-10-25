@@ -9,6 +9,15 @@
 右端有 ─ □ ✕ 窗口按钮; 无边框缩放由 shell_pages.init 的 WS_THICKFRAME 补丁恢复。
 
 注意: pythonnet 对 .NET 虚方法重写(OnPaint 等)不可靠, 必须用 Paint/MouseClick 事件订阅。
+
+视觉(v0.4.43dsk 重做, 对标 Chrome/Edge) —— 差距在**结构**不在配色, 改色救不回来:
+- 标签相邻无缝隙, 激活标签顶角圆角 + 底边平直, 且左右各有向外张开的"脚";
+- 激活标签**下沿与工具栏齐平**, 且与工具栏同色 → 视觉上与下方内容连成一片;
+  所以工具栏(shell_navbar)的底色必须取 scheme 的 active, 标签条取 bar;
+- 分隔线只画在两个"都非激活/非悬停"的相邻标签之间;
+- ✕ / + / ─ □ ✕ 全部改成 1px 矢量线(旧版用文字符号, 粗细不匀、基线乱飘);
+- 每个标签带 16px 站点图标瓦片(域名取色 + 首字母, 没有真实 favicon 时的兜底)。
+验收: `_shot_chrome.py` 把本模块与导航栏真渲染成 PNG(深/浅/悬停/窄窗四张), 肉眼比对。
 """
 import re
 import threading
@@ -20,7 +29,7 @@ import threading
 #   —— 任意方向的曼哈顿距离, 于是"点一下标签"手抖二十来像素就被拽成悬浮窗(用户反馈);
 #   而"往下拽"因为标签栏只有 ~32px 高、拖出去立刻触发 MouseLeave 被取消, 反而永远
 #   拽不出来。方向语义整个是反的, 而内联写法在无 GUI 环境下没法回归测试。
-DETACH_DY = 26     # 向下拖出的阈值(逻辑像素 × scale); 标签栏高 ≈ 32 × scale
+DETACH_DY = 26     # 向下拖出的阈值(逻辑像素 × scale); 标签栏高 ≈ 36 × scale
 HINT_DY = 8        # 到这个位移先给视觉提示(还没到撕出阈值)
 
 
@@ -47,26 +56,38 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
     [{"id":..,"title":..,"closable":..}] 与激活 id 即重绘。"""
     import clr
     clr.AddReference("System.Drawing")
-    from System.Drawing import (Color, ContentAlignment, Font, Pen, Rectangle,
-                                SolidBrush, StringFormat, StringAlignment,
-                                StringFormatFlags, StringTrimming, RectangleF,
-                                Point, Size)
+    from System.Drawing import (Color, ContentAlignment, Font, FontStyle, Pen,
+                                Rectangle, SolidBrush, StringFormat,
+                                StringAlignment, StringFormatFlags, StringTrimming,
+                                RectangleF, Point, Size)
     from System.Drawing.Drawing2D import GraphicsPath, SmoothingMode
     import System.Windows.Forms as WinForms
 
     form = win.native
     scale = float(getattr(form, "_scale", 1.0) or 1.0)
-    bar_h = max(28, int(32 * scale))
-    tab_h = bar_h - 8
-    font = Font("Microsoft YaHei", 8.0 * scale)
-    btn_font = Font("Microsoft YaHei", 10.0 * scale)   # 按钮符号=1.25倍字号(─□✕/标签✕), 标题不动
-    TAB_ACTIVE = Color.FromArgb(22, 25, 32)     # 激活标签(=应用 --panel)
+    # ---- 比例对标 Chrome/Edge ----
+    # 标签条 36 逻辑像素(旧版 32 偏矮, 标题挤在一起显得廉价); 标签从距顶 5px 起画,
+    # **下沿与工具栏齐平** —— 齐平 + 与工具栏同色, 激活标签才会和下方内容连成一片。
+    # 旧版标签是"浮在深色条上的一张独立圆角小卡片", 这是最致命的差距: 结构不像浏览器,
+    # 再怎么调颜色也救不回来。
+    bar_h = max(30, int(36 * scale))
+    tab_top = int(5 * scale)          # 标签顶部留白(上方露出的是标签条底色)
+    tab_h = bar_h - tab_top           # 标签高度 = 一直到栏底(不减去底部留白)
+    font = Font("Microsoft YaHei", 8.5 * scale)
+    btn_font = Font("Microsoft YaHei", 10.0 * scale)   # 自绘弹出菜单用
+    fav_font = Font("Segoe UI", 8.0 * scale, FontStyle.Bold)   # 站点图标瓦片里的字母
+    TAB_ACTIVE = Color.FromArgb(22, 25, 32)     # 激活标签(= 工具栏底色, 两者必须同色)
     TAB_HOVER = Color.FromArgb(30, 34, 44)      # 非激活悬停
-    BG = Color.FromArgb(10, 12, 16)             # 标签栏底色(比窗口更深一档)
+    BG = Color.FromArgb(10, 12, 16)             # 标签条底色(比工具栏深一档)
     FG_ON = Color.White
     FG_OFF = Color.FromArgb(150, 158, 172)
+    # 站点图标瓦片的兜底配色(没有真实 favicon 时用首字母色块, Edge 也是这么兜的)
+    FAV_COLORS = ((0x4C, 0x8D, 0xFF), (0xE0, 0x5C, 0x7B), (0x3F, 0xB9, 0x8C),
+                  (0xE8, 0xA3, 0x3D), (0x8B, 0x77, 0xF0), (0x2F, 0xAE, 0xC9),
+                  (0xE2, 0x6B, 0x4C), (0x5E, 0x8C, 0x3E))
     st = {"tabs": [], "active": 0, "hover_btn": None, "hover_tab": None,
           "hover_add": False,   # 「+」新建按钮悬停
+          "hover_close": None,  # 指针落在哪个标签的 ✕ 上(画圆形悬停底)
           "drop_hi": False,   # 悬浮窗被拖到标签栏上方 → 整条高亮(提示"松手即合并成标签页")
           "accent": Color.FromArgb(251, 114, 153),   # 默认主题粉; accent_watch 会用设置文件的强调色覆盖
           "bar": Color.FromArgb(10, 12, 16), "tab_active": Color.FromArgb(22, 25, 32),
@@ -90,40 +111,46 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
     sf.LineAlignment = StringAlignment.Center
     sf.FormatFlags = StringFormatFlags.NoWrap
     sf.Trimming = StringTrimming.EllipsisCharacter
-    sf_c = StringFormat()   # 符号居中(✕/─□✕): 字形再宽也不会越出保留区被裁
+    sf_c = StringFormat()   # 居中(站点图标字母/地球锁形): 字形再宽也不会越出保留区被裁
     sf_c.Alignment = StringAlignment.Center
     sf_c.LineAlignment = StringAlignment.Center
 
-    ADD_W = int(24 * scale)   # 标签条右端的「+」新建按钮
+    ADD_W = int(28 * scale)   # 标签条右端的「+」新建按钮
+    TAB_MIN = int(72 * scale)    # 标签最窄(再窄标题就没法读了)
+    TAB_MAX = int(232 * scale)   # 标签最宽
 
     def _layout(width):
+        """标签几何: **相邻无缝隙**(靠 1px 分隔线区分, 与 Chrome 一致)。
+
+        旧版留 4px 间隙 + 每张标签独立圆角 → 一排"小卡片", 不像浏览器标签。
+        """
         n = len(st["tabs"])
         if not n:
             return []
-        gap, margin = int(4 * scale), int(6 * scale)
-        btn_zone = BTN_W() * 3 + int(2 * scale)
-        # 「+」占一格(含与前一个标签的间距), 从可用宽度里扣掉
-        slack = width - margin - btn_zone - gap - ADD_W - gap * (n - 1)
-        # 挤不下时收窄标签(浏览器习惯), 不能硬保下限: 旧下限110会把总宽顶出栏外,
-        # 最右标签被面板右缘裁掉 → ✕只剩半个(用户截图)。60(逻辑)保住✕+点击区完整。
-        tw = min(int(180 * scale), max(int(60 * scale), slack // n))
-        out, x = [], margin
-        for _ in range(n):
-            out.append((x, tw))
-            x += tw + gap
-        return out
+        margin = int(8 * scale)
+        btn_zone = BTN_W() * 3 + int(4 * scale)
+        slack = width - margin - btn_zone - ADD_W - int(10 * scale)
+        tw = min(TAB_MAX, max(TAB_MIN, slack // n))
+        if tw * n > slack:      # 标签太多: 宁可挤窄, 也不能顶出栏外把最右边的 ✕ 裁掉
+            tw = max(int(44 * scale), slack // n)
+        return [(margin + i * tw, tw) for i in range(n)]
 
     def _add_rect():
         """「+」按钮矩形 —— 紧贴最后一个标签右侧; 标签多到挤满时钉在窗口按键左侧。"""
         boxes = _layout(strip.Width)
-        x = (boxes[-1][0] + boxes[-1][1] + int(4 * scale)) if boxes else int(6 * scale)
-        limit = strip.Width - BTN_W() * 3 - ADD_W - int(4 * scale)
-        x = max(int(2 * scale), min(x, limit))
-        return (x, int(3 * scale), ADD_W, bar_h - int(6 * scale))
+        x = (boxes[-1][0] + boxes[-1][1] + int(8 * scale)) if boxes else int(10 * scale)
+        limit = strip.Width - BTN_W() * 3 - ADD_W - int(6 * scale)
+        x = max(int(4 * scale), min(x, limit))
+        return (x, tab_top, ADD_W, tab_h)
 
     def _hit_add(x, yv):
         ax, ay, aw, ah = _add_rect()
         return ax <= x <= ax + aw and ay <= yv <= ay + ah
+
+    def _close_rect(x, tw):
+        """标签 ✕ 的圆形热区(正方形框, 里面画圆)。"""
+        d = int(20 * scale)
+        return (x + tw - d - int(3 * scale), tab_top + (tab_h - d) // 2, d, d)
 
     def _rounded_path(x, y, w, h, rad):
         p = GraphicsPath()
@@ -135,87 +162,184 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
         p.CloseFigure()
         return p
 
+    def _tab_path(x, y, w, hh, rad, foot):
+        """浏览器标签轮廓: 上方圆角 + 下方两只向外张开的"脚", 底边平直。
+
+        foot>0 时底边比上边左右各宽 foot, 用四分之一圆过渡 —— 这就是 Chrome/Edge
+        标签那种"坐"在内容区上的形状。激活标签的底边与工具栏齐平且同色, 于是两者
+        在视觉上连成一体; 脚的溢出部分会压住左右邻居, 所以激活标签必须**最后画**。
+
+        foot=0 → 普通的"上方圆角、下方平底"矩形(非激活悬停底色用)。
+        """
+        p = GraphicsPath()
+        r = max(1, int(rad))
+        f = max(0, int(foot))
+        b = y + hh
+        p.AddArc(x, y, r * 2, r * 2, 180, 90)                    # 左上角
+        p.AddArc(x + w - r * 2, y, r * 2, r * 2, 270, 90)        # 右上角
+        if f > 0:
+            p.AddLine(x + w, y + r, x + w, b - f)                # 右边直下
+            p.AddArc(x + w, b - f * 2, f * 2, f * 2, 180, -90)   # 右脚
+            p.AddLine(x + w + f, b, x - f, b)                    # 底边
+            p.AddArc(x - f * 2, b - f * 2, f * 2, f * 2, 90, -90)   # 左脚
+            p.AddLine(x, b - f, x, y + r)                        # 左边直上
+        else:
+            p.AddLine(x + w, y + r, x + w, b)
+            p.AddLine(x + w, b, x, b)
+            p.AddLine(x, b, x, y + r)
+        p.CloseFigure()
+        return p
+
+    def _fav(t):
+        """(瓦片底色, 首字母) —— 没有真实 favicon 时的兜底站点图标。
+
+        域名取色(同一站点颜色稳定), 首页/固定页用强调色 + 标题首字。
+        """
+        if not t.get("closable"):
+            return st["accent"], (str(t.get("title") or "?")[:1] or "?")
+        host = ""
+        try:
+            m = re.match(r"^https?://([^/:?#]+)", str(t.get("url") or ""))
+            if m:
+                host = m.group(1).lower()
+                if host.startswith("www."):
+                    host = host[4:]
+        except Exception:
+            host = ""
+        if not host:
+            return st["accent"], (str(t.get("title") or "?")[:1] or "?")
+        h = 0
+        for ch in host:
+            h = (h * 131 + ord(ch)) & 0xFFFFFF
+        c = FAV_COLORS[h % len(FAV_COLORS)]
+        return Color.FromArgb(c[0], c[1], c[2]), host[:1].upper()
+
     def on_paint(_sender, e):
         g = e.Graphics
         g.SmoothingMode = SmoothingMode.AntiAlias
         g.Clear(st["bar"])
         boxes = _layout(strip.Width)
-        rad = int(5 * scale)
-        ty, th = int(3 * scale), bar_h - int(6 * scale)
-        last_right = None
-        for i, t in enumerate(st["tabs"]):
+        rad = int(8 * scale)                     # 顶角半径(Chrome ≈ 8)
+        foot = max(2, int(4 * scale))            # 标签底部"脚"的外扩量
+        n = len(st["tabs"])
+        act_id, hov_id = st["active"], st["hover_tab"]
+        pen_sep = Pen(st["sep"], 1.0)
+
+        # ---- 1) 分隔线: 只在"两侧都不是激活/悬停"的相邻标签之间(Chrome 同款) ----
+        for i in range(1, min(n, len(boxes))):
+            a, c = st["tabs"][i - 1], st["tabs"][i]
+            if a["id"] == act_id or c["id"] == act_id or hov_id in (a["id"], c["id"]):
+                continue
+            x = float(boxes[i][0])
+            g.DrawLine(pen_sep, x, float(tab_top + int(8 * scale)),
+                       x, float(bar_h - int(9 * scale)))
+
+        # ---- 2) 标签: 非激活先画, 激活最后画在最上层(它的"脚"要压住左右邻居) ----
+        for i in sorted(range(n), key=lambda k: (st["tabs"][k]["id"] == act_id)):
             if i >= len(boxes):
-                break
+                continue
+            t = st["tabs"][i]
             x, tw = boxes[i]
-            act = (t["id"] == st["active"])
-            hov = (st["hover_tab"] == t["id"] and not act)
-            if not act and last_right is not None:   # 非激活标签之间的细分隔线
-                g.DrawLine(Pen(st["sep"], 1.0),
-                           float(x - int(2 * scale)), float(ty + th * 0.25),
-                           float(x - int(2 * scale)), float(ty + th * 0.75))
-            g.FillPath(SolidBrush(st["tab_active"] if act else (st["tab_hover"] if hov else st["bar"])),
-                       _rounded_path(x, ty, tw, th, rad))
+            act = (t["id"] == act_id)
+            hov = (t["id"] == hov_id and not act)
+            if act:
+                g.FillPath(SolidBrush(st["tab_active"]),
+                           _tab_path(x, tab_top, tw, tab_h, rad, foot))
+            elif hov:
+                # 悬停: 内缩 1px 的"上圆下平"底, 不画脚(脚是激活态专属)
+                g.FillPath(SolidBrush(st["tab_hover"]),
+                           _tab_path(x + int(1 * scale), tab_top,
+                                     max(2, tw - int(2 * scale)), tab_h, rad, 0))
             # v0.3.1.44: 正在往下拖这个标签 → 染强调色, 让用户看得见"再往下就是悬浮窗"
-            # (旧版一点就撕出, 用户根本不知道有拖拽手势; 现在手势变严了, 必须给反馈)
             if st.get("drag_hint") and st.get("drag_tid") == t["id"]:
                 try:
                     ac = st["accent"]
-                    g.FillPath(SolidBrush(Color.FromArgb(64, ac.R, ac.G, ac.B)),
-                               _rounded_path(x, ty, tw, th, rad))
-                    g.DrawPath(Pen(ac, max(1.0, 2.0 * scale)),
-                               _rounded_path(x, ty, tw, th, rad))
+                    dp = _tab_path(x, tab_top, tw, tab_h, rad, foot)
+                    g.FillPath(SolidBrush(Color.FromArgb(64, ac.R, ac.G, ac.B)), dp)
+                    g.DrawPath(Pen(ac, max(1.0, 2.0 * scale)), dp)
                 except Exception:
                     pass
             fg = st["fg_on"] if act else st["fg_off"]
-            close_w = int(20 * scale) if t.get("closable") else int(6 * scale)
-            rect = RectangleF(float(x + int(8 * scale)), float(ty),
-                              float(tw - close_w - int(8 * scale)), float(th))
-            g.DrawString(t.get("title") or "页面", font, SolidBrush(fg), rect, sf)
+            # ---- 站点图标瓦片: 16px 圆角方块 + 首字母(窄标签自动省掉) ----
+            pad = int(10 * scale)
+            tile = int(16 * scale)
+            left = x + pad
+            if tw >= int(104 * scale):
+                fc, letter = _fav(t)
+                ty_ = tab_top + (tab_h - tile) // 2
+                g.FillPath(SolidBrush(fc),
+                           _rounded_path(left, ty_, tile, tile, int(4 * scale)))
+                g.DrawString(letter, fav_font, SolidBrush(Color.White),
+                             RectangleF(float(left), float(ty_), float(tile), float(tile)),
+                             sf_c)
+                left += tile + int(8 * scale)
+            close_w = int(26 * scale) if t.get("closable") else int(4 * scale)
+            right = x + tw - close_w
+            if right - left >= int(6 * scale):
+                g.DrawString(t.get("title") or "页面", font, SolidBrush(fg),
+                             RectangleF(float(left), float(tab_top),
+                                        float(right - left), float(tab_h)), sf)
+            # ---- ✕: 1px 矢量细线 + 圆形悬停底(旧版是 10pt 的"✕"字符, 又粗又虚) ----
             if t.get("closable"):
-                cx = x + tw - close_w
-                g.DrawString("✕", btn_font, SolidBrush(fg),
-                             RectangleF(float(cx), float(ty), float(close_w), float(th)), sf_c)
-            last_right = x + tw
-        # 「+」新建标签按钮(浏览器式): 悬停给底色, 加号本身不变形
+                cr = _close_rect(x, tw)
+                if st.get("hover_close") == t["id"]:
+                    g.FillEllipse(SolidBrush(Color.FromArgb(56, st["bar"].R,
+                                                            st["bar"].G, st["bar"].B)),
+                                  float(cr[0]), float(cr[1]), float(cr[2]), float(cr[3]))
+                cx = cr[0] + cr[2] / 2.0
+                cy = cr[1] + cr[3] / 2.0
+                s = max(3.0, 3.6 * scale)
+                xp = Pen(fg, max(1.0, 1.1 * scale))
+                g.DrawLine(xp, cx - s, cy - s, cx + s, cy + s)
+                g.DrawLine(xp, cx - s, cy + s, cx + s, cy - s)
+
+        # ---- 3) 「+」新建标签: 细线加号 + 圆形悬停底 ----
         ax, ay, aw, ah = _add_rect()
+        acx, acy = ax + aw / 2.0, ay + ah / 2.0
+        arr = min(aw, ah) / 2.0 - 1.0
         if st.get("hover_add"):
-            g.FillPath(SolidBrush(st["tab_hover"]),
-                       _rounded_path(ax, ty, aw, th, rad))
-        g.DrawString("+", btn_font,
-                     SolidBrush(st["fg_on"] if st.get("hover_add") else st["fg_off"]),
-                     RectangleF(float(ax), float(ty), float(aw), float(th)), sf_c)
-        # 右端窗口按钮: ─ □ ✕ —— 白色符号 + 分隔线
-        # (Pen 必须用顶部 import: 函数中段 import 会让前面的分隔线绘制碰到未绑定局部名,
-        #  "点回信息流(激活标签后有非激活标签)"的重绘即爆 UnboundLocalError 整窗异常)
+            g.FillEllipse(SolidBrush(st["tab_hover"]), float(acx - arr), float(acy - arr),
+                          float(arr * 2), float(arr * 2))
+        pp = Pen(st["fg_on"] if st.get("hover_add") else st["fg_off"],
+                 max(1.0, 1.2 * scale))
+        ps = max(4.0, 4.5 * scale)
+        g.DrawLine(pp, acx - ps, acy, acx + ps, acy)
+        g.DrawLine(pp, acx, acy - ps, acx, acy + ps)
+
+        # ---- 4) 右端窗口按钮: 细线矢量图标(旧版用 ─ □ ✕ 文字符号, 粗细不匀、基线乱飘) ----
+        # (Pen 必须用顶部 import: 函数中段 import 会让前面的绘制碰到未绑定局部名)
         bw = BTN_W()
         zx = strip.Width - bw * 3
-        g.DrawLine(Pen(st["sep"], 1.0),
-                   float(zx), float(int(4 * scale)), float(zx), float(bar_h - int(4 * scale)))
-        for i, (name, sym) in enumerate((("min", "─"), ("max", "□"), ("close", "✕"))):
+        is_max = (form.WindowState == WinForms.FormWindowState.Maximized
+                  or fill_state["saved"] is not None)
+        for i, name in enumerate(("min", "max", "close")):
             bx = zx + bw * i
             hov = (st["hover_btn"] == name)
-            if name == "close" and hov:
-                g.FillRectangle(SolidBrush(Color.FromArgb(232, 17, 35)),
-                                float(bx), 0.0, float(bw), float(bar_h))
-            elif hov:
-                g.FillRectangle(SolidBrush(st["tab_hover"]),
-                                float(bx), 0.0, float(bw), float(bar_h))
-            if name == "max" and (form.WindowState == WinForms.FormWindowState.Maximized
-                                  or fill_state["saved"] is not None):
-                # 还原态图标: 两方块右上角部分重叠(前块左下完整, 后块右上被遮)
-                fg = st["fg_on"]
-                s = max(6, int(9 * scale))
-                off = max(2, int(3 * scale))
-                px = int(bx + (bw - s - off) / 2.0)
-                py = int((bar_h - s - off) / 2.0)
-                pen = Pen(fg, max(1.0, 1.4 * scale))
-                g.DrawRectangle(pen, px + off, py, s, s)              # 后块(右上)
-                g.FillRectangle(SolidBrush(st["tab_hover"] if hov else st["bar"]),
-                                px - 1, py + off - 1, s + 2, s + 2)    # 遮后块与前块重叠的线
-                g.DrawRectangle(pen, px, py + off, s, s)              # 前块(左下)
+            bg = st["bar"]
+            if hov:
+                bg = Color.FromArgb(232, 17, 35) if name == "close" else st["tab_hover"]
+                g.FillRectangle(SolidBrush(bg), float(bx), 0.0, float(bw), float(bar_h))
+            fg = Color.White if (hov and name == "close") else st["fg_on"]
+            cx, cy = bx + bw / 2.0, bar_h / 2.0
+            s = max(4.0, 5.0 * scale)
+            wp = Pen(fg, max(1.0, 1.0 * scale))
+            if name == "min":
+                g.DrawLine(wp, cx - s, cy, cx + s, cy)
+            elif name == "max":
+                if is_max:
+                    # 还原图标: 两方块右上角部分重叠(前块左下完整, 后块右上被遮)
+                    s2, off = max(3.0, 4.0 * scale), max(2.0, 2.4 * scale)
+                    x0, y0 = cx - s2 - off / 2.0, cy - s2 - off / 2.0
+                    g.DrawRectangle(wp, x0 + off, y0, s2 * 2, s2 * 2)   # 后块(右上)
+                    g.FillRectangle(SolidBrush(bg), float(x0 - 1), float(y0 + off - 1),
+                                    float(s2 * 2 + 2), float(s2 * 2 + 2))   # 遮重叠线
+                    g.DrawRectangle(wp, x0, y0 + off, s2 * 2, s2 * 2)   # 前块(左下)
+                else:
+                    g.DrawRectangle(wp, cx - s, cy - s, s * 2, s * 2)
             else:
-                g.DrawString(sym, btn_font, SolidBrush(st["fg_on"]),
-                             RectangleF(float(bx), 0.0, float(bw), float(bar_h)), sf_c)
+                g.DrawLine(wp, cx - s, cy - s, cx + s, cy + s)
+                g.DrawLine(wp, cx - s, cy + s, cx + s, cy - s)
+
         # 悬浮窗拖到标签栏上方 → 整条染色 + 强调色描边(松手即合并成标签页)
         if st.get("drop_hi"):
             try:
@@ -227,7 +351,7 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
             except Exception:
                 pass
 
-    BTN_W = lambda: int(36 * scale)   # ─ □ ✕ 窗口按钮宽
+    BTN_W = lambda: int(46 * scale)   # ─ □ ✕ 窗口按钮宽(Chrome 是 46 逻辑像素)
 
     def _btn_zone(x):
         return x >= strip.Width - BTN_W() * 3
@@ -309,6 +433,20 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
             bx, tw = boxes[i]
             if bx <= x <= bx + tw and 0 <= yv <= bar_h:
                 return st["tabs"][i]
+        return None
+
+    def _hit_close(x, yv):
+        """指针是否落在某个标签的 ✕ 圆钮上 → 返回标签 id(画圆形悬停底用)。"""
+        boxes = _layout(strip.Width)
+        for i, t in enumerate(st["tabs"]):
+            if i >= len(boxes):
+                break
+            bx, tw = boxes[i]
+            if not t.get("closable") or not (bx <= x <= bx + tw):
+                continue
+            cx, cy, cw, chh = _close_rect(bx, tw)
+            if cx <= x <= cx + cw and cy <= yv <= cy + chh:
+                return t["id"]
         return None
 
     def _nc_drag(ht):
@@ -485,6 +623,10 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
         if hid != st["hover_tab"]:
             st["hover_tab"] = hid
             strip.Invalidate()
+        hc = _hit_close(args.X, args.Y)
+        if hc != st.get("hover_close"):
+            st["hover_close"] = hc
+            strip.Invalidate()
 
     def on_mouse_up(_sender, args):
         """松手收尾: 放开鼠标捕获 + 清掉拖拽可视态。"""
@@ -507,6 +649,9 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
             ch = True
         if st["hover_tab"] is not None:
             st["hover_tab"] = None
+            ch = True
+        if st.get("hover_close") is not None:
+            st["hover_close"] = None
             ch = True
         if st["hover_add"]:
             st["hover_add"] = False
@@ -539,15 +684,13 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
             return
         t = _hit_tab(args.X, args.Y)
         if t is not None:
-            boxes = _layout(strip.Width)
-            for i, tt in enumerate(st["tabs"]):
-                if tt is t and i < len(boxes):
-                    x, tw = boxes[i]
-                    if t.get("closable") and args.X > x + tw - int(24 * scale):
-                        api.tab_close(t["id"])
-                    else:
-                        api.tab_switch(t["id"])
-                    return
+            # ✕ 的命中区与绘制区共用 _close_rect, 不再各写一份宽度(旧版两处 24/20 不一致)
+            if t.get("closable") and _hit_close(args.X, args.Y) == t["id"]:
+                st["hover_close"] = None
+                api.tab_close(t["id"])
+            else:
+                api.tab_switch(t["id"])
+            return
 
     def on_capture_changed(_sender, _args):
         """捕获被意外抢走(Alt+Tab / 系统弹窗 / 别的窗口抢焦点) → 拖拽状态必须复位。
@@ -578,6 +721,12 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
         except Exception:
             pass
 
+    def _mix(c, base, k):
+        """把 c 按 k 比例混向 base(0=base, 1=c)。"""
+        return Color.FromArgb(int(base.R + (c.R - base.R) * k),
+                              int(base.G + (c.G - base.G) * k),
+                              int(base.B + (c.B - base.B) * k))
+
     def set_bg_scheme(raw):
         """页面推送的标签栏配色方案(app.js bgStripScheme: 栏底/激活/悬停/文字/分隔线,
         深浅文字极性由页面按深度算好), 这里只解析上色; 贴边热区面板同步吃栏底色。"""
@@ -595,10 +744,13 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
 
             st["bar"] = _c("bar", st["bar"])
             st["tab_active"] = _c("active", st["tab_active"])
-            st["tab_hover"] = _c("hover", st["tab_hover"])
             st["fg_on"] = _c("fgon", st["fg_on"])
             st["fg_off"] = _c("fgoff", st["fg_off"])
             st["sep"] = _c("sep", st["sep"])
+            # ★ 悬停底色不用页面给的 hover, 而是"栏底 → 激活"之间取中点。
+            #   页面给的 hover 在深色下比 active 还亮(L15 vs L11), 悬停一个非激活标签
+            #   会比激活标签更显眼 —— 层次整个反了。中点保证: 栏底 < 悬停 < 激活。
+            st["tab_hover"] = _mix(st["tab_active"], st["bar"], 0.5)
 
             def apply():
                 try:
@@ -766,4 +918,9 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
     update.highlight = highlight      # 悬浮窗拖拽落点提示(shell_float 拖拽期间调用)
     update.fill_toggle = _toggle_max   # 窗口化全屏开关(测试可直调; app_window 只用调用签名)
     update.bar_h = bar_h               # 标签栏逻辑高度(app_window 定位导航工具栏用)
+    # 视觉回归用出口(与 shell_ai 暴露 st 的做法一致): _shot_chrome.py 直接驱动这几项,
+    # 不依赖真鼠标/真窗口, 就能把顶栏渲染成图做肉眼与像素级比对。
+    update.st = st
+    update.strip = strip
+    update.set_scheme = set_bg_scheme
     return update

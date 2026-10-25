@@ -638,7 +638,7 @@ def install_bookmarks(win, api, top=0, store=None, on_height=None, bg_getter=Non
     store = store or BookmarkStore()
     icons = icons or FaviconCache()
     st = {
-        "bar": Color.FromArgb(10, 12, 16),
+        "bar": Color.FromArgb(22, 25, 32),
         "hover": Color.FromArgb(38, 43, 54),
         "fg": Color.FromArgb(226, 230, 238),
         "fg_dim": Color.FromArgb(118, 124, 136),
@@ -1004,7 +1004,9 @@ def install_bookmarks(win, api, top=0, store=None, on_height=None, bg_getter=Non
                                           int(v[5:7], 16))
                 return fallback
 
-            st["bar"] = _c("bar", st["bar"])
+            # 与导航栏同一块"底板": 取 active(激活标签色)而不是 bar, 否则收藏栏会在
+            # 导航栏下面接一条更深的色带, 顶栏看起来像被切开
+            st["bar"] = _c("active", st["bar"])
             st["hover"] = _c("hover", st["hover"])
             st["fg"] = _c("fgon", st["fg"])
             st["fg_dim"] = _c("fgoff", st["fg_dim"])

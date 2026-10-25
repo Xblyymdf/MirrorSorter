@@ -93,12 +93,16 @@ def consts(code, out=None):
     """模块里出现过的所有标识符/字面量。
 
     函数名和局部变量名**不在** co_consts 里：`def foo()` 的名字是 code.co_name，
-    被引用的全局名在 co_names。只扫 co_consts 会把 `install_ai_panel` 误判成没打进去。
+    被引用的全局名在 co_names，**局部变量在 co_varnames**；被内层函数引用的局部变量
+    会变成闭包变量, 落在 **co_cellvars**（`FAV_COLORS` 就是这样 —— 只查 varnames 会
+    把"明明打进去了"误判成 FAIL）。
     """
     if out is None:
         out = []
     out.append(code.co_name)
     out.extend(code.co_names)
+    out.extend(code.co_varnames)
+    out.extend(code.co_cellvars)
     for c in code.co_consts:
         if isinstance(c, str):
             out.append(c)
@@ -124,6 +128,26 @@ if "app" in pyz_mods:
     for kw in ("set_browser_bridge", "_AGENT_BROWSER_TOOLS", "api/panel/state",
                "panel.html"):
         ok("app 字节码含 " + kw, has(c, kw))
+
+# ---------- 6. 顶栏视觉重做（v0.4.43dsk）真的进了包 ----------
+# 这两个模块是 app_window 顶层 import 的，不会漏；但**改完没重新打包**是常见坑
+# （PyInstaller 在 Analysis 阶段采集源码，打包中途改文件不会进包）。
+for mod, kws in (("shell_tabstrip", ("install_strip", "_tab_path", "_fav", "_mix",
+                                     "FAV_COLORS", "hover_close", "set_bg_scheme")),
+                 ("shell_navbar", ("install_navbar", "_pill_rect", "_recalc_omni",
+                                   "_circle", "NAV_H"))):
+    if mod in pyz_mods:
+        c = pyz.extract(mod)
+        for kw in kws:
+            ok("%s 字节码含 %s" % (mod, kw), has(c, kw))
+    else:
+        ok("PYZ 含 " + mod, False)
+# index.html 里的版本页脚必须已经是新版（防止打了旧 web/）
+hit = [n for n in names if n.replace("\\", "/").endswith("web/index.html")]
+if hit:
+    html = car.extract(hit[0]).decode("utf-8", "replace")
+    ok("归档 web/index.html 页脚已是 v0.4.43dsk", "v0.4.43dsk" in html
+       and "v0.4.42dsk" not in html)
 
 print("\nRESULT: %s" % ("PASS(%d)" % PASS if not FAILS else "FAIL(%d): %s" % (len(FAILS), " | ".join(FAILS))))
 sys.exit(1 if FAILS else 0)
