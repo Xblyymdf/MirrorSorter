@@ -16,6 +16,7 @@
 
 开源依赖: pywebview (MIT, github.com/r0x0r/pywebview), Windows 走 WebView2 运行时。
 """
+import io
 import os
 import re
 import subprocess
@@ -1365,10 +1366,21 @@ def _e2e_panel_shot(form, ctrl, path):
         return "decode:%r" % (e,)
 
 
+def _probe_dir():
+    """探针产物目录: 源码态用工程目录; 打包态用 exe 所在目录。
+
+    frozen 下 `__file__` 指向 _MEIPASS(临时解压目录), 退出就被删 —— 日志和截图
+    必须在跑完之后还能看, 所以按 sys.executable 落盘。
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "build", "probe")
+    return os.path.join(HERE, "build", "probe")
+
+
 def _e2e_ai_panel(api, panel, pages, url):
     """真机自测: 开一个标签页 → 面板停靠/让位 → 网页快照/查找/填写/滚动 → 开合。
 
-    只在 `--e2e-ai <url>` 下跑, 结果落 build/probe/ai_panel_e2e.log。
+    只在 `--e2e-ai <url>` 下跑, 结果落 build/probe/ai_panel_e2e.log(打包态在 exe 同级)。
     为什么必须真机: WebView2 的 ExecuteScriptAsync 只有在真控件里才有意义(控件创建、
     Task 完成回调、UI 线程 marshalling 全是原生行为, 单测替不了)。
     """
@@ -1468,7 +1480,7 @@ def _e2e_ai_panel(api, panel, pages, url):
             ok("16 松手后按新宽度重新对齐(inset 同步)", int(geo2.get("inset") or 0) == 380 + 6,
                str(geo2))
             # 面板本身的真实渲染(WebView2 里 380/300 两档, 供人眼检查窄面板版式)
-            probe = os.path.join(HERE, "build", "probe")
+            probe = _probe_dir()
             pctrl = panel.st.get("ctrl")
             panel.st["w"] = 380
             panel.layout()
@@ -1537,13 +1549,25 @@ def _e2e_ai_panel(api, panel, pages, url):
             ok("20 面板状态", False, repr(e)[:120])
     finally:
         try:
-            os.makedirs(os.path.join(HERE, "build", "probe"), exist_ok=True)
-            with io.open(os.path.join(HERE, "build", "probe", "ai_panel_e2e.log"),
+            # 目录和文件必须用同一个根: frozen 下 HERE 是 _MEIPASS(临时), 建在那儿
+            # 再往 exe 同级写就会因目录不存在而静默失败 —— 打包态又没有 stdout,
+            # 日志一丢就彻底没有证据了。
+            os.makedirs(_probe_dir(), exist_ok=True)
+            with io.open(os.path.join(_probe_dir(), "ai_panel_e2e.log"),
                          "w", encoding="utf-8") as f:
                 f.write("\n".join(lines) + "\n")
+        except Exception as e:
+            # 别静默吞: 之前这里 except: pass 把 "io 没 import" 的 NameError 藏了,
+            # 结果日志从来没写成功过, 却以为写好了。
+            print("[ai-e2e] 日志落盘失败: %r" % (e,))
+        say("RESULT: %s" % ("FAIL(%d)" % fails[0] if fails[0] else "PASS"))
+        # RESULT 行在写文件之后才产生, 补写一次, 否则日志里看不到最终结论
+        try:
+            with io.open(os.path.join(_probe_dir(), "ai_panel_e2e.log"),
+                         "a", encoding="utf-8") as f:
+                f.write("RESULT: %s\n" % ("FAIL(%d)" % fails[0] if fails[0] else "PASS"))
         except Exception:
             pass
-        say("RESULT: %s" % ("FAIL(%d)" % fails[0] if fails[0] else "PASS"))
     return fails[0]
 
 

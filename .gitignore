@@ -143,3 +143,6 @@ desktop/_vis/fasttext_demo/*.json
 # v0.4.42dsk: 内置浏览器右侧 AI 面板。_test_ai_page_js.js 用 node 沙盒跑注入网页的
 # 助手脚本(假 DOM + 断言真的点了哪个元素/发了哪些请求), 静态断言证明不了行为。
 !desktop/_test_ai_page_js.js
+# v0.4.42dsk: 面板归档层验收(局部 import 的 shell_ai 是否进 PYZ / panel.* 字节是否一致)。
+# 默认取 dist 下最新的 exe, 每版都能跑, 不用改。
+!desktop/_verify_exe_panel.py
