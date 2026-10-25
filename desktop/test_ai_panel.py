@@ -410,14 +410,35 @@ for f, need in (("web/panel.html", 'id="msgs"'), ("web/panel.css", "--accent"),
 js = src("web/app.js")
 split = js[js.find('const sp = e.target.closest(".splitter")'):
            js.find('$("#toggleLeft").onclick')]
-check("61 分栏拖动: 每帧只写宽度变量(requestAnimationFrame + applySplitOnly)",
-      "requestAnimationFrame(() => { splitRaf = 0; applySplitOnly(); })" in split
-      and "applySplitOnly();" in split)
-check("62 分栏拖动: 拖动中不再逐帧调 applyPrefs(卡顿根因)",
-      split.count("applyPrefs()") == 1 and "applyPrefs();     // 收尾" in split, str(split.count("applyPrefs()")))
+check("61 分栏拖动: 拖动中只动预览线(translate3d), 一次都不改真实宽度变量",
+      "splitGhost" in split and "translate3d" in split
+      and split.count("setProperty") == 0, str(split.count("setProperty")))
+check("62 分栏拖动: 拖动中不调 applyPrefs, 松手才跑唯一一次(卡顿根因)",
+      split.count("applyPrefs()") == 1
+      and "applyPrefs();     // 收尾: 唯一一次真正改宽度" in split,
+      str(split.count("applyPrefs()")))
 check("63 分栏拖动: 收尾才落库一次", split.count("savePrefs()") == 1)
 check("64 拖动期间关掉中间栏指针事件(避免 hover 抖动)",
       "body.splitting #center" in src("web/style.css"))
+_scss = src("web/style.css")
+check("64b 预览线走合成层(will-change/transform, 不触发布局重绘)",
+      "#splitGhost" in _scss and "will-change:transform" in _scss
+      and "pointer-events:none" in _scss)
+# 面板侧同理: 拖动中只挪那条线, 不许每帧 SetBounds WebView2
+_sai = src("shell_ai.py")
+_dm = _sai[_sai.find("def _drag_move"):_sai.find("def _move_split_only")]
+check("64c 面板拖动: _drag_move 只挪分栏线, 不碰标签控件",
+      "_move_split_only(w)" in _dm and "layout()" not in _dm
+      and "SetBounds" not in _dm, _dm.count("layout()"))
+_dms = _sai[_sai.find("def _move_split_only"):_sai.find("def _drag_up")]
+# 只许动分栏自己: 出现标签控件/面板控件的 SetBounds 就是又把 WebView2 拖进重排了
+check("64d 面板拖动: _move_split_only 只 SetBounds 分栏自己",
+      'self.st["split"].SetBounds' in _dms
+      and "c.SetBounds" not in _dms and "vis.SetBounds" not in _dms
+      and 'self.st.get("ctrl")' not in _dms)
+_du = _sai[_sai.find("def _drag_up"):_sai.find("对外状态")]
+check("64e 面板拖动: 松手才 layout() 一次性对齐 + 落库",
+      "self.layout()" in _du and 'sset("ui_ai_panel_w"' in _du)
 
 # 65/66 是 300px 窄面板真机截图里看出来的两处走形, 静态断言兜住别回归
 pcss = src("web/panel.css")

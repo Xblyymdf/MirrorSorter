@@ -3616,23 +3616,19 @@
   };
 
   /* ================= 分栏拖动 / 开关 ================= */
-  // 拖动时**只改两根宽度变量**。旧实现每帧调 applyPrefs(), 而它里面做的事跟拖拽毫无关系:
-  //   · applyBg() 往 documentElement 上重写 6 个颜色变量 → 全文档样式失效(几百张卡片一起重算);
-  //   · applyListCols() 读 clientWidth → 每帧一次强制同步重排;
-  //   · renderBgRow()/paintRanges()/applyStatCard() 各自碰 DOM。
-  // 体感就是"拖 AI 对话框特别卡"。现在: 每帧一次 rAF, 只写 2 个 CSS 变量 + 2 个 class;
-  // 松手才跑一次 applyPrefs() 把其余样式补齐。拖动期间还关掉中间栏的 pointer-events,
-  // 免得鼠标扫过卡片时一路触发 hover 状态。
-  let splitRaf = 0;
-  function applySplitOnly() {
-    const html = document.documentElement, shell = $("#shell");
-    shell.classList.toggle("le", !!prefs.le);
-    shell.classList.toggle("re", !!prefs.re);
-    html.style.setProperty("--leftW", (prefs.le ? 0 : prefs.leftW) + "px");
-    html.style.setProperty("--rightW", (prefs.re ? 0 : prefs.rightW) + "px");
-    const tl = $("#toggleLeft"), tr = $("#toggleRight");
-    if (tl) tl.classList.toggle("collapsed", !!prefs.le);
-    if (tr) tr.classList.toggle("collapsed", !!prefs.re);
+  // ★ 拖动期间**一次都不改真实宽度**。
+  // 之前(哪怕加了 rAF 合帧)每帧仍然在改 --leftW/--rightW → #shell 的 grid 列宽跟着变 →
+  // 中间栏几百张卡片重新折行、封面图重绘, 有 canvas/视频时还要按新尺寸重画一遍,
+  // 一次拖动就是几十次全量重排。体感就是"拖一下卡一下"。
+  // 现在拖动只移动一条 fixed 定位的预览线: transform 走合成层, 不触发布局也不触发重绘;
+  // 松手才把宽度一次性落地, 并且只跑一次 applyPrefs()。
+  let splitGhost = null;
+  function splitGhostEl() {
+    if (splitGhost && splitGhost.isConnected) return splitGhost;
+    splitGhost = document.createElement("div");
+    splitGhost.id = "splitGhost";
+    document.body.appendChild(splitGhost);
+    return splitGhost;
   }
   document.addEventListener("pointerdown", (e) => {
     const sp = e.target.closest(".splitter");
@@ -3640,29 +3636,35 @@
     e.preventDefault();
     const which = sp.dataset.split;
     const x0 = e.clientX;
+    const rect0 = sp.getBoundingClientRect();
     const w0 = which === "left" ? (prefs.le ? 0 : prefs.leftW) : (prefs.re ? 0 : prefs.rightW);
     // ★ 右栏在屏幕右侧，它的「变宽」方向和鼠标位移是**相反**的：
     //   往左拖(dx<0) → 右栏变宽；往右拖(dx>0) → 右栏变窄。
-    //   之前两栏共用 w0 + dx，右栏就是反的（往左拉反而缩、往右拉反而展）。
     const sign = which === "left" ? 1 : -1;
+    const LO = 170, HI = which === "left" ? 430 : 460;
+    let target = w0;          // 松手后会生效的宽度; 拖动中只用来算线位置
+    let collapse = false;     // 拖到很窄 → 松手折叠
+    const g = splitGhostEl();
+    g.classList.add("on");
+    g.classList.toggle("collapsing", false);
+    g.style.transform = "translate3d(" + Math.round(rect0.left) + "px,0,0)";
     document.body.classList.add("splitting");
     const move = (ev) => {
       const raw = w0 + sign * (ev.clientX - x0);
-      if (which === "left") {
-        if (raw < 90) { prefs.le = true; }
-        else { prefs.le = false; prefs.leftW = Math.max(170, Math.min(430, raw)); }
-      } else {
-        if (raw < 90) { prefs.re = true; }
-        else { prefs.re = false; prefs.rightW = Math.max(170, Math.min(460, raw)); }
-      }
-      if (!splitRaf) splitRaf = requestAnimationFrame(() => { splitRaf = 0; applySplitOnly(); });
+      collapse = raw < 90;
+      target = collapse ? 0 : Math.max(LO, Math.min(HI, raw));
+      // 线的位置 = 分隔条初始位置 + (目标宽度 - 初始宽度) * 方向; 被 clamp 住不会飘出屏幕
+      g.style.transform = "translate3d(" + Math.round(rect0.left + (target - w0) * sign) + "px,0,0)";
+      g.classList.toggle("collapsing", collapse);
     };
     const up = () => {
       document.removeEventListener("pointermove", move);
       document.removeEventListener("pointerup", up);
-      if (splitRaf) { cancelAnimationFrame(splitRaf); splitRaf = 0; }
       document.body.classList.remove("splitting");
-      applyPrefs();     // 收尾: 一次性补齐底色变量/色卡/列数/按钮文案
+      g.classList.remove("on", "collapsing");
+      if (which === "left") { prefs.le = collapse; if (!collapse) prefs.leftW = target; }
+      else { prefs.re = collapse; if (!collapse) prefs.rightW = target; }
+      applyPrefs();     // 收尾: 唯一一次真正改宽度, 并补齐底色变量/色卡/列数/按钮文案
       savePrefs();
     };
     document.addEventListener("pointermove", move);

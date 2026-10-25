@@ -963,6 +963,7 @@ def main(argv=None):
             e2e_ai_url = argv[argv.index("--e2e-ai") + 1]
         except IndexError:
             e2e_ai_url = None
+    e2e_split = "--e2e-split" in argv   # 测试钩子: 量化拖动分栏时的布局/重绘次数
     e2e_float_resize_url = None
     if "--e2e-float-resize" in argv:  # 测试钩子: 真鼠标消息驱动悬浮窗八向缩放
         try:
@@ -996,7 +997,7 @@ def main(argv=None):
         return 0
     return shell_main(e2e_url=e2e_url, e2e_float_url=e2e_float_url,
                       e2e_float_resize_url=e2e_float_resize_url,
-                      e2e_ai_url=e2e_ai_url)
+                      e2e_ai_url=e2e_ai_url, e2e_split=e2e_split)
 
 
 def _install_mouse_side_buttons(api, win):
@@ -1366,6 +1367,145 @@ def _e2e_panel_shot(form, ctrl, path):
         return "decode:%r" % (e,)
 
 
+def _e2e_split_perf(form, ctrl):
+    """量化: 拖动左栏分栏 30 帧, 中间内容区到底被 resize 了几次。
+
+    "拖一下卡一下"的机制是每帧改 --leftW → #shell 的 grid 列宽变 → #center 宽度变 →
+    里面几百张卡片重新折行、封面图重绘、有 canvas/视频时还要按新尺寸重画。
+    所以最贴切的指标不是"布局耗时", 而是**内容区尺寸变了几次**: 用 ResizeObserver 数,
+    拖动全程应该是 0 次(只有松手那一次)。
+
+    (WebView2 的 CDP 里 Performance.getMetrics 返回空数组, 拿不到 LayoutCount,
+     所以走页面内 ResizeObserver —— 语义还更准。)
+
+    只在 `--e2e-split` 下跑。
+    """
+    import json as _json
+    lines, fails = [], [0]
+
+    def say(m):
+        lines.append(str(m))
+        print("[e2e-split] " + str(m))
+
+    def ok(name, cond, extra=""):
+        if not cond:
+            fails[0] += 1
+        say("%s  %s%s" % ("PASS" if cond else "FAIL", name,
+                          ("  " + str(extra)) if extra else ""))
+
+    def ev(expr, timeout=40.0):
+        r = _e2e_panel_cdp(form, ctrl, "Runtime.evaluate",
+                           _json.dumps({"expression": expr, "returnByValue": True,
+                                        "awaitPromise": True}), timeout=timeout)
+        try:
+            return (_json.loads(r).get("result") or {}).get("value")
+        except Exception:
+            return None
+
+    RAF = "await new Promise(function(k){requestAnimationFrame(k);});"
+    FIND_SPLIT = ('(function(){var s=document.querySelector(".splitter[data-split=left]");'
+                  'if(!s)return null;var r=s.getBoundingClientRect();'
+                  'if(r.width<1||r.height<1)return null;'
+                  'return {x:r.left+r.width/2,y:Math.round(innerHeight/2)};})()')
+
+    try:
+        ok("0 拿到主界面 WebView2 控件", ctrl is not None, ctrl)
+        if ctrl is None:
+            return fails[0]
+        # 主界面刚 show 出来时页面可能还在加载, 轮询等它出现(冷启动可能要十几秒)
+        box = None
+        for _ in range(40):
+            box = ev(FIND_SPLIT, timeout=10.0)
+            if isinstance(box, dict) and box.get("x") is not None:
+                break
+            time.sleep(0.5)
+        ok("1 找得到左栏分栏热区", isinstance(box, dict) and box.get("x") is not None, box)
+        if not isinstance(box, dict):
+            return fails[0]
+        lw0 = (ev("getComputedStyle(document.documentElement)"
+                  ".getPropertyValue('--leftW')") or "").strip()
+        ok("2 起始宽度可读", lw0.endswith("px"), lw0)
+
+        # ---- 被测: 真实拖动 30 帧(合成 PointerEvent, 每次 move 之间让出一帧) ----
+        DRAG_JS = ('(async function(){'
+                   'var c=document.getElementById("center");'
+                   'var n=0, ro=new ResizeObserver(function(){n++;}); ro.observe(c);'
+                   + RAF + RAF +    # observe() 必然先报一次初始尺寸; 它排在 rAF 之后,
+                   'n=0;'           # 所以要等两帧再清零, 否则会把初始回调算进来
+                   'var sp=document.querySelector(".splitter[data-split=left]");'
+                   'var r=sp.getBoundingClientRect();'
+                   'var x=r.left+r.width/2, y=Math.round(innerHeight/2);'
+                   'function pe(t,cx){return new PointerEvent(t,{bubbles:true,cancelable:true,'
+                   'clientX:cx,clientY:y,button:0,buttons:t==="pointerup"?0:1,pointerId:1,'
+                   'pointerType:"mouse",isPrimary:true});}'
+                   'var out={};'
+                   'sp.dispatchEvent(pe("pointerdown",x));'
+                   + RAF +
+                   'for(var i=1;i<=30;i++){'
+                   'document.dispatchEvent(pe("pointermove",x+i*3));'
+                   + RAF +
+                   'if(i===15){var g=document.getElementById("splitGhost");'
+                   'out.midLw=getComputedStyle(document.documentElement)'
+                   '.getPropertyValue("--leftW").trim();'
+                   'out.on=!!(g&&g.classList.contains("on"));'
+                   'out.gx=g?String(g.style.transform):"";}}'
+                   'out.resizesDuring=n;'
+                   'document.dispatchEvent(pe("pointerup",x+90));'
+                   + RAF + RAF +
+                   'out.resizesTotal=n; ro.disconnect();'
+                   'out.lwAfter=getComputedStyle(document.documentElement)'
+                   '.getPropertyValue("--leftW").trim();'
+                   'return out;})()')
+        drag = ev(DRAG_JS) or {}
+        ok("3 拖动中预览线已显示", bool(drag.get("on")) and "translate3d" in str(drag.get("gx")),
+           drag)
+        ok("4 拖动中真实宽度一次都没变(--leftW 保持)", drag.get("midLw") == lw0,
+           "%r vs %r" % (drag.get("midLw"), lw0))
+        ok("5 松手后宽度才落地", str(drag.get("lwAfter") or "").strip() != lw0,
+           "%r -> %r" % (lw0, drag.get("lwAfter")))
+        ok("6 松手后预览线隐藏",
+           ev("(function(){var g=document.getElementById('splitGhost');"
+              "return !g||!g.classList.contains('on');})()", timeout=10.0) is True)
+        n_new = int(drag.get("resizesDuring") or 0)
+        n_tot = int(drag.get("resizesTotal") or 0)
+        ok("7 拖动 30 帧: 内容区一次都没被 resize(卡片不重排/画布不重绘)",
+           n_new == 0, "resize %d 次(拖动中)" % n_new)
+        ok("8 整段(含松手)内容区只 resize 一次", n_tot <= 1, "resize %d 次(全程)" % n_tot)
+
+        # ---- 对照组: 同一套测法, 但每帧真的改 --leftW(旧做法) ----
+        # 没有这组, "0 次" 可能只是测法失效; 旧做法必须炸出几十次才算有判别力。
+        OLD_JS = ('(async function(){'
+                  'var c=document.getElementById("center");'
+                  'var n=0, ro=new ResizeObserver(function(){n++;}); ro.observe(c);'
+                  + RAF + RAF +    # 同样等两帧吃掉初始回调
+                  'n=0;'
+                  'var h=document.documentElement;'
+                  'var w0=parseInt(getComputedStyle(h).getPropertyValue("--leftW"))||238;'
+                  'for(var i=1;i<=30;i++){h.style.setProperty("--leftW",(w0+i*3)+"px");'
+                  + RAF +
+                  '}'
+                  'h.style.setProperty("--leftW",w0+"px");'
+                  + RAF + RAF +
+                  'ro.disconnect(); return n;})()')
+        n_old = int(ev(OLD_JS) or 0)
+        ok("9 对照: 旧做法(每帧改宽度)确实反复 resize 内容区(证明测法有判别力)",
+           n_old >= 20, "resize %d 次" % n_old)
+        ok("10 新实现 vs 旧做法", n_new == 0 and n_old >= 20,
+           "拖动 30 帧: 新 %d 次 / 旧 %d 次" % (n_new, n_old))
+    except Exception as e:
+        ok("异常", False, repr(e)[:200])
+    finally:
+        try:
+            os.makedirs(_probe_dir(), exist_ok=True)
+            with io.open(os.path.join(_probe_dir(), "split_perf_e2e.log"),
+                         "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        except Exception as e:
+            print("[e2e-split] 日志落盘失败: %r" % (e,))
+        say("RESULT: %s" % ("FAIL(%d)" % fails[0] if fails[0] else "PASS"))
+    return fails[0]
+
+
 def _probe_dir():
     """探针产物目录: 源码态用工程目录; 打包态用 exe 所在目录。
 
@@ -1467,17 +1607,21 @@ def _e2e_ai_panel(api, panel, pages, url):
             ok("14 面板上沿与网页区对齐(让开标签栏/导航栏)",
                abs(int(pw.Location.Y) - int(geo.get("top") or 0)) <= 1,
                "y=%s top=%s" % (int(pw.Location.Y), geo.get("top")))
-            # 拖动: 直接调内部摆位(模拟一帧), 再松手对齐
-            panel.st["w"] = 460
-            panel._place_live(460)
+            # 拖动: 只挪那条线, 网页区**不该动** —— 这是"拖面板不卡"的核心
+            # (以前每帧 SetBounds WebView2, 每帧触发整页重排)
+            panel.st["drag"] = {"x": 0, "w": 380}
+            panel.st["ghost_w"] = 460
+            panel._move_split_only(460)
             time.sleep(0.3)
-            ok("15 改宽度后网页区跟着缩",
-               abs(int(c.Size.Width) - (W - 460 - 6)) <= 2, int(c.Size.Width))
-            panel.st["w"] = 380
+            ok("15 拖动中只挪分栏线, 网页区尺寸不变(不触发 WebView2 重排)",
+               abs(int(c.Size.Width) - (W - 380 - 6)) <= 2, int(c.Size.Width))
+            ok("15b 拖动中分栏线已跟到目标位置",
+               abs(int(sp.Location.X) - (W - 460 - 6)) <= 2, int(sp.Location.X))
+            panel.st["ghost_w"] = 380
             panel._drag_up(None, None)
             time.sleep(0.6)
             geo2 = pages.geometry()
-            ok("16 松手后按新宽度重新对齐(inset 同步)", int(geo2.get("inset") or 0) == 380 + 6,
+            ok("16 松手后才按新宽度重新对齐(inset 同步)", int(geo2.get("inset") or 0) == 380 + 6,
                str(geo2))
             # 面板本身的真实渲染(WebView2 里 380/300 两档, 供人眼检查窄面板版式)
             probe = _probe_dir()
@@ -1738,7 +1882,7 @@ def _e2e_drag_to_tabbar(api, tid, say):
 
 
 def shell_main(e2e_url=None, e2e_float_url=None, e2e_float_resize_url=None,
-               e2e_ai_url=None):
+               e2e_ai_url=None, e2e_split=False):
     """窗口壳主流程: 起/复用服务 → WebView2 检测 → 主窗口(含标签页) → 全关后收尾。
 
     e2e_url 仅测试用(_e2e_shell.py): 主窗口就绪后自动走一次 open_in_app 桥调用,
@@ -1958,6 +2102,24 @@ def shell_main(e2e_url=None, e2e_float_url=None, e2e_float_resize_url=None,
             finally:
                 try:
                     time.sleep(1)
+                    win.destroy()
+                except Exception:
+                    pass
+                try:
+                    app.shutdown(server)
+                except Exception:
+                    pass
+                os._exit(0)
+        if e2e_split:
+            # 量化自测: 拖动分栏 30 帧 → 读 Performance 指标(布局/样式重算次数)
+            try:
+                _e2e_split_perf(api._win.native, pages.home_ctrl())
+            except Exception:
+                import traceback
+                traceback.print_exc()
+            finally:
+                try:
+                    time.sleep(0.6)
                     win.destroy()
                 except Exception:
                     pass

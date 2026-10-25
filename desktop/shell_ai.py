@@ -261,6 +261,7 @@ class AIPanel:
                    "fs": False,        # 网页/视频全屏中(整窗让给视频)
                    "tab_ok": False,    # 当前标签是不是网页(信息流标签不显示面板)
                    "ready": False, "laying": False, "drag": None,
+                   "ghost_w": None,    # 拖动中的预览宽度(松手才落到 w)
                    "theme": "dark", "ctrl": None, "split": None}
         self.on_change = None   # 开合变化回调(导航栏按钮高亮)
         self._form = None
@@ -517,6 +518,7 @@ class AIPanel:
             if e.Button != WinForms.MouseButtons.Left:
                 return
             self.st["drag"] = {"x": WinForms.Cursor.Position.X, "w": self.st["w"]}
+            self.st["ghost_w"] = self.st["w"]
             self.st["split"].Capture = True
         except Exception:
             pass
@@ -529,16 +531,21 @@ class AIPanel:
             import System.Windows.Forms as WinForms
             dx = WinForms.Cursor.Position.X - d["x"]
             w = self._clamp_w(d["w"] - dx)
-            if w == self.st["w"]:
+            if w == self.st.get("ghost_w"):
                 return
-            self.st["w"] = w
-            self._place_live(w)
+            self.st["ghost_w"] = w
+            self._move_split_only(w)
         except Exception:
             pass
 
-    def _place_live(self, w):
-        """拖动中的轻量摆位: 只动分栏 + 面板 + 当前可见的标签控件。"""
-        from System.Drawing import Point, Size
+    def _move_split_only(self, w):
+        """拖动中只挪分栏那条线, 面板和标签控件一动不动。
+
+        ★ 以前这里每帧 SetBounds 面板 + 当前标签的 WebView2: 控件尺寸一变, WebView2 就要
+        重新布局整页(视频画布按新尺寸重绘、B站 SPA 还会触发 resize 观察者), 一次拖动
+        就是几十次全量重排 —— 这是"拖面板特别卡"的真正来源。现在拖动全程 WebView2 尺寸
+        不变, 松手才 layout() 一次性对齐。
+        """
         form = self._form
         if form is None:
             return
@@ -550,17 +557,6 @@ class AIPanel:
             return   # 最小化时客户区是 0, 别把控件摆到负坐标
         try:
             self.st["split"].SetBounds(W - w - SPLIT_W, top, SPLIT_W, max(1, H - top))
-            c = self.st.get("ctrl")
-            if c is not None:
-                c.SetBounds(W - w, top, max(1, w), max(1, H - top))
-        except Exception:
-            pass
-        # 可见标签页: 立刻跟着缩, 用户才看得到实时效果; 其余标签松手再对齐
-        try:
-            tid = (self.api.active_page() or {}).get("id")
-            vis = self.pages.ctrl(tid) if tid is not None else None
-            if vis is not None and vis is not self.st.get("ctrl"):
-                vis.SetBounds(0, top, max(1, W - w - SPLIT_W), max(1, H - top))
         except Exception:
             pass
 
@@ -573,11 +569,15 @@ class AIPanel:
             self.st["split"].BackColor = self._hover_color(False)
         except Exception:
             pass
+        w = self.st.get("ghost_w")
+        if isinstance(w, int) and w > 0:
+            self.st["w"] = w
+        self.st["ghost_w"] = None
         try:
             app.sset("ui_ai_panel_w", str(int(self.st["w"])))
         except Exception:
             pass
-        self.layout()   # 一次性对齐所有标签控件
+        self.layout()   # 唯一一次真正改宽度: 对齐面板 + 所有标签控件
 
     # ---------------------------------------------------------------- 对外状态
     def is_open(self):

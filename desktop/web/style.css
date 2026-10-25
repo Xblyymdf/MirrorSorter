@@ -127,10 +127,18 @@ input[type=range]:hover::-webkit-slider-thumb,input[type=range]:focus-visible::-
   font-size:12.5px;flex:none}
 .sidehead .ttl{flex:1;font-weight:600;overflow:hidden;text-overflow:ellipsis}
 .splitter{cursor:col-resize;position:relative}
-/* 拖动分栏期间: 关掉中间栏的指针事件 —— 宽度每帧都在变, 鼠标扫过的卡片会一路触发
-   hover 状态(每个都改 class → 又一次重排), 这是"拖动卡"的另一半来源。 */
+/* 拖动分栏期间: 关掉中间栏的指针事件 —— 鼠标扫过的卡片会一路触发 hover 状态
+   (每个都改 class → 又一次重排), 这是"拖动卡"的另一半来源。 */
 body.splitting{cursor:col-resize;user-select:none}
 body.splitting #center,body.splitting .side{pointer-events:none}
+/* 拖动中的预览线: 只改 transform(合成层), 不触发布局/重绘。
+   真实宽度要等松手才落地, 所以中间栏的卡片/canvas 在整个拖动过程里一次都不重排。 */
+#splitGhost{position:fixed;top:0;bottom:0;left:0;width:2px;z-index:9999;
+  background:var(--accent-ink);pointer-events:none;opacity:0;
+  will-change:transform;transition:opacity .08s linear}
+#splitGhost.on{opacity:.95}
+#splitGhost.collapsing{opacity:.5}
+body.splitting .splitter::after{background:transparent}
 .splitter::after{content:"";position:absolute;left:2px;top:0;bottom:0;width:2px;background:var(--line)}
 .splitter:hover::after{background:var(--accent-ink)}
 /* 收起时不画任何线：栏自身边框 + 分割线都隐掉（浅色主题下也不会出现黑线） */
