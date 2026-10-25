@@ -178,6 +178,9 @@ set MIRRORSORTER_WV2_DATA=%TEMP%\msx-ai-e2e-wv2
 set MIRRORSORTER_PORT=18061
 python app_window.py --e2e-ai http://127.0.0.1:18061/panel
 :: 产物: build/probe/panel_w380.png / panel_light.png / panel_w300.png
+:: 打包态跑同一套: 日志和截图落在 exe 同级的 build/probe/ (exe 没有 stdout, 只能看文件)
+
+python _verify_exe_panel.py      :: 归档层: panel.* 字节一致 + shell_ai 真的进了 PYZ
 ```
 
 跑真机 e2e 的三个坑：① 别先 `win.minimize()`（ClientSize 归零，几何全测不出来）；
