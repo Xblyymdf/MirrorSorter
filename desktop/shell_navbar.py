@@ -23,8 +23,12 @@ def nav_h(scale=1.0):
     return max(30, int(NAV_H * scale))
 
 
-def install_navbar(win, api, top=0, bg_getter=None):
+def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
+                   title_getter=None):
     """在窗口 y=top 处安装导航工具栏(须在标签栏 install_strip 之后调用)。
+
+    bookmarks: shell_bookmarks.BookmarkStore —— 给出时在刷新右侧多一个 ☆/★ 按钮
+    (收藏当前网页; 网址为空的信息流固定页上禁用)。title_getter: 取当前标签标题。
     返回 update(url, can_back, can_fwd, loading=False) —— ShellApi 经它推送状态。
     """
     import clr
@@ -59,11 +63,11 @@ def install_navbar(win, api, top=0, bg_getter=None):
         FontFamily("Segoe MDL2 Assets")
         icon_font = Font("Segoe MDL2 Assets", 10.0 * scale)
         glyphs = {"back": "\uE72B", "fwd": "\uE72A", "reload": "\uE72C",
-                  "lock": "\uE72E"}
+                  "lock": "\uE72E", "star": "\uE734", "star_on": "\uE735"}
     except Exception:
         icon_font = Font("Microsoft YaHei", 10.0 * scale)
         glyphs = {"back": "\u2190", "fwd": "\u2192", "reload": "\u21BB",
-                  "lock": ""}
+                  "lock": "", "star": "\u2606", "star_on": "\u2605"}
     tb_font = Font("Microsoft YaHei", 8.5 * scale)
 
     BTN_W, BTN_GAP, MARGIN = (lambda: (int(32 * scale), int(2 * scale), int(6 * scale)))()
@@ -77,14 +81,25 @@ def install_navbar(win, api, top=0, bg_getter=None):
     bar.BackColor = st["bar"]
 
     # ---- 布局几何 ----
+    def _names():
+        ns = ["back", "fwd", "reload"]
+        if bookmarks is not None:
+            ns.append("star")
+        return ns
+
+    def _enabled(name):
+        return {"back": st["back"], "fwd": st["fwd"], "reload": True,
+                "star": bool(st["url"])}[name]
+
     def _btn_rects():
         x, bw, gap = MARGIN, BTN_W, BTN_GAP
         return {n: (x + i * (bw + gap), 0, bw, h)
-                for i, n in enumerate(("back", "fwd", "reload"))}
+                for i, n in enumerate(_names())}
 
     def _tb_rect():
         rects = _btn_rects()
-        end = rects["reload"][0] + rects["reload"][2]
+        last = _names()[-1]
+        end = rects[last][0] + rects[last][2]
         tx = end + (int(22 * scale) if glyphs.get("lock") else int(8 * scale))
         return (tx, int(5 * scale),
                 bar.Width - tx - int(8 * scale), h - int(10 * scale))
@@ -149,16 +164,22 @@ def install_navbar(win, api, top=0, bg_getter=None):
         g.SmoothingMode = SmoothingMode.AntiAlias
         g.Clear(st["bar"])
         rects = _btn_rects()
-        for name in ("back", "fwd", "reload"):
+        for name in _names():
             bx, by, bw, bh = rects[name]
-            enabled = {"back": st["back"], "fwd": st["fwd"],
-                       "reload": True}[name]
+            enabled = _enabled(name)
             hov = (st["hover"] == name and enabled)
             if hov:
                 g.FillPath(SolidBrush(st["hover_bg"]),
                            _rounded_path(bx, int(3 * scale), bw, bh - int(6 * scale),
                                          int(5 * scale)))
-            g.DrawString(glyphs[name], icon_font,
+            glyph = glyphs[name]
+            if name == "star" and enabled:
+                try:
+                    if bookmarks.has(st["url"]):
+                        glyph = glyphs.get("star_on", glyph)
+                except Exception:
+                    pass
+            g.DrawString(glyph, icon_font,
                          SolidBrush(st["fg"] if enabled else st["fg_dim"]),
                          RectangleF(float(bx), float(by), float(bw), float(bh)), sf)
         # 地址栏: 圆角描边 + 左端锁形装饰(有的话)
@@ -180,7 +201,7 @@ def install_navbar(win, api, top=0, bg_getter=None):
 
     def on_mouse_move(_sender, args):
         name = _btn_at(args.X, args.Y)
-        if name and {"back": st["back"], "fwd": st["fwd"], "reload": True}[name] is False:
+        if name and not _enabled(name):
             name = None   # 禁用按钮不给悬停高亮
         if name != st["hover"]:
             st["hover"] = name
@@ -204,17 +225,49 @@ def install_navbar(win, api, top=0, bg_getter=None):
             api.nav_forward()
         elif name == "reload":
             api.nav_reload()
+        elif name == "star" and st["url"]:
+            title = ""
+            if title_getter is not None:
+                try:
+                    title = str(title_getter() or "")
+                except Exception:
+                    title = ""
+            try:
+                bookmarks.toggle(st["url"], title)
+            except Exception:
+                pass
+            bar.Invalidate()
 
-    # ---- 地址栏: 回车导航 / Esc 还原 / 失焦还原 / 聚焦全选 ----
+    # ---- 地址栏: 回车导航 / Esc 还原 / 失焦还原 / 点击聚焦全选 ----
+    st["tb_click"] = False
+
+    def on_tb_down(_s=None, _e=None):
+        # 用户按下地址栏。GotFocus 先于 MouseDown 触发(Control.WmMouseDown 先
+        # Focus() 再 OnMouseDown), 所以全选要延后一拍看这个标记。
+        st["tb_click"] = True
+
     def on_tb_focus(_s=None, _a=None):
         st["edit"] = True
         _apply_tb_fg()
+
+        def _sel_all():
+            # 只给"用户自己点进来"的焦点全选。被动获焦不能全选 —— 隐藏 WebView2 时
+            # Windows 会把焦点临时甩给本框, 否则切标签瞬间网址会闪一下高亮。
+            want = bool(st.get("tb_click"))
+            st["tb_click"] = False
+            if want and tb.Focused:
+                try:
+                    tb.SelectAll()
+                except Exception:
+                    pass
+
         try:
-            tb.SelectAll()
+            tb.BeginInvoke(WinForms.MethodInvoker(_sel_all))
         except Exception:
             pass
 
     def on_tb_blur(_s=None, _a=None):
+        st["tb_click"] = False
         st["edit"] = False
         try:
             tb.Text = st["url"]
@@ -226,7 +279,9 @@ def install_navbar(win, api, top=0, bg_getter=None):
         code = int(e.KeyCode)
         if code == 13:   # Enter
             st["edit"] = False
-            api.nav_goto(str(tb.Text or ""))
+            # 输入的是网址 → 直接去; 是普通文字 → 按「设置 → 常规 → 浏览器」的
+            # 搜索引擎搜索(见 ShellApi.nav_input)
+            api.nav_input(str(tb.Text or ""))
             try:
                 tb.Text = st["url"]
             except Exception:
@@ -242,6 +297,7 @@ def install_navbar(win, api, top=0, bg_getter=None):
             e.Handled = True
             e.SuppressKeyPress = True
 
+    tb.MouseDown += on_tb_down
     tb.GotFocus += on_tb_focus
     tb.LostFocus += on_tb_blur
     tb.KeyDown += on_tb_key
@@ -358,6 +414,21 @@ def install_navbar(win, api, top=0, bg_getter=None):
                 bar.BeginInvoke(WinForms.MethodInvoker(_apply))
             else:
                 _apply()
+        except Exception:
+            pass
+
+    # 收藏增删(收藏栏 ✕ / ☆)后 ☆/★ 状态要立刻重画
+    if bookmarks is not None:
+        def _refresh_star():
+            try:
+                if bar.InvokeRequired:
+                    bar.BeginInvoke(WinForms.MethodInvoker(bar.Invalidate))
+                else:
+                    bar.Invalidate()
+            except Exception:
+                pass
+        try:
+            bookmarks.subscribe(_refresh_star)
         except Exception:
             pass
 

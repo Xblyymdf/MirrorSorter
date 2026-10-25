@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-洞鉴虚明 · 基础版 (v0.4.25dsk)
+洞鉴虚明 · 基础版 (v0.4.38dsk)
 ==========================
 本地运行的洞鉴虚明：读取 B站 内容 → 黑白名单/AI 分拣 → 推荐流 + 数据源状态 + AI 聊天。
 
@@ -70,7 +70,7 @@ if _PORT_ENV:
         PORTS = (int(_PORT_ENV),)
     except Exception:
         pass
-APP_VER = "v0.4.25dsk"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
+APP_VER = "v0.4.38dsk"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
 # 本机回环请求必须绕过系统代理: 用户开着 Clash/V2Ray/公司代理时, 环境里的 http_proxy 会把
 # 127.0.0.1 的请求转给代理服务器, 轻则 502, 重则心跳连续失败 -> 悬浮球探活 2 轮不过自我了断,
 # 表现为「球莫名消失/点定位没反应」。这里建一个禁用代理的 opener 专供本地调用; 外网 API 仍走
@@ -131,7 +131,8 @@ _IO_IMPORTABLE = ({"mode", "ai_base", "ai_key", "ai_model", "ai_enabled", "ai_fu
                    "m_block_mystery_bio", "m_block_lottery",
                    "m_block_empty_space", "m_dm_on",
                    "ft_on", "ft_video", "ft_dm", "ft_cf", "ft_thresh", "ft_labels",
-                   "ft_point", "ft_bthr", "ft_engine"} | _IO_CRED_KEYS) - _IO_STATE_KEYS
+                   "ft_point", "ft_bthr", "ft_engine",
+                   "ui_search_engine", "ui_browser_on_start"} | _IO_CRED_KEYS) - _IO_STATE_KEYS
 # 脱敏导出白名单(白名单, 不是黑名单): 只有列在这里的键才会进「只导出设置」的文件。
 # 将来新增设置项默认**不导出**, 必须显式加进来 —— 避免新字段悄悄把敏感信息带出去。
 _IO_SHAREABLE = frozenset(_IO_IMPORTABLE - _IO_CRED_KEYS)
@@ -882,9 +883,12 @@ def db():
         CREATE TABLE IF NOT EXISTS shown(key TEXT PRIMARY KEY, ts INTEGER);
         CREATE TABLE IF NOT EXISTS item_presentation(key TEXT, request_id TEXT, presented_at INTEGER,
                                                       PRIMARY KEY(key, request_id));
+        CREATE TABLE IF NOT EXISTS item_viewed(key TEXT, rid TEXT, ts INTEGER,
+                                               PRIMARY KEY(key, rid));
         CREATE TABLE IF NOT EXISTS item_exposure_state(key TEXT PRIMARY KEY, run_count INTEGER NOT NULL DEFAULT 0,
                                                        last_presented_at INTEGER NOT NULL DEFAULT 0,
-                                                       cooldown_until INTEGER NOT NULL DEFAULT 0);
+                                                       cooldown_until INTEGER NOT NULL DEFAULT 0,
+                                                       seen_n INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS rebut_saved(id INTEGER PRIMARY KEY AUTOINCREMENT,
                                                source TEXT, seg TEXT, content TEXT, ts INTEGER);
         CREATE TABLE IF NOT EXISTS author_meta(mid TEXT PRIMARY KEY, sign TEXT,
@@ -907,6 +911,14 @@ def db():
             pass
         try:   # 老库补 ablock.mid 列(拉黑名单接口自带 mid, 存下来供弹幕按 hash 就地屏蔽)
             conn.execute("ALTER TABLE ablock ADD COLUMN mid TEXT")
+        except Exception:
+            pass
+        try:   # v0.4.27: 老库补 seen_n(首页累计出现次数; 排序按它降权, 且不随冷却重置)
+            conn.execute("ALTER TABLE item_exposure_state ADD COLUMN seen_n INTEGER NOT NULL DEFAULT 0")
+            try:   # 只在刚补列时回填(至少不小于 run_count); 每个新连接都跑会白扫全表
+                conn.execute("UPDATE item_exposure_state SET seen_n=run_count WHERE seen_n < run_count")
+            except Exception:
+                pass
         except Exception:
             pass
         try:   # 老库补 cid 列(多会话); 旧消息归为默认会话
@@ -1000,6 +1012,10 @@ DEFAULTS = {
     # v0.3.1.34 信息打开方式(桌面窗口壳): 1=点开信息弹独立悬浮窗(默认; 悬浮窗可塞回标签页,
     # 标签页也能拖出成悬浮窗) 0=旧的标签页内打开。仅桌面壳生效, 安卓/浏览器忽略。
     "ui_new_window": "1",
+    # 地址栏 / 内置浏览器「+」新标签使用的搜索引擎(google / baidu / bing)
+    "ui_search_engine": "bing",
+    # 启动软件时自动打开一个浏览器标签页(搜索引擎首页); 默认关
+    "ui_browser_on_start": "0",
     "m_max_age_months": "5",  # 机器筛选: 只显示最近N个月发布的内容(0=不限)
     "ser_max_age_months": "30",  # 严肃模式独立时间窗: 知识/教程内容历史长, 默认30个月(0=不限)
     "m_seen_hours": "6",      # 通用筛选: 已看信息N小时内不重复出现(0=不限)
@@ -1760,6 +1776,8 @@ def search_pushdown():
 # 窗口外照旧由 machine_filter / pref_age_cut 硬拦。平方衰减:
 #   刚发布 1.0 → 窗口过半 0.36 → 窗口末尾 0.15(仍有机会) → 窗外 0。
 _RECENCY_FLOOR = 0.15
+_RECENCY_MAX_DROP = 0.15     # 单批最多裁掉 15%(见 _recency_gate)
+_RECENCY_DROP_BELOW = 0.5    # 只裁梯度概率低于此值的(窗口靠后段), 新鲜的一律不动
 
 
 def _recency_prob(pubdate, window_months, now=None):
@@ -1778,9 +1796,20 @@ def _recency_prob(pubdate, window_months, now=None):
 
 
 def _recency_gate(items):
-    """抓取侧按时效梯度抽样: 同一轮里越老的内容越容易被丢掉。
+    """抓取漏斗末段(时效梯度): 窗外的不算抓回, 窗内的按新鲜度裁掉最老的一小截。
+
     关注/直播/非B站豁免(各有独立机制); 偏好内容用偏好时间窗。
-    全被抽掉时原样放行 —— 不能制造"空抓取"让上层退化成离线示例。"""
+    整批都在窗外时返回空: 这些条目 100% 会被 machine_filter 按同一时间窗拒掉,
+    放行只会白烧 BERT; fetch_pool 会把"抓到了但全过窗"与"网络没返回"分开处理。
+
+    v0.4.36: 旧实现逐条掷骰子按概率丢, 一批里老内容占比高时会丢掉四到六成
+    (实测 quick 41→15 抽 63%, full 408→243 抽 40%), 抓回来的东西一半白抓;
+    而梯度本来只是"窗口内偏新鲜"的排序偏好。现在:
+      · 窗外的(p=0)直接剔除 —— 它们 100% 会被 machine_filter 按同一时间窗拒掉;
+      · 窗内的按 _recency_prob 从最老的开始裁, 单批不超过 _RECENCY_MAX_DROP,
+        且只裁概率已低于 _RECENCY_DROP_BELOW 的那截 —— 新鲜内容一条不动;
+      · 都是确定性操作, 同一批候选留哪些可预期, 不再看运气。
+    这样留下的第一批内容本身就是"最可能过筛"的那批。"""
     try:
         mode = sget("mode")
         win = int(sget("ser_max_age_months") if mode == "严肃"
@@ -1789,20 +1818,29 @@ def _recency_gate(items):
         win = 0
     pref_win = pref_age_months()
     now = time.time()
-    kept, dropped = [], 0
+    kept, aging, dropped = [], [], 0
     for it in items:
         if it.get("platform") != "B站" or it.get("following") or it.get("is_live"):
             kept.append(it)
             continue
         p = _recency_prob(it.get("pubdate") or 0,
                           pref_win if it.get("pref_kw") else win, now)
-        if p < 1.0 and random.random() >= p:
-            dropped += 1
+        if p <= 0.0:
+            dropped += 1   # 窗外: 抓取阶段就不算数(下面 machine_filter 本来也会拦)
             continue
         kept.append(it)
+        if p < _RECENCY_DROP_BELOW:
+            aging.append((p, it))
+    cap = int(len(kept) * _RECENCY_MAX_DROP)
+    if cap and aging:
+        aging.sort(key=lambda t: (t[0], t[1].get("pubdate") or 0))
+        cut = {id(it) for _, it in aging[:cap]}
+        if cut:
+            kept = [it for it in kept if id(it) not in cut]
+            dropped += len(cut)
     if dropped:
         _funnel_bump("recency", dropped)
-    return kept or items
+    return kept
 
 
 # B站直搜最近一次失败的原因(进程内诊断用): 搜索"没有B站视频"时先看这里
@@ -4391,7 +4429,9 @@ def fetch_pool(quick=False, _token=None):
     enabled = enabled_source_ids()
     avail = [s for s in BILI_SOURCES if s[1] in enabled] or BILI_SOURCES
     n = len(avail)
-    per = 2 if quick else SOURCES_PER_FETCH
+    # quick 只取 2 个源时一批原始候选约 40 条, 过时效梯度只剩 ~15 条(实测), 首屏池子
+    # 一页就空。多取两个源仍是同一个并发池发请求, 只多占请求名额, 首屏候选翻倍。
+    per = 4 if quick else SOURCES_PER_FETCH
     if n <= per:                        # 开启的分区很少时, 全部取
         picked = avail[:]
     else:
@@ -4408,6 +4448,19 @@ def fetch_pool(quick=False, _token=None):
 
     # --- 榜单源: 并行抓取(严肃模式跳过: 榜单内容非教程类, 抓了也全被滤掉) ---
     ser_mode = sget("mode") == "严肃"
+    # --- 时效梯度(抓取漏斗入口): 时间窗先下推到源, 窗外的内容根本不该抓回来再丢 ---
+    # 实测 full 一次抓回 380 条, 其中 92 条(24%)发布时间已超出用户窗口 —— 搜索词引擎
+    # 没下推时间窗, 那组 r 中位数是 4.96(窗口的 4.96 倍)。这些条目 100% 会被
+    # machine_filter 按同一时间窗拒掉, 等于白占请求、白算 BERT。
+    # search_items 的 pub_begin 带"窗内为空则回退免窗重取"的兜底, 不会把小众词抓空。
+    _age_cut = 0
+    try:
+        _win_m = int(sget("ser_max_age_months") if ser_mode
+                     else (sget("m_max_age_months") or 0))
+        if _win_m:
+            _age_cut = int(time.time() - _win_m * 30.44 * 86400)
+    except Exception:
+        _age_cut = 0
     tb_future = xhh_future = fol_future = live_future = local_serious_future = None
     serious_search_futures = []
     quick_search_futures = []
@@ -4426,9 +4479,11 @@ def fetch_pool(quick=False, _token=None):
         ser_terms = serious_kw_pool(enabled)[:10]
         # B站严肃关键词搜索 + 允许吧内搜索统一 fan-out, 结果随后统一去重/门禁
         for i, kw in enumerate(ser_terms):
-            serious_search_futures.append(("bili", kw, _SERIOUS_X.submit(search_items, kw, 1)))
+            serious_search_futures.append(("bili", kw, _SERIOUS_X.submit(
+                search_items, kw, 1, pub_begin=_age_cut or None)))
             if i < 4:
-                serious_search_futures.append(("bili", kw, _SERIOUS_X.submit(search_items, kw, 2)))
+                serious_search_futures.append(("bili", kw, _SERIOUS_X.submit(
+                    search_items, kw, 2, pub_begin=_age_cut or None)))
         if tb_weight() > 0:
             for fname in tb_users():
                 for kw in ser_terms[:4]:
@@ -4460,7 +4515,8 @@ def fetch_pool(quick=False, _token=None):
             pool = _SERIOUS_X if ser_mode else _FX
             quick_search_futures = [
                 (kw, pool.submit(search_items, kw, pg,
-                                 order=_push.get("order"), duration=_push.get("duration")))
+                                 order=_push.get("order"), duration=_push.get("duration"),
+                                 pub_begin=_age_cut or None))
                 for kw in picked_kws
                 for pg in ([1, 2] if ser_mode else [random.choice([1, 1, 2])])]
     else:
@@ -4758,7 +4814,10 @@ def fetch_pool(quick=False, _token=None):
         kws = serious_kw_pool(enabled) if ser_mode else pick_kws(6)   # B站供给: 每轮6词(热榜跨构建重叠大, 靠搜索补新)
         _push = search_pushdown()
         jobs2 = [(kw, random.choice([1, 1, 2, 3])) for kw in kws]   # 随机页: 每词独立乱序
-        for (kw, page), res in zip(jobs2, _FX.map(lambda a: search_items(a[0], a[1], order=_push.get("order"), duration=_push.get("duration")), jobs2)):
+        for (kw, page), res in zip(jobs2, _FX.map(
+                lambda a: search_items(a[0], a[1], order=_push.get("order"),
+                                       duration=_push.get("duration"),
+                                       pub_begin=_age_cut or None), jobs2)):
             if len(res) > 1:
                 random.shuffle(res)   # 同一搜索词的结果顺序固定, 打散后再决定谁先进池
             keys = [x["key"] for x in res]
@@ -4827,7 +4886,7 @@ def fetch_pool(quick=False, _token=None):
             if len(_recent_rand) > 6:
                 _recent_rand.pop(0)
             page = random.choice([1, 1, 2, 3, 4, 5, 6, 8, 10, 12, 15])
-            res = search_items(kw, page, **search_pushdown())
+            res = search_items(kw, page, pub_begin=_age_cut or None, **search_pushdown())
             if len(res) > 1:
                 random.shuffle(res)
             made = 0
@@ -4888,8 +4947,14 @@ def fetch_pool(quick=False, _token=None):
             if len(items) >= 300 or batch >= 1:
                 break
 
-    items = _recency_gate(items)   # 时效梯度: 窗口内越新越容易被留下(窗外仍由 machine_filter 硬拦)
+    raw_n = len(items)
+    items = _recency_gate(items)   # 时效梯度: 窗外条目在抓取阶段就剔除
     _fetch_count += 1
+    if not items and raw_n:
+        # 网络有返回但全在时间窗外: 这是"抓到了、没有能用的", 不是离线。
+        # 走离线分支会灌 MOCK_ITEMS 假内容; 返回空列表则照常走本地回流(backlog_items)。
+        return {"ok": True, "offline": False, "source": " + ".join(names),
+                "items": [], "error": ""}
     if not items:
         return {"ok": False, "offline": True, "source": "内置示例(离线)",
                 "items": MOCK_ITEMS, "error": "; ".join(errors)}
@@ -4940,26 +5005,49 @@ def get_feed_raw(force=False):
     return _feed_cache["payload"]
 
 
+_BACKLOG_SCAN = 2600   # 每次从全库随机抽这么多行做回流候选(纯本地, 实测 ~70ms)
+
+
 def backlog_items(exclude_keys, enabled_ids, limit=300):
     """历史沉淀池: 之前几轮抓过、但当前新鲜页没有的条目(严格按分区开关过滤)。
 
-    原来 limit=100、只扫最新 600 行, 注释写的理由是"避免历史内容反复占满首页导致重复率高"。
-    实测(用户真实数据): 本地 items 存量 2.9 万条, 其中 1 万多条**从没推给过该用户**,
-    而当前内存池只有两千条上下 —— 前端要保持 300 条缓冲, 很快见底, 滑到底就得等下一次构建;
-    可源上此刻往往没有新内容(实测一次全量构建只多出 12 条)。也就是说用户等的主要不是网络,
-    是这个被卡在 100 条的本地回流。
-    现在放大到 300 条、扫描窗口 3000 行, 并**优先挑没进过 shown 的**: 回流进来的确实是他没看过的,
-    而不是把刚看过的又端回来。重复率交给 shown 表把关, 不再靠"少回流"来压。
-    本函数只读本地库, 不联网 —— 加深池子不增加任何抓取请求。"""
+    本函数只读本地库, 不联网 —— 加深池子不增加任何抓取请求。
+
+    v0.4.36: 取样方式改掉。旧实现按 fetched_at DESC 只扫最新 3000 行, 而 items 表存的是
+    **抓回来的一切**(包括随后被规则拒掉的), 所以"最新"恰好是"刚被拒掉的那一批"。
+    实测同一份真实库(7948 条, 4153 条从没推过):
+        · 最新 300 条未推过条目 → 只有 7 条(2.3%)能过规则
+        · 全库随机 300 条       → 56 条(18.7%)
+        · 随机 2500 行 + 便宜规则预筛 → 300 条里 140 条(46.7%)能过
+    旧取样等于每次构建把 300 个回流名额全花在注定被拒的条目上, 池子永远补不满。
+    现在全库随机抽, 再用与 machine_filter 同口径的便宜规则预筛(只提前筛掉必被拒的,
+    不改变判定结果), 没推过的排前面; 随机化同时保证每次端上来的存货不一样。"""
     seen = set(exclude_keys)
     try:
         shown = {r[0] for r in db().execute("SELECT key FROM shown").fetchall()}
     except Exception:
         shown = set()
-    fresh, stale = [], []
-    for (j,) in db().execute(
-            "SELECT json FROM items ORDER BY fetched_at DESC LIMIT 3000").fetchall():
-        if len(fresh) >= limit:
+    now = time.time()
+    min_views = int(sget("m_min_views") or 0)
+    max_views = int(sget("m_max_views") or 0)
+    min_dur = int(sget("m_min_duration") or 0)
+    max_dur = int(sget("m_max_duration") or 0)
+    if sget("mode") == "严肃":
+        max_age = int(sget("ser_max_age_months") or 0)
+    else:
+        max_age = int(sget("m_max_age_months") or 0)
+    pref_age = pref_age_months()
+    age_cut = (now - max_age * 30.44 * 86400) if max_age else 0
+    pref_cut = (now - pref_age * 30.44 * 86400) if pref_age else 0
+    fm = int(sget("bili_follow_months") or 1)
+    follow_cut = (now - fm * 30.44 * 86400) if fm else 0
+    emotion = sget("m_emotion") != "0"
+    news_fresh = sget("m_news_fresh") != "0"
+    picked = []
+    rows = db().execute(
+        "SELECT json FROM items ORDER BY RANDOM() LIMIT ?", (_BACKLOG_SCAN,)).fetchall()
+    for (j,) in rows:
+        if len(picked) >= limit * 2:   # 够下面按"没推过/推过"分流, 不再多解 json
             break
         try:
             it = json.loads(j)
@@ -4970,11 +5058,37 @@ def backlog_items(exclude_keys, enabled_ids, limit=300):
             continue
         if not item_domain_ok(it, enabled_ids):
             continue   # 统一分区校验: 旧池里不属于当前分区的全部不会回流
+        if it.get("following"):
+            if not it.get("pubdate") or (follow_cut and it["pubdate"] < follow_cut):
+                continue
+        elif it.get("platform") != "B站直播":
+            cut = pref_cut if it.get("pref_kw") else age_cut
+            if cut and it.get("pubdate") and it["pubdate"] < cut:
+                continue
+            if news_fresh and it.get("pubdate") and _is_newsy(it) \
+                    and now - it["pubdate"] > 86400:
+                continue
+            views_known = it.get("views_known") is True or it.get("platform") == "B站"
+            duration_known = it.get("duration_known") is True or it.get("platform") == "B站"
+            if views_known and ((min_views and (it.get("views") or 0) < min_views)
+                                or (max_views and (it.get("views") or 0) > max_views)):
+                continue
+            if duration_known and ((min_dur and (it.get("duration") or 0) < min_dur)
+                                   or (max_dur and (it.get("duration") or 0) > max_dur)):
+                continue
+            if emotion:
+                why = _emo_bad(it)
+                if not why and _ad_bad(it):
+                    why = "广告"
+                if why:
+                    continue
         seen.add(k)
-        (stale if k in shown else fresh).append(it)
+        picked.append(it)
+    picked = negative_feedback_filter(picked)   # 已不喜欢/黑名单/临时屏蔽: 不占回流名额
+    fresh = [it for it in picked if it["key"] not in shown]
+    stale = [it for it in picked if it["key"] in shown]
     # 没看过的排前面; 不够 limit 才用看过的补满(总回流上限仍是 limit)
     return (fresh + stale)[:limit]
-    return out
 
 
 # ---------------------------------------------------------------- AI 模块 (OpenAI 兼容)
@@ -7136,7 +7250,7 @@ def _annotate_following(items):
     mids, names = following_identities()
     if not (mids or names) and account_cookie():
         try:
-            threading.Thread(target=fetch_following_videos, kwargs={"total_cap": 1}, daemon=True).start()
+            threading.Thread(target=fetch_following_videos, daemon=True).start()
         except Exception:
             pass
         mids, names = following_identities()
@@ -7167,18 +7281,36 @@ def _space_videos(mid, ps=30):
         return []
 
 
+# 「关注的人」投稿缓存: 这步要发 nav + 最多 20 页关注列表 + 20 个空间投稿, 每个请求
+# 还要过 0.25s 的限速队列 —— 实测 11~14 秒。而它返回的往往就是**同一批已入库投稿**
+# (本机实测 60/60 已存在), 每次 full 构建重抓一遍纯属白等。池子越薄构建越频繁,
+# 这十几秒就一次次压在用户等首屏/等补池的时间上, 表现为「抓取变慢」。
+# 缓存 5 分钟: 构建绝大多数命中缓存; 关注的人发新稿最多晚 5 分钟入池(信息流本来也是
+# 分钟级刷新)。缓存存整批、返回时按调用方要的条数截断 —— 身份预热那次要 1 条也不会
+# 让紧接着的构建再抓一遍。
+_FOLLOW_POOL_TTL = 300
+_FOLLOW_POOL_STORE = 200   # 缓存里留的条数上限(远高于默认 60): 要几条由调用方截断
+_follow_pool_cache = {"ts": 0.0, "months": None, "items": None, "ident": None}
+
+
 def fetch_following_videos(max_up=20, per_up=30, total_cap=60):
     """抓取「关注的人」投稿入池(强调功能)。返回 (items, err)，失败不抛异常。
     语义: 只保留「强调月数内发布」的关注视频并标 following=True(强调); 超期/无发布时间的一律丢弃,
     不进池。bili_follow_months(0=不限). 未登录/风控 → 空。"""
     if not account_cookie():
         return [], "未登录B站账号"
+    months = int(sget("bili_follow_months") or 1)
+    c = _follow_pool_cache
+    if c["items"] is not None and c["months"] == months \
+            and time.time() - c["ts"] < _FOLLOW_POOL_TTL:
+        if c["ident"]:
+            _set_following_identities(*c["ident"])   # 关注身份缓存过期后要跟着续上
+        return [dict(it) for it in c["items"][:total_cap]], ""
     try:
         nav = bili_get("https://api.bilibili.com/x/web-interface/nav")
         if nav.get("code") != 0 or not (nav.get("data") or {}).get("isLogin"):
             return [], "未登录或Cookie失效"
         mid = (nav.get("data") or {}).get("mid", 0)
-        months = int(sget("bili_follow_months") or 1)
         cut = 0 if months <= 0 else time.time() - months * 30.44 * 86400
     except Exception as e:
         return [], str(e)[:80]
@@ -7222,6 +7354,9 @@ def fetch_following_videos(max_up=20, per_up=30, total_cap=60):
     except Exception as e:
         return items, str(e)[:80]
     items.sort(key=lambda x: -x["pubdate"])
+    _follow_pool_cache.update(ts=time.time(), months=months,
+                              items=[dict(it) for it in items[:_FOLLOW_POOL_STORE]],
+                              ident=(set(names), set(mids)))
     return items[:total_cap], ""
 
 
@@ -8213,6 +8348,96 @@ def _open_explore():
     return "已开启探索模式（30分钟）：探索区配额临时拉高到 30%。候选预览：" + lines
 
 
+# ---------------------------------------------------------------- 内置浏览器
+# 设置页「常规 → 浏览器」选的搜索引擎: 只影响地址栏搜索与「+ 浏览器」首页,
+# 不改变抓取来源。与 app_window 里的同名单保持一致的 key。
+SEARCH_ENGINES = {
+    "google": ("谷歌", "https://www.google.com/search?q=", "https://www.google.com/"),
+    "baidu": ("百度", "https://www.baidu.com/s?wd=", "https://www.baidu.com/"),
+    "bing": ("Bing", "https://www.bing.com/search?q=", "https://www.bing.com/"),
+}
+
+
+def search_engine_key():
+    try:
+        v = str(sget("ui_search_engine") or "").strip().lower()
+    except Exception:
+        v = ""
+    return v if v in SEARCH_ENGINES else "bing"
+
+
+def engine_from_text(text):
+    """消息里点名的搜索引擎(百度/谷歌/Bing); 没点名返回 ""。"""
+    t = str(text or "").lower()
+    if "百度" in t:
+        return "baidu"
+    if "谷歌" in t or "google" in t:
+        return "google"
+    if "bing" in t or "必应" in t:
+        return "bing"
+    return ""
+
+
+def browser_search_url(query, engine=None):
+    from urllib.parse import quote_plus
+    key = engine if engine in SEARCH_ENGINES else search_engine_key()
+    return SEARCH_ENGINES[key][1] + quote_plus(str(query or "").strip())
+
+
+def browser_home(engine=None):
+    key = engine if engine in SEARCH_ENGINES else search_engine_key()
+    name, _q, home = SEARCH_ENGINES[key]
+    return home, name
+
+
+def browser_command(m):
+    """聊天里明确说「用浏览器打开/搜索」→ 下发 browser 指令(桌面壳真去打开)。
+
+    刻意不抢普通抓取搜索: 必须出现 浏览器/网页/网址/百度/谷歌/Bing 等字样,
+    「给我刷 XX」「搜 XX 视频」仍走原来的信息流搜索。
+    """
+    m = str(m or "").strip()
+    if not m:
+        return None
+    mu = re.search(r"https?://[^\s\u4e00-\u9fff，。；、！？\"'<>]+", m, re.I)
+    if mu:
+        u = mu.group(0).rstrip(".,;!?)]}】）")
+        if len(m) <= len(mu.group(0)) + 8 or re.search(r"打开|访问|浏览|看看|去", m):
+            return {"reply": "已在浏览器标签页打开：%s" % u,
+                    "trigger": "browser", "browser": {"url": u, "title": "浏览器"}}
+    # 「浏览器打开 www.xxx.com」「打开 xxx.com」—— 主机名本身就够明确, 不必再要"浏览器"字样
+    mhost = re.search(r"(?:打开|访问|浏览)\s*(?:网页|网站|网址)?\s*"
+                      r"([a-zA-Z0-9][\w.\-]*\.[a-zA-Z]{2,}(?:/[^\s\u4e00-\u9fff]*)?)", m)
+    if mhost:
+        u = mhost.group(1)
+        if not re.match(r"^https?://", u, re.I):
+            u = "https://" + u
+        return {"reply": "已在浏览器标签页打开：%s" % u,
+                "trigger": "browser", "browser": {"url": u, "title": "浏览器"}}
+    if not re.search(r"(浏览器|网页|网站|网址|百度|谷歌|google|bing|必应)", m, re.I):
+        return None
+    # 「打开百度/谷歌/Bing/浏览器」→ 对应引擎首页(点了名的优先, 否则用设置里的默认引擎)
+    if (re.search(r"打开\s*(百度|谷歌|google|bing|必应|浏览器)\s*$", m, re.I)
+            and not re.search(r"搜索|搜一下|搜|查询|查一下|查|找", m, re.I)):
+        url, name = browser_home(engine_from_text(m) or None)
+        return {"reply": "已打开 %s。" % name, "trigger": "browser",
+                "browser": {"url": url, "title": name}}
+    # 「用百度搜 xxx」「浏览器搜索 xxx」「搜一下 xxx」
+    mq = re.search(r"(?:浏览器|百度|谷歌|google|bing|必应)\s*(?:里|中|上)?\s*"
+                   r"(?:搜索|搜一下|搜|查询|查一下|查)\s*[:：]?\s*(.+)$", m, re.I)
+    if mq:
+        q = mq.group(1).strip(" 　，。！？!?、\"'")
+        q = re.sub(r"^(一下|下|个|看看|看)\s*", "", q).strip()
+        if q:
+            eng = engine_from_text(m) or None
+            name = SEARCH_ENGINES[eng if eng in SEARCH_ENGINES else search_engine_key()][0]
+            return {"reply": "已在浏览器里用 %s 搜索「%s」。" % (name, q[:40]),
+                    "trigger": "browser",
+                    "browser": {"url": browser_search_url(q[:80], eng),
+                                "title": "搜索：" + q[:20]}}
+    return None
+
+
 def handle_command(msg):
     """聊天框命令引擎(无需AI): 识别并直接执行设置/屏蔽/统计/随机等指令。"""
     m = msg.strip()
@@ -8220,6 +8445,10 @@ def handle_command(msg):
     ref = handle_reference(m)
     if ref:
         return ref
+    # --- 内置浏览器(打开网页/搜索): 只有明确提到浏览器或搜索引擎才走 ---
+    bcmd = browser_command(m)
+    if bcmd:
+        return bcmd
     # --- 新建/切换对话 ---
     if any(w in m for w in ("新对话", "新建对话", "换个话题", "重新开个", "开个新对话", "开新对话")):
         cid = conv_create()
@@ -8401,6 +8630,18 @@ def handle_chat_payload(payload):
             return {"reply": "没有可切换的分区。", "trigger": None}
         names = apply_partition_ids(ids)
         return {"reply": "已切换分区：只看 %s（%d 个）" % (names, len(ids)), "trigger": "settings"}
+    if op == "browse":
+        url = str((payload or {}).get("url") or "").strip()
+        q = str((payload or {}).get("query") or "").strip()
+        if not url and q:
+            url = browser_search_url(q)
+        if not url:
+            return {"reply": "没有要打开的网址。", "trigger": None}
+        return {"reply": ("已在浏览器里搜索「%s」。" % q[:40]) if q
+                else "已在浏览器标签页打开。",
+                "trigger": "browser",
+                "browser": {"url": url,
+                            "title": ("搜索：" + q[:20]) if q else "浏览器"}}
     if op == "noop":
         return {"reply": "好的，没有做任何改动。", "trigger": None}
     return {"reply": "未知操作，已忽略。", "trigger": None}
@@ -8539,7 +8780,10 @@ def extract_intent(msg):
                     "9) 想改界面/显示设置(主题、单栏/双栏/大图、字号、封面、推荐理由、"
                     "强调色、来源标识、平台占比、直播筛选) → "
                     "{\"action\":\"reply\",\"keywords\":[]}; 这类交给设置通道, 别当搜索词\n"
-                    "10) 其他闲聊/提问 → {\"action\":\"reply\",\"keywords\":[]}"},
+                    "10) 想让内置浏览器打开网页/搜索(用浏览器打开某网站、用百度/谷歌/Bing 搜索、"
+                    "打开某网址) → {\"action\":\"browse\",\"query\":\"搜索词\"} 或 "
+                    "{\"action\":\"browse\",\"url\":\"https://...\"}; 普通刷视频的「搜/刷」不算\n"
+                    "11) 其他闲聊/提问 → {\"action\":\"reply\",\"keywords\":[]}"},
                 {"role": "user", "content": msg[:300]}], max_tokens=1500)
             d = json.loads(content)
             if isinstance(d, dict):
@@ -8584,6 +8828,14 @@ def extract_intent(msg):
                     return {"action": "open_explore"}
                 if act == "digest":
                     return {"action": "digest"}
+                if act == "browse":
+                    u = str(d.get("url") or "").strip()
+                    q = str(d.get("query") or "").strip()
+                    if u and re.match(r"^https?://", u, re.I):
+                        return {"action": "browse", "url": u[:500], "query": ""}
+                    if q:
+                        return {"action": "browse", "url": "", "query": q[:80]}
+                    return {"action": "reply", "keywords": []}
                 if act == "reply":
                     return {"action": "reply", "keywords": []}
         except Exception:
@@ -9942,7 +10194,7 @@ def machine_filter(items):
                 _funnel_bump("emotion")
                 continue   # 情绪过滤器: 轰炸/引战/标题党(标题) + 广告引流(简介), 纯规则零token
         # v0.3.1.43dsk 快速文本分析: 规则层没抓到的语义垃圾(引战/低质/标题党/阴阳怪气)
-        # 交给本地 fastText 兜一遍。词表命中的上面已经拦了, 这里只处理"词表覆盖不到"的。
+        # 交给本地 BERT 兜一遍。词表命中的上面已经拦了, 这里只处理"词表覆盖不到"的。
         # 只在 m_emotion 之后跑 —— 省一次模型调用, 也让漏斗计数各归各的。
         if not is_live and sget("ft_on") == "1" and sget("ft_video") == "1":
             _w = text_scan([(it.get("title") or "") + " " + (it.get("desc") or "")], "video")[0]
@@ -10661,16 +10913,22 @@ def bake_universe(payload, quick=False):
             it["interest"] = 5
         kept.append(it)
     shown_map = {r[0]: r[1] for r in db().execute("SELECT key, ts FROM shown").fetchall()}
+    # v0.4.27: 首页**被翻到** N 次的条目按 _seen_weight 降权(1→0.8, 2→0.5, 之后 -0.1, 地板 0.1)。
+    # 旧行为在关闭 AI 全量时会把"出现过"当二值桶(出现过一律排到从未出现之后), 语义上等于
+    # 权重直接归零; 用户要的是**逐次递减**, 所以这里换成乘法权重。
+    wmap = _seen_weight_map([it.get("key") for it in kept])
+    for it in kept:
+        it["_w"] = wmap.get(it.get("key"), 1.0)
     if full and ai:
         # 已评分内容排前, 未评分垫底(供后台评分; 前端按序加载先展示已筛查内容)
-        kept.sort(key=lambda x: (0 if x.get("_scored") else 1, -x["interest"], -x["views"]))
+        kept.sort(key=lambda x: (0 if x.get("_scored") else 1,
+                                 -x["interest"] * x["_w"], -x["views"] * x["_w"]))
     else:
         kept.sort(key=lambda x: (
             0 if x["author"] in acct_authors else 1,
-            0 if x["key"] not in shown_map else 1,
-            shown_map.get(x["key"], 0),
             0 if acct_kws and any(k in x["title"] for k in acct_kws) else 1,
-            -x["views"]))
+            -(x.get("views") or 0) * x["_w"],
+            shown_map.get(x["key"], 0)))   # 同分: 出现更早的先轮换回来
     kept = mix_sources(kept)   # 混排: 来源交错, 同类(词/源)不扎堆
     if len(kept) > 1 and kept[0]["key"] == _last_top["key"]:   # 防重复保险
         for j in range(1, len(kept)):
@@ -11802,9 +12060,10 @@ def _slot_of(it, sig, med, now):
         return "comfort"
     if _is_newsy(it) and it.get("pubdate") and now - it["pubdate"] < 86400:
         return "social"
-    if (it.get("views") or 0) >= med * 2:
+    vw = (it.get("views") or 0) * (it.get("_w") or 1.0)   # 出现过多次的按降权后看待
+    if vw >= med * 2:
         return "social"
-    if (it.get("interest") or 5) >= 7 or (it.get("views") or 0) >= med:
+    if (it.get("interest") or 5) >= 7 or vw >= med:
         return "expand"
     return "comfort"
 
@@ -11850,6 +12109,9 @@ def _explore_candidates(exclude, limit=30):
             out.append(it)
         if len(out) >= limit:
             break
+    wmap = _seen_weight_map([it.get("key") for it in out])
+    for it in out:
+        it["_w"] = wmap.get(it.get("key"), 1.0)
     return out
 
 
@@ -12097,11 +12359,89 @@ def cooldown_keys(now=None):
         return set()
 
 
+# v0.4.38: 这里只记「重复推送」口径(run_count/冷却), 不再动 seen_n ——
+# 卡片返回给信息流 ≠ 用户翻到了它, 降权次数改由 mark_viewed 按曝光上报累计。
 _UPSERT_EXPOSURE = ("INSERT INTO item_exposure_state(key,run_count,last_presented_at,cooldown_until) "
                     "VALUES(?,?,?,?) ON CONFLICT(key) DO UPDATE SET "
                     "run_count=excluded.run_count,last_presented_at=excluded.last_presented_at,"
                     "cooldown_until=excluded.cooldown_until")
 _SQL_CHUNK = 300     # IN / 多值 VALUES 分片大小(SQLite 变量上限远大于此, 留足余量)
+
+
+_VIEW_UPSERT = ("INSERT INTO item_exposure_state(key,run_count,last_presented_at,cooldown_until,seen_n) "
+                "VALUES(?,0,0,0,1) ON CONFLICT(key) DO UPDATE SET "
+                "seen_n=item_exposure_state.seen_n+1")
+
+
+def mark_viewed(keys, rid, now=None):
+    """卡片真正被翻到才累计降权次数(v0.4.38)。
+
+    旧口径在卡片一返回给信息流时就 +1, 用户没滑到的半页也被降权; 现在由前端
+    IntersectionObserver(露出过半)上报。同一 rid(本次打开)内同一条只算一次。
+    run_count/冷却不动 —— 那是「重复推送」口径, 与首页降权分开。"""
+    now = int(now or time.time())
+    rid = str(rid or "")[:64]
+    ks = [str(k) for k in (keys or []) if k][:300]
+    if not ks or not rid:
+        return 0
+    if not _db_lock.acquire(timeout=0.4):
+        return 0
+    try:
+        conn = db()
+        ph = ",".join("(?,?,?)" for _ in ks)
+        params = []
+        for k in ks:
+            params.extend((k, rid, now))
+        seen = [r[0] for r in conn.execute(
+            "INSERT OR IGNORE INTO item_viewed(key,rid,ts) VALUES " + ph +
+            " RETURNING key", params)]
+        if seen:
+            conn.executemany(_VIEW_UPSERT, [(k,) for k in seen])
+            conn.execute("DELETE FROM item_viewed WHERE ts < ?", (now - 7 * 86400,))
+        conn.commit()
+    except Exception:
+        return 0
+    finally:
+        _db_lock.release()
+    return len(seen)
+
+
+def _seen_weight(n):
+    """首页被翻到次数 → 排序权重(用户口径):
+       没出现过 1.0; 出现 1 次 0.8; 2 次 0.5; 之后每多一次再 -0.1, 地板 0.1。
+       即 3 次 0.4 / 4 次 0.3 / 5 次 0.2 / 6 次起 0.1。"""
+    try:
+        n = int(n or 0)
+    except (TypeError, ValueError):
+        n = 0
+    if n <= 0:
+        return 1.0
+    if n == 1:
+        return 0.8
+    if n == 2:
+        return 0.5
+    return max(0.1, 0.5 - 0.1 * (n - 2))
+
+
+def _seen_weight_map(keys=None):
+    """key → 权重(item_exposure_state.seen_n → _seen_weight)。
+    给了 keys 就只查这一批(IN 分片); 查库失败一律按 1.0(宁可少降权, 不误杀)。"""
+    try:
+        if keys is None:
+            rows = db().execute("SELECT key, seen_n FROM item_exposure_state").fetchall()
+        else:
+            ks = [k for k in keys if k]
+            if not ks:
+                return {}
+            rows = []
+            for i in range(0, len(ks), _SQL_CHUNK):
+                part = ks[i:i + _SQL_CHUNK]
+                rows += db().execute(
+                    "SELECT key, seen_n FROM item_exposure_state WHERE key IN (%s)" %
+                    ",".join("?" * len(part)), tuple(part)).fetchall()
+    except Exception:
+        return {}
+    return {r[0]: _seen_weight(r[1]) for r in rows}
 
 
 def record_feed_presentations(items, request_id, now=None):
@@ -12354,6 +12694,15 @@ def build_universe(quick=False, _claimed=False):
                 _in_pool = {it.get("key") for it in _universe["items"]}
             exclude = {it["key"] for it in payload["items"]} | {k for k in _in_pool if k}
             payload["items"] = payload["items"] + backlog_items(exclude, enabled_source_ids())
+        else:
+            # 全源失败≠没内容可给: 旧实现只拿 MOCK_ITEMS 过筛, 本地沉淀池几千条未推
+            # 存货被整段跳过 → 空构建 → 40s 退避, 首屏先看到几条约稿示例然后干等一分钟。
+            # 现在先用本地回流顶上; 真没存货(首次安装)才保留 MOCK_ITEMS 兜底。
+            with _uni_lock:
+                _in_pool = {it.get("key") for it in _universe["items"]}
+            local = backlog_items({k for k in _in_pool if k}, enabled_source_ids())
+            if local:
+                payload.update(offline=False, source="本地存货(网络暂不可用)", items=local)
         kept = bake_universe(payload, quick=quick)
         threading.Thread(target=ensure_tags, kwargs={"items": kept}, daemon=True).start()   # 后台补标签(厌恶匹配用)
         offline, source = payload["offline"], payload["source"]
@@ -13459,9 +13808,13 @@ class Handler(BaseHTTPRequestHandler):
                 #  ① 不清空池子(旧实现先把 items 清空, 前端只能干等重建, 屏上直接空掉);
                 #  ② 用 quick 而不是 full: 全量要 10-30 秒, 刷新应该立刻有反馈。
                 #     quick 只取少量源, 且 build_universe 末尾会自动接力一次全量。
-                # _uni_token +1 同时作废旧构建、并让 _feed_plan 的缓存 key 失效 → 重新规划顺序。
+                # _uni_token +1 能让 _feed_plan 缓存失效、重新规划顺序; 但**有构建在跑时
+                # 不能换令牌** —— 前端首屏空页轮询每第 3 次就发 refresh, 冷启动时正好撞上
+                # 首轮构建, 一换令牌在途构建立即作废, 从头再抓一遍(首次出流因此翻倍)。
+                # 构建完成后 gen 变化本身就会让计划重排, 这里不换令牌没有副作用。
                 with _uni_lock:
-                    _uni_token += 1
+                    if not _universe["building"]:
+                        _uni_token += 1
                 # 用户主动刷新 = 明确要求重试贴吧: 解掉 403 冷却(否则要干等 10 分钟)。
                 # 60 秒内只放行一次, 连点不会把百度风控招得更狠。
                 _tb_allow_retry()
@@ -13945,7 +14298,9 @@ class Handler(BaseHTTPRequestHandler):
                                                         "ai_enabled", "disclaimer_version",
                                                         "ui_bq", "ui_bq_level", "ui_sr",
                                                         "ui_fg", "ui_sr_level", "ui_sr_scale",
-                                                        "ui_ownui", "ui_new_window")}
+                                                        "ui_ownui", "ui_new_window",
+                                                        "ui_search_engine",
+                                                        "ui_browser_on_start")}
                                   | {"ai_ok": ai_ok(), "ai_on": ai_on()})
         if path == "/api/floatball":
             env = float_ball_env()
@@ -14275,6 +14630,12 @@ class Handler(BaseHTTPRequestHandler):
                 # 已在计划中的不喜欢条目立即被 planned_feed 的负反馈过滤剔除。
                 sset("feedback_sig", str(int(time.time())))
             return self.send_json({"ok": True})
+        if path == "/api/viewed":
+            keys = body.get("keys")
+            n = mark_viewed(keys if isinstance(keys, list) else [],
+                            str(body.get("rid") or ""))
+            return self.send_json({"ok": True, "n": n})
+
         if path == "/api/feed/refresh":
             key = (body.get("key") or "").strip()
             if not key:
@@ -14335,12 +14696,16 @@ class Handler(BaseHTTPRequestHandler):
                       "price_in", "price_out", "ai_full_scan", "ai_interest_min",
                       "ai_batch", "ai_cache_hours", "ai_enabled", "ui_bq", "ui_bq_level",
                       "ui_sr", "ui_fg", "ui_sr_level", "ui_sr_scale", "ui_ownui",
-                      "ui_new_window"):
+                      "ui_new_window", "ui_search_engine", "ui_browser_on_start"):
                 if k in body and body[k] is not None:
                     if k in ("ai_base", "ai_model") and not str(body[k]).strip():
                         continue   # 地址/模型不允许空值覆盖(保留默认/原值)
                     if k == "mode" and str(body[k]) not in MODE_THRESH:
                         continue   # 档位白名单: 防止乱码/非法值污染
+                    if k == "ui_search_engine" and str(body[k]) not in SEARCH_ENGINES:
+                        continue   # 搜索引擎白名单: google / baidu / bing
+                    if k == "ui_browser_on_start" and str(body[k]) not in ("0", "1"):
+                        continue   # 只管开/关两态
                     sset(k, body[k])
             if any(k in body for k in ("ai_full_scan", "ai_interest_min", "ai_batch",
                                        "ai_cache_hours", "ai_enabled")):
@@ -14626,15 +14991,16 @@ class Handler(BaseHTTPRequestHandler):
                     event, json.dumps(data, ensure_ascii=False))).encode("utf-8"))
                 self.wfile.flush()
 
-            def finish(reply, ok=True, err="", trigger=None):
+            def finish(reply, ok=True, err="", trigger=None, browser=None):
                 db().execute("INSERT INTO chat(role,content,ts,cid) VALUES('assistant',?,?,?)",
                              (reply, int(time.time()), cid))
                 db().commit()
                 return self.send_json({"ok": ok, "reply": reply, "intent": intent,
                                        "chips": chips, "cid": cid, "error": err,
-                                       "trigger": trigger, "ctx": chat_ctx_get(cid)})
+                                       "trigger": trigger, "browser": browser,
+                                       "ctx": chat_ctx_get(cid)})
 
-            def sse_reply(reply, intent, trigger=None):
+            def sse_reply(reply, intent, trigger=None, browser=None):
                 """一次性回复的 SSE 事件流(无增量): meta → done。"""
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -14643,7 +15009,8 @@ class Handler(BaseHTTPRequestHandler):
                 sse_send("meta", {"intent": intent, "chips": chips, "cid": cid,
                                   "ctx": chat_ctx_get(cid)})
                 sse_send("done", {"reply": reply, "chips": chips, "ok": True,
-                                  "trigger": trigger, "ctx": chat_ctx_get(cid)})
+                                  "trigger": trigger, "browser": browser,
+                                  "ctx": chat_ctx_get(cid)})
                 db().execute("INSERT INTO chat(role,content,ts,cid) VALUES('assistant',?,?,?)",
                              (reply, int(time.time()), cid))
                 db().commit()
@@ -14653,20 +15020,41 @@ class Handler(BaseHTTPRequestHandler):
                 res = handle_chat_payload(payload)
                 reply = res.get("reply", "")
                 if stream:
-                    sse_reply(reply, intent, res.get("trigger"))
+                    sse_reply(reply, intent, res.get("trigger"), res.get("browser"))
                     return
-                return finish(reply, trigger=res.get("trigger"))
+                return finish(reply, trigger=res.get("trigger"),
+                              browser=res.get("browser"))
 
             if cmd:
                 intent = {"action": "reply", "keywords": []}
                 reply = cmd.get("reply", "")
                 trig = cmd.get("trigger")
+                brg = cmd.get("browser")
                 if stream:
-                    sse_reply(reply, intent, trig)
+                    sse_reply(reply, intent, trig, brg)
                     return
-                return finish(reply, trigger=trig)
+                return finish(reply, trigger=trig, browser=brg)
 
             intent = extract_intent(msg)
+            # 内置浏览器: 模型判定「打开/搜索网页」→ 页面经壳在标签页里打开
+            if intent["action"] == "browse":
+                q = str(intent.get("query") or "").strip()
+                url = str(intent.get("url") or "").strip()
+                if not url and q:
+                    url = browser_search_url(q)
+                if not url:
+                    url, _nm = browser_home()
+                if q:
+                    reply = "已在浏览器里搜索「%s」。" % q[:40]
+                    br = {"url": url, "title": "搜索：" + q[:20]}
+                else:
+                    reply = "已在浏览器标签页打开。"
+                    br = {"url": url, "title": "浏览器"}
+                intent = {"action": "reply", "keywords": []}
+                if stream:
+                    sse_reply(reply, intent, "browser", br)
+                    return
+                return finish(reply, trigger="browser", browser=br)
             # 意图搜索: 固定短回复(不调用LLM, 省token又快), 前端切搜索流
             if intent["action"] == "add_dislike":
                 # 真正执行: 把关键词(含AI补的相关词)追加到厌恶备注
@@ -14818,9 +15206,11 @@ class Handler(BaseHTTPRequestHandler):
                           "系统会在你回答之前就把它执行掉。"
                           "所以绝不要说「我改不了」「动不了你的页面布局」或让他自己去设置页点；"
                           "你不确定他想改哪一项时，就问一句「是想换成单栏吗」。"
-                          "你确实做不到的是推送/搜索/切换视频，也看不到页面上的执行结果，"
+                          "你确实做不到的是推送/切换信息流里的视频(浏览器搜索见下)，也看不到页面上的执行结果，"
                           "因此不要声称「已推送」「已切换到左侧」「已改好」。"
                           "用户想刷视频时会直接说「给我刷/推/看XX」，系统会自动执行并另行确认。"
+                          "你也可以让内置浏览器打开网页或搜索：用户说「打开某网站」「用浏览器搜某词」"
+                          "时系统会立刻执行；但你看不到网页正文，不要假装读过页面内容，也不要编造链接。"
                           "如果上下文里有【用户当前正在聊的条目】或【用户指代的最近条目】，"
                           "围绕它可以做总结、点评、回答追问；没有依据的部分不要编造。"
                           "可参考的用户画像:\n" + (user_context() or "(空)")

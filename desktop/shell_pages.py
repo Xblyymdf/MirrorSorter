@@ -275,6 +275,164 @@ _NOFLASH_JS = r"""
 """
 
 
+
+# ---- 拖入外部网页 → 内置浏览器新标签页(v0.4.27dsk) --------------------------
+# 用户要求: 「拖拽浏览器网页到我们的软件上可以从我们的软件进行播放」。
+# 从外部浏览器把地址栏/标签页/链接拖进 WebView2 时, 页面收到的是 DOM drop 事件,
+# dataTransfer 里带 text/uri-list(Chrome/Edge)或 text/x-moz-url(Firefox)。
+# 这里在 document-start 捕获: 认出 http(s) 链接就 preventDefault 并经 WebMessage
+# 交给壳开新标签页; 认不出也 preventDefault(否则内核会把当前页导航走 —— 实测过).
+# 文件/输入框里拖字仍放行, 页面内发起的拖拽(dragstart)不接管.
+# 为什么不用 window.open: 拖放事件在部分内核上不算"用户手势", 会被弹窗拦截;
+# WebMessage 是 WebView2 的宿主通道, 稳定、也不会真的弹窗口。
+_DROP_OPEN_JS = r"""
+(function(){
+  if (window.__msx_drop_open) return;
+  window.__msx_drop_open = 1;
+  /* 子框架不接管: drop 只作用于顶层文档(与幕布/注入脚本同一守卫) */
+  try { if (window.top !== window.self) return; } catch (e) { return; }
+  /* 页面自己发起的拖拽(拖卡片/拖选中的字)不接管; 只有外部程序拖进来的才算。
+     v0.4.27: 外部拖拽**一律 preventDefault** —— 认不出链接也不能让内核把当前页导航走
+     (用户实测: 拖网页进来直接把当前页顶掉, 而不是新开标签)。 */
+  var internal = false;
+  window.addEventListener('dragstart', function(){ internal = true; }, true);
+  window.addEventListener('dragend', function(){
+    setTimeout(function(){ internal = false; }, 0);
+  }, true);
+  function host(){
+    try {
+      if (window.chrome && window.chrome.webview &&
+          typeof window.chrome.webview.postMessage === 'function') return window.chrome.webview;
+    } catch (e) {}
+    return null;
+  }
+  function editable(el){
+    try {
+      for (var t = el; t && t.nodeType === 1; t = t.parentNode) {
+        var n = t.nodeName;
+        if (n === 'INPUT' || n === 'TEXTAREA' || n === 'SELECT') return true;
+        var ce = t.getAttribute && t.getAttribute('contenteditable');
+        if (ce === '' || ce === 'true' || ce === 'plaintext-only') return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+  /* 只接受"整行就是一个 http(s) 链接"的值: uri-list 每行一个(# 开头是注释),
+     Firefox 的 text/x-moz-url 第一行是 URL、第二行是标题;
+     段落文本里夹带的链接不算, 免得抢走站点自己的文字拖放。 */
+  function strictUrl(s){
+    s = String(s == null ? '' : s).replace(/\u0000/g, '').trim();
+    if (!s) return '';
+    var lines = s.split(/\r?\n/);
+    for (var i = 0; i < lines.length; i++) {
+      var v = lines[i].trim();
+      if (v && v.charAt(0) !== '#' && /^https?:\/\/\S+$/i.test(v)) return v;
+    }
+    return '';
+  }
+  function fromHtml(h){
+    try {
+      var m = /href\s*=\s*["']([^"']+)["']/i.exec(String(h || ''));
+      if (m && /^https?:\/\/\S+$/i.test(m[1])) return m[1];
+    } catch (e) {}
+    return '';
+  }
+  function typesOf(dt){
+    try { return Array.prototype.slice.call(dt.types || []); } catch (e) { return []; }
+  }
+  function pick(dt){
+    if (!dt) return '';
+    var types = typesOf(dt);
+    var order = ['text/uri-list', 'text/x-moz-url', 'URL', 'text/plain'];
+    for (var i = 0; i < order.length; i++) {
+      if (types.length && types.indexOf(order[i]) < 0) continue;
+      var v = '';
+      try { v = dt.getData(order[i]); } catch (e) { continue; }
+      var u = strictUrl(v) || fromHtml(v);
+      if (u) return u;
+    }
+    if (types.indexOf('text/html') >= 0) {
+      try { return fromHtml(dt.getData('text/html')); } catch (e) {}
+    }
+    return '';
+  }
+  /* 部分内核对外部拖拽在 drop 时 getData 读不到, 但 items 里仍有字符串:
+     异步再试一次; 仍读不到就上报 miss(壳里记日志), 绝不落回内核默认导航。 */
+  function asyncPick(dt, done){
+    var answered = false, left = 0, items = [];
+    function answer(u){ if (answered) return; answered = true; done(u || ''); }
+    try { items = Array.prototype.slice.call((dt && dt.items) || []); } catch (e) { items = []; }
+    for (var i = 0; i < items.length; i++) {
+      var it = items[i];
+      var kind = String(it.kind || '');
+      var ty = String(it.type || '');
+      if (kind !== 'string') continue;
+      if (!/^text\//i.test(ty) && ty !== 'URL') continue;
+      left++;
+      (function(it2){
+        try {
+          it2.getAsString(function(s){
+            var u = strictUrl(s) || fromHtml(s);
+            if (u) { answer(u); return; }
+            if (--left <= 0) answer('');
+          });
+        } catch (e) { if (--left <= 0) answer(''); }
+      })(it);
+    }
+    if (!left) answer('');
+  }
+  function blocked(e){
+    try {
+      var dt = e.dataTransfer;
+      if (!dt) return true;
+      var types = typesOf(dt);
+      if (types.indexOf('Files') >= 0) return true;      /* 拖文件: 交给页面 */
+      if (dt.files && dt.files.length) return true;
+      if (editable(e.target)) return true;               /* 输入框/可编辑区里拖字 */
+      return false;                                      /* 其余外部拖拽一律接管 */
+    } catch (err) { return true; }
+  }
+  function openInShell(u){
+    var w = host();
+    if (!w) return false;
+    try { w.postMessage({ t: 'msx-drop', u: u }); return true; } catch (e) { return false; }
+  }
+  function reportMiss(types){
+    var w = host();
+    if (!w) return;
+    try {
+      w.postMessage({ t: 'msx-drop-miss',
+                      types: (types || []).join('|').slice(0, 200) });
+    } catch (e) {}
+  }
+  document.addEventListener('dragover', function(e){
+    if (blocked(e)) return;
+    if (internal) return;   /* 页面内拖拽: 不干预站点自己的 dragover 逻辑 */
+    try { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; } catch (err) {}
+  }, true);
+  document.addEventListener('drop', function(e){
+    if (blocked(e)) return;
+    var wasInternal = internal;
+    internal = false;
+    var dt = e.dataTransfer;
+    var u = pick(dt);
+    if (!u && wasInternal) return;   /* 页面内拖拽且没有链接: 交还给站点 */
+    try {
+      e.preventDefault();
+      e.stopPropagation();
+      if (e.stopImmediatePropagation) e.stopImmediatePropagation();
+    } catch (err) {}
+    if (u) { openInShell(u); return; }
+    var ts = typesOf(dt);
+    asyncPick(dt, function(u2){
+      if (u2) { openInShell(u2); return; }
+      reportMiss(ts);
+    });
+  }, true);
+})()
+
+"""
+
 # ---- 内置油猴脚本环境: Vue + GM 垫片 + 净化大师 + 用户自定义脚本 ----
 # 通道: AddScriptToExecuteOnDocumentCreatedAsync(每次文档创建自动执行, MAIN 上下文,
 # 等价于 document-start 的油猴脚本)。扩展 API(AddBrowserExtensionAsync)在部分
@@ -291,6 +449,29 @@ def _dbg_log(msg):
             f.write("[%s] %s%s" % (_t.strftime("%H:%M:%S"), msg, NL))
     except Exception:
         pass
+
+
+def drop_url_from_message(raw):
+    """WebMessage(JSON 文本) → 拖入的链接; 不是拖放消息返回 ""。
+    只做协议解析, URL 合法性交给 ShellApi.open_in_app(与它同一道安全闸)。"""
+    try:
+        d = json.loads(raw) if raw else None
+    except Exception:
+        return ""
+    if not isinstance(d, dict) or d.get("t") != "msx-drop":
+        return ""
+    return str(d.get("u") or "").strip()[:2000]
+
+
+def drop_miss_types_from_message(raw):
+    """WebMessage(JSON 文本) → 拖拽认不出时的 MIME 类型串; 不是该消息返回 ""。"""
+    try:
+        d = json.loads(raw) if raw else None
+    except Exception:
+        return ""
+    if not isinstance(d, dict) or d.get("t") != "msx-drop-miss":
+        return ""
+    return str(d.get("types") or "").strip()[:200]
 
 
 def _read_ext_file(name):
@@ -1212,7 +1393,7 @@ def _build_inject_script(port):
 
 
 def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=None,
-                on_fs=None):
+                on_fs=None, on_drop=None):
     """创建控件池。须在窗口壳启动后调用(任意线程, 内部自行 marshal)。
 
     on_title(tab_key, title) / on_newtab(tab_key, url): 站点控件的
@@ -1222,12 +1403,13 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
     ShellApi 侧忽略。控件未就绪/标签已关时不上报。
     on_fs(tab_key, on): 网页(视频)进入/退出全屏(bug6) —— 窗口壳据此隐藏标签栏与
     导航栏; 控件本身的几何(铺满客户区/还原)由池自己改, 调用方不用管。
+    on_drop(tab_key, url): 外部浏览器把网页/链接拖进窗口(注入脚本经 WebMessage 上报)。
     返回管理器: init/create/show/hide/dispose/get_nav/push_nav/reload/goto/
     navigate_history —— 均以 tab_key 为键(key 0 = 信息流主控件); 控件对象由池内部持有。
     """
     import System.Windows.Forms as WinForms  # noqa: F401  提前加载 CLR(pythonnet)
     box = {"form": None, "theme": None, "stopping": False, "port": port,
-           "on_nav": on_nav, "on_fs": on_fs}
+           "on_nav": on_nav, "on_fs": on_fs, "on_drop": on_drop}
 
     def _tab_geo(form, home, key):
         """标签控件的常规几何(锚在信息流主控件 home 上)。创建与全屏退出都走这里。
@@ -1449,6 +1631,28 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
                 # 不在 WebView2 的事件回调里直接改窗口几何(见 _ui_later 的说明)
                 _ui_later(_apply_fs)
 
+            def guard_home_nav(_s, a):
+                """首页(信息流)只该停在本地服务: 任何外部导航一律取消。
+                v0.4.27 用户实测"拖网页进来把首页顶掉"—— 页面 JS 没拦住(或内核直接
+                走了原生拖放导航)时, 这里兜底把链接交给 on_drop 开新标签页。"""
+                try:
+                    uri = str(getattr(a, "Uri", "") or "")
+                    low = uri.lower()
+                    if not low:
+                        return
+                    if (low.startswith("http://127.0.0.1:%d" % port) or
+                            low.startswith("http://localhost:%d" % port)):
+                        return          # 本地界面自身的刷新/回退
+                    if not low.startswith(("http://", "https://", "file:")):
+                        return          # about:/data:/blob: 等不动
+                    a.Cancel = True
+                    _dbg_log("home-guard: cancel nav %s" % uri[:300])
+                    cb = box.get("on_drop")
+                    if cb is not None and low.startswith(("http://", "https://")):
+                        threading.Thread(target=cb, args=(0, uri), daemon=True).start()
+                except Exception:
+                    pass
+
             def on_core_ready(_s, _a):
                 try:
                     core = c.CoreWebView2
@@ -1459,6 +1663,11 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
                         core.ContainsFullScreenElementChanged += on_fs_changed
                     except Exception as e:
                         _dbg_log("wire_fs(%s) subscribe FAILED: %r" % (tab_key, e))
+                    if tab_key == 0:
+                        try:   # 首页只允许本地服务: 外部网址一律取消并开新标签页
+                            core.NavigationStarting += guard_home_nav
+                        except Exception as e:
+                            _dbg_log("wire_guard(0) subscribe FAILED: %r" % e)
                 except Exception:
                     _dbg_log("wire_nav(%s) subscribe FAILED: %r" % (tab_key, _s))
 
@@ -1594,6 +1803,11 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
                             _dbg_log("on_ready: AddScript(noflash) called")
                         except Exception as e:
                             _dbg_log("noflash register FAILED: %r" % e)
+                        try:   # 拖入外部网页(document-start 捕获) → WebMessage
+                            core.AddScriptToExecuteOnDocumentCreatedAsync(_DROP_OPEN_JS)
+                            _dbg_log("on_ready: AddScript(drop-open) called")
+                        except Exception as e:
+                            _dbg_log("drop-open register FAILED: %r" % e)
                         try:   # 内置油猴环境: 净化大师 + 用户自定义脚本(每次文档创建自动执行)
                             _dbg_log("on_ready: registering document-created script")
                             inj = _build_inject_script(box.get("port") or 8000)
@@ -1613,6 +1827,30 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
                                 return
                             on_newtab(tab_key, u)
                         core.NewWindowRequested += on_newwin
+
+                        def on_msg(_s3, a3):
+                            """外部网页被拖进来: 注入脚本发的 WebMessage → 开新标签页。
+                            其余消息(含 pywebview 自己的桥消息)一律忽略。"""
+                            if tab_key in _Pool._dead:
+                                return
+                            cb = box.get("on_drop")
+                            if cb is None:
+                                return
+                            try:
+                                raw = a3.get_WebMessageAsJson()
+                            except Exception:
+                                raw = ""
+                            u = drop_url_from_message(raw)
+                            if not u:
+                                mt = drop_miss_types_from_message(raw)
+                                if mt:
+                                    _dbg_log("drop-miss tab=%s types=%s" % (tab_key, mt))
+                                return
+                            try:
+                                cb(tab_key, u)
+                            except Exception:
+                                _dbg_log("drop-open callback FAILED tab=%s" % tab_key)
+                        core.WebMessageReceived += on_msg
 
                         def on_nav_done(_s2, _a2):   # 每次整页加载完按当前主题补注入
                             self._apply_theme(c, self._is_dark())
@@ -1829,6 +2067,31 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
                 except Exception:
                     import traceback
                     traceback.print_exc()
+            _ui(go)
+
+        def set_content_top(self, top):
+            """窗口 chrome(导航栏/收藏栏)高度变化 → 主窗口内容区整体下移/回缩。
+            全屏期间不动(退出全屏按进入前的几何快照还原)。悬浮窗里的控件不归这里管。"""
+            def go():
+                form = box.get("form")
+                if form is None or _Pool.fs.get("on"):
+                    return
+                from System.Drawing import Point, Size
+                top_ = max(0, int(top))
+                for c in list(_Pool.ctrls.values()):
+                    if c is None:
+                        continue
+                    try:
+                        if not self._same_form(c.FindForm(), form):
+                            continue
+                    except Exception:
+                        continue
+                    try:
+                        c.Location = Point(0, top_)
+                        c.Size = Size(max(1, form.ClientSize.Width),
+                                      max(1, form.ClientSize.Height - top_))
+                    except Exception:
+                        pass
             _ui(go)
 
         def hide(self, key):

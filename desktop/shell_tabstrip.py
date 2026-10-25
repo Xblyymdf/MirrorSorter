@@ -47,9 +47,10 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
     [{"id":..,"title":..,"closable":..}] 与激活 id 即重绘。"""
     import clr
     clr.AddReference("System.Drawing")
-    from System.Drawing import (Color, Font, Pen, Rectangle, SolidBrush, StringFormat,
-                                StringAlignment, StringFormatFlags,
-                                StringTrimming, RectangleF, Point, Size)
+    from System.Drawing import (Color, ContentAlignment, Font, Pen, Rectangle,
+                                SolidBrush, StringFormat, StringAlignment,
+                                StringFormatFlags, StringTrimming, RectangleF,
+                                Point, Size)
     from System.Drawing.Drawing2D import GraphicsPath, SmoothingMode
     import System.Windows.Forms as WinForms
 
@@ -65,6 +66,7 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
     FG_ON = Color.White
     FG_OFF = Color.FromArgb(150, 158, 172)
     st = {"tabs": [], "active": 0, "hover_btn": None, "hover_tab": None,
+          "hover_add": False,   # 「+」新建按钮悬停
           "drop_hi": False,   # 悬浮窗被拖到标签栏上方 → 整条高亮(提示"松手即合并成标签页")
           "accent": Color.FromArgb(251, 114, 153),   # 默认主题粉; accent_watch 会用设置文件的强调色覆盖
           "bar": Color.FromArgb(10, 12, 16), "tab_active": Color.FromArgb(22, 25, 32),
@@ -92,13 +94,16 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
     sf_c.Alignment = StringAlignment.Center
     sf_c.LineAlignment = StringAlignment.Center
 
+    ADD_W = int(24 * scale)   # 标签条右端的「+」新建按钮
+
     def _layout(width):
         n = len(st["tabs"])
         if not n:
             return []
         gap, margin = int(4 * scale), int(6 * scale)
         btn_zone = BTN_W() * 3 + int(2 * scale)
-        slack = width - margin - btn_zone - gap * (n - 1)
+        # 「+」占一格(含与前一个标签的间距), 从可用宽度里扣掉
+        slack = width - margin - btn_zone - gap - ADD_W - gap * (n - 1)
         # 挤不下时收窄标签(浏览器习惯), 不能硬保下限: 旧下限110会把总宽顶出栏外,
         # 最右标签被面板右缘裁掉 → ✕只剩半个(用户截图)。60(逻辑)保住✕+点击区完整。
         tw = min(int(180 * scale), max(int(60 * scale), slack // n))
@@ -107,6 +112,18 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
             out.append((x, tw))
             x += tw + gap
         return out
+
+    def _add_rect():
+        """「+」按钮矩形 —— 紧贴最后一个标签右侧; 标签多到挤满时钉在窗口按键左侧。"""
+        boxes = _layout(strip.Width)
+        x = (boxes[-1][0] + boxes[-1][1] + int(4 * scale)) if boxes else int(6 * scale)
+        limit = strip.Width - BTN_W() * 3 - ADD_W - int(4 * scale)
+        x = max(int(2 * scale), min(x, limit))
+        return (x, int(3 * scale), ADD_W, bar_h - int(6 * scale))
+
+    def _hit_add(x, yv):
+        ax, ay, aw, ah = _add_rect()
+        return ax <= x <= ax + aw and ay <= yv <= ay + ah
 
     def _rounded_path(x, y, w, h, rad):
         p = GraphicsPath()
@@ -159,6 +176,14 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
                 g.DrawString("✕", btn_font, SolidBrush(fg),
                              RectangleF(float(cx), float(ty), float(close_w), float(th)), sf_c)
             last_right = x + tw
+        # 「+」新建标签按钮(浏览器式): 悬停给底色, 加号本身不变形
+        ax, ay, aw, ah = _add_rect()
+        if st.get("hover_add"):
+            g.FillPath(SolidBrush(st["tab_hover"]),
+                       _rounded_path(ax, ty, aw, th, rad))
+        g.DrawString("+", btn_font,
+                     SolidBrush(st["fg_on"] if st.get("hover_add") else st["fg_off"]),
+                     RectangleF(float(ax), float(ty), float(aw), float(th)), sf_c)
         # 右端窗口按钮: ─ □ ✕ —— 白色符号 + 分隔线
         # (Pen 必须用顶部 import: 函数中段 import 会让前面的分隔线绘制碰到未绑定局部名,
         #  "点回信息流(激活标签后有非激活标签)"的重绘即爆 UnboundLocalError 整窗异常)
@@ -296,6 +321,76 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
         except Exception:
             pass
 
+    def _open_add_menu():
+        """「+」→ 标签栏下方的小选择框: 浏览器 / 副信息流。
+
+        用无边框 Form 自绘(而不是 ContextMenuStrip): 后者的系统配色在深色主题下会
+        露出一圈白边, 且没法跟随页面推来的标签栏配色。点外面 / Esc / 选中一项都关闭。
+        """
+        from System.Drawing import Point as SPoint, Size as SSize
+        try:
+            ow, oh = int(150 * scale), int(80 * scale)
+            row_h = int(35 * scale)
+            pop = WinForms.Form()
+            pop.FormBorderStyle = getattr(WinForms.FormBorderStyle, "None")
+            pop.ShowInTaskbar = False
+            pop.StartPosition = WinForms.FormStartPosition.Manual
+            pop.BackColor = st["tab_active"]
+            pop.Size = SSize(ow, oh)
+            pop.KeyPreview = True
+
+            def _close(_s=None, _e=None):
+                try:
+                    pop.Close()
+                except Exception:
+                    pass
+
+            pop.Deactivate += _close
+            pop.Paint += lambda _s, e: e.Graphics.DrawRectangle(
+                Pen(st["sep"], 1.0), 0, 0, pop.Width - 1, pop.Height - 1)
+            pop.KeyDown += lambda _s, e: _close() if int(e.KeyCode) == 27 else None
+
+            for i, (label, kind) in enumerate((("浏览器", "browser"),
+                                               ("副信息流", "feed"))):
+                b = WinForms.Button()
+                b.Text = label
+                b.FlatStyle = WinForms.FlatStyle.Flat
+                b.FlatAppearance.BorderSize = 0
+                b.FlatAppearance.MouseOverBackColor = st["tab_hover"]
+                b.FlatAppearance.MouseDownBackColor = st["tab_hover"]
+                b.BackColor = st["tab_active"]
+                b.ForeColor = st["fg_on"]
+                b.Font = font
+                b.Cursor = WinForms.Cursors.Hand
+                b.TextAlign = ContentAlignment.MiddleLeft
+                b.Padding = WinForms.Padding(int(10 * scale), 0, 0, 0)
+                b.Location = SPoint(int(5 * scale),
+                                    int(5 * scale) + i * row_h)
+                b.Size = SSize(ow - int(10 * scale), row_h - int(2 * scale))
+
+                def _pick(_s=None, _e=None, k=kind):
+                    _close()
+                    try:
+                        api.tab_new(k)
+                    except Exception:
+                        pass
+                b.Click += _pick
+                pop.Controls.Add(b)
+
+            ax, _ay, _aw, _ah = _add_rect()
+            pt = strip.PointToScreen(SPoint(ax, bar_h))
+            scr = WinForms.Screen.FromControl(form).WorkingArea
+            x = max(scr.X, min(pt.X, scr.Right - ow))
+            y = pt.Y
+            if y + oh > scr.Bottom:
+                y = max(scr.Y, pt.Y - bar_h - oh)
+            pop.Location = SPoint(x, y)
+            pop.Show(form)
+            pop.Activate()
+        except Exception:
+            import traceback
+            traceback.print_exc()
+
     # 拖出成悬浮窗(v0.3.1.34; 触发方式 v0.3.1.44 修正):
     #   判定在模块级 detach_verdict() 里(可单测), 这里只负责"按住/捕获/吞点击"。
     #   ★ 按住期间必须用鼠标捕获跟住指针 —— 往下拖会立刻离开这 32px 高的标签栏,
@@ -333,6 +428,8 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
         drag["fired"] = False
         if _btn_at(args.X) is not None:
             return
+        if _hit_add(args.X, args.Y):
+            return   # 「+」点击自己处理; 不能落到下面的窗口拖动
         t = _hit_tab(args.X, args.Y)
         if t is not None:
             if t.get("closable"):
@@ -379,6 +476,10 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
         if name != st["hover_btn"]:
             st["hover_btn"] = name
             strip.Invalidate()
+        hov_add = _hit_add(args.X, args.Y)
+        if hov_add != st["hover_add"]:
+            st["hover_add"] = hov_add
+            strip.Invalidate()
         ht = _hit_tab(args.X, args.Y)
         hid = ht["id"] if ht is not None else None
         if hid != st["hover_tab"]:
@@ -407,6 +508,9 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
         if st["hover_tab"] is not None:
             st["hover_tab"] = None
             ch = True
+        if st["hover_add"]:
+            st["hover_add"] = False
+            ch = True
         if ch:
             strip.Invalidate()
 
@@ -429,6 +533,9 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
         name = _btn_at(args.X)
         if name is not None:
             on_window_btn(name)
+            return
+        if _hit_add(args.X, args.Y):
+            _open_add_menu()
             return
         t = _hit_tab(args.X, args.Y)
         if t is not None:

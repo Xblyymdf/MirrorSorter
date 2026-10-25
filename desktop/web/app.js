@@ -103,6 +103,27 @@
       if (r !== "ok") toast("打不开这个链接", true);   // 壳里打不开也不许 window.open 顶掉界面
     }).catch(function () { toast("打不开这个链接", true); });
   }
+  // AI 下发浏览器指令(打开网页/搜索) → 主窗口新标签页。
+  // 壳里必须走桥, 不能 window.open(会把信息流页面顶掉, 见上一条注释)。
+  const browserQueue = [];
+  function openBrowserTab(url, title) {
+    if (!url) return;
+    const api = shellBridge();
+    if (api) {
+      Promise.resolve(api.open_in_app(url, title || "", "tab")).then(function (r) {
+        if (r !== "ok") toast("打不开这个链接", true);
+      }).catch(function () { toast("打不开这个链接", true); });
+      return;
+    }
+    if (inShellWebview()) { browserQueue.push([url, title || ""]); return; }
+    window.open(url, "_blank", "noopener");
+  }
+  window.addEventListener("pywebviewready", function () {
+    while (browserQueue.length) {
+      const q = browserQueue.shift();
+      openBrowserTab(q[0], q[1]);
+    }
+  });
   function openExternal(url, title) {
     if (!url) return;
     if (shellBridge()) { deliverOpen(url, title); return; }
@@ -113,7 +134,136 @@
     while (shellQueue.length) { const q = shellQueue.shift(); deliverOpen(q[0], q[1]); }
   });
 
-  /* ================= 自动更新（仅 Windows 桌面版 exe） ================= */
+  /* ---------- 外部网页拖入 → 内置浏览器新标签（v0.4.27dsk） ----------
+     从外部浏览器把地址栏 / 标签页 / 链接拖进窗口: 是 http(s) 链接就开一个新标签页。
+     v0.4.27: **认不出链接也一律 preventDefault** —— 旧实现只要漏一次, 内核就把首页
+     导航到拖进来的网页(用户实测: 信息流被顶掉)。文件/纯文本只给提示, 绝不导航。
+     页面自己发起的拖拽(dragstart)不接管; 普通浏览器里完全不接管。 */
+  const dropQueue = [];
+  let dropInternal = false;
+  document.addEventListener("dragstart", function () { dropInternal = true; }, true);
+  document.addEventListener("dragend", function () {
+    setTimeout(function () { dropInternal = false; }, 0);
+  }, true);
+  function dropOpenWith(api, url) {
+    Promise.resolve(api.open_in_app(url, "", "tab")).then(function (r) {
+      if (r !== "ok") toast("打不开这个链接", true);
+    }).catch(function () { toast("打不开这个链接", true); });
+  }
+  function dropDeliver(url) {
+    const api = shellBridge();
+    if (api) { dropOpenWith(api, url); return; }
+    dropQueue.push(url);   // 只可能是壳里(普通浏览器 dropTargetOk 已整体放行)
+  }
+  window.addEventListener("pywebviewready", function () {
+    while (dropQueue.length) {
+      const api = shellBridge(), u = dropQueue.shift();
+      if (!api) { dropQueue.unshift(u); break; }
+      dropOpenWith(api, u);
+    }
+  });
+  function dropStrictUrl(s) {
+    s = String(s == null ? "" : s).replace(/\u0000/g, "").trim();
+    if (!s) return "";
+    const lines = s.split(/\r?\n/);
+    for (let i = 0; i < lines.length; i++) {
+      const v = lines[i].trim();
+      if (v && v.charAt(0) !== "#" && /^https?:\/\/\S+$/i.test(v)) return v;
+    }
+    return "";
+  }
+  function dropFromHtml(h) {
+    try {
+      const m = /href\s*=\s*["']([^"']+)["']/i.exec(String(h || ""));
+      if (m && /^https?:\/\/\S+$/i.test(m[1])) return m[1];
+    } catch (e) { /* 读不到就算了 */ }
+    return "";
+  }
+  function dropTypes(dt) {
+    try { return Array.prototype.slice.call(dt.types || []); } catch (e) { return []; }
+  }
+  function dropPick(dt) {
+    if (!dt) return "";
+    const types = dropTypes(dt);
+    const order = ["text/uri-list", "text/x-moz-url", "URL", "text/plain"];
+    for (let i = 0; i < order.length; i++) {
+      if (types.length && types.indexOf(order[i]) < 0) continue;
+      let v = "";
+      try { v = dt.getData(order[i]); } catch (e) { continue; }
+      const u = dropStrictUrl(v) || dropFromHtml(v);
+      if (u) return u;
+    }
+    if (types.indexOf("text/html") >= 0) {
+      try { return dropFromHtml(dt.getData("text/html")); } catch (e) { /* 忽略 */ }
+    }
+    return "";
+  }
+  /* 部分内核对外部拖拽在 drop 时 getData 读不到, 但 items 里仍有字符串 */
+  function dropAsyncPick(dt, done) {
+    let answered = false, left = 0;
+    let items = [];
+    function answer(u) { if (!answered) { answered = true; done(u || ""); } }
+    try { items = Array.prototype.slice.call((dt && dt.items) || []); } catch (e) { items = []; }
+    for (let i = 0; i < items.length; i++) {
+      const it = items[i], kind = String(it.kind || ""), ty = String(it.type || "");
+      if (kind !== "string") continue;
+      if (!/^text\//i.test(ty) && ty !== "URL") continue;
+      left++;
+      try {
+        it.getAsString(function (s) {
+          const u = dropStrictUrl(s) || dropFromHtml(s);
+          if (u) { answer(u); return; }
+          if (--left <= 0) answer("");
+        });
+      } catch (e) { if (--left <= 0) answer(""); }
+    }
+    if (!left) answer("");
+  }
+  function dropMiss(types) {
+    const api = shellBridge();
+    if (!api || typeof api.drop_miss !== "function") return;
+    try { api.drop_miss(String(types || "").slice(0, 200)); } catch (e) { /* 忽略 */ }
+  }
+  function dropEditable(el) {
+    for (let t = el; t && t.nodeType === 1; t = t.parentNode) {
+      const n = t.nodeName;
+      if (n === "INPUT" || n === "TEXTAREA" || n === "SELECT") return true;
+      const ce = t.getAttribute && t.getAttribute("contenteditable");
+      if (ce === "" || ce === "true" || ce === "plaintext-only") return true;
+    }
+    return false;
+  }
+  function dropTargetOk(e) {
+    if (!shellBridge() && !inShellWebview()) return false;   // 普通浏览器: 不接管
+    if (!e.dataTransfer) return false;
+    if (dropEditable(e.target)) return false;                // 输入框里拖字交给页面
+    return true;                                             // 其余(含文件)一律由壳接管
+  }
+  document.addEventListener("dragover", function (e) {
+    if (!dropTargetOk(e)) return;
+    e.preventDefault();
+    try { e.dataTransfer.dropEffect = "copy"; } catch (err) { /* 忽略 */ }
+  }, true);
+  document.addEventListener("drop", function (e) {
+    if (!dropTargetOk(e)) return;
+    const wasInternal = dropInternal;
+    dropInternal = false;
+    const dt = e.dataTransfer;
+    const u = dropPick(dt);
+    if (!u && wasInternal) return;                           // 页面内拖拽: 交还给页面
+    e.preventDefault();
+    e.stopPropagation();
+    if (u) { dropDeliver(u); return; }
+    const types = dropTypes(dt);
+    dropAsyncPick(dt, function (u2) {
+      if (u2) { dropDeliver(u2); return; }
+      dropMiss(types.join("|"));
+      toast("拖入的内容里没有网页链接", true);
+    });
+  }, true);
+
+
+  /* ================= 自动更新  /* ================= 自动更新（仅 Windows 桌面版 exe） ================= */
   let updBusy = false, updTimer = null;
   function updSize(n) {
     n = Number(n) || 0;
@@ -743,6 +893,32 @@
     if (act === "refresh") { refreshFeed(); return; }
     goSettings(act);          // general / sources / ai …
   }
+  // v0.4.38: 首页降权只算「真的被翻到」的卡片。旧口径是服务端一返回就计数,
+  // 4 列布局下没滑到的半页也照样被降权。这里用 IntersectionObserver 看露出比例,
+  // 过半才把 key 攒起来批量上报; 同一张卡(元素)只报一次。
+  const viewSeen = new WeakSet();
+  let viewQueue = [], viewTimer = null;
+  function flushViewed() {
+    viewTimer = null;
+    const keys = viewQueue.splice(0, viewQueue.length);
+    if (!keys.length || S.view !== "feed" || S.q || !S.session) return;
+    api("/api/viewed", { method: "POST", body: JSON.stringify({ rid: S.session, keys: keys }) })
+      .catch(function () {});
+  }
+  const viewObs = ("IntersectionObserver" in window) ? new IntersectionObserver(function (es) {
+    let hit = false;
+    for (const e of es) {
+      if (!e.isIntersecting || e.intersectionRatio < 0.5) continue;
+      const el = e.target;
+      viewObs.unobserve(el);
+      if (viewSeen.has(el)) continue;
+      viewSeen.add(el);
+      const k = el.dataset && el.dataset.key;
+      if (k) { viewQueue.push(k); hit = true; }
+    }
+    if (hit && !viewTimer) viewTimer = setTimeout(flushViewed, 700);
+  }, { threshold: [0.5] }) : null;
+
   function renderItems(items) {
     if (!items.length) {
       if (S.offset === 0) $("#list").innerHTML = renderEmpty(emptyKind(), S.q);
@@ -766,6 +942,11 @@
       list.scrollTop = Math.max(0, list.scrollTop - removed);
     }
     applySrcFilter();
+    if (viewObs && S.view === "feed" && !S.q) {
+      // 已上报过的元素是 unobserve 状态; 重复 observe 无副作用。隐藏(别的平台)的卡
+      // 不算 intersecting, 不会被计入。
+      list.querySelectorAll(".card").forEach(function (c) { viewObs.observe(c); });
+    }
   }
   async function loadFeed(refresh) {
     if (S.loading) return;
@@ -1616,6 +1797,8 @@
       segPick("#bqLevelRow", s.ui_bq === "0" ? "关闭" : (s.ui_bq_level || "中"));
       segPick("#ownuiRow", s.ui_ownui || "1");
       segPick("#openModeRow", s.ui_new_window === "0" ? "0" : "1");
+      segPick("#browserRow", s.ui_search_engine || "bing");
+      segPick("#browserStartRow", s.ui_browser_on_start === "1" ? "1" : "0");
     } catch (e) { toast("读取设置失败：" + e, true); }
   }
   // 分段选择器：读取时点亮当前档，点击即保存（旧版同做法，省一次"保存"点击）
@@ -1652,6 +1835,8 @@
   segBind("#srScaleRow", "ui_sr_scale", "保存超分倍率");
   segBind("#ownuiRow", "ui_ownui", "保存播放页自有 UI");
   segBind("#openModeRow", "ui_new_window", "保存打开方式");
+  segBind("#browserRow", "ui_search_engine", "保存搜索引擎");
+  segBind("#browserStartRow", "ui_browser_on_start", "保存启动行为");
   // 超分 / 增强强度：界面上是一个「档位」，后端存的是「开关 + 档位」两个键。
   // 档位选「关」= 开关写 0（脚本据此整段不启用），选别的 = 开关写 1 + 档位名。
   const segBindPair = (sel, onKey, lvlKey, offVal, label) => {
@@ -3169,7 +3354,8 @@
     addMsg("me", t);
     const aiEl = addMsg("ai", "");
     const tEl = aiEl.querySelector(".msg-text");
-    let chips = [], trigger = null, cid = S.cid, ctx = undefined, replied = "";
+    let chips = [], trigger = null, browser = null, cid = S.cid,
+        ctx = undefined, replied = "";
     $("#chatStop").hidden = false;
     chatCtrl = new AbortController();
     const scroll = () => { $("#msgs").scrollTop = $("#msgs").scrollHeight; };
@@ -3183,6 +3369,7 @@
         const d = await r.json();                       // 未配置 AI / 总开关关闭时后端回普通 JSON
         tEl.textContent = d.reply || d.error || "（没有返回内容）";
         chips = d.chips || []; cid = d.cid || cid; ctx = d.ctx; trigger = d.trigger || null;
+        browser = d.browser || null;
       } else {
         const reader = r.body.getReader(), dec = new TextDecoder();
         let buf = "";
@@ -3201,7 +3388,7 @@
             if (ev === "meta") { chips = data.chips || []; cid = data.cid || cid; if (data.ctx !== undefined) ctx = data.ctx; }
             else if (ev === "think") { if (!tEl.textContent) tEl.textContent = "思考中…"; }
             else if (ev === "delta") { replied += data.t || ""; tEl.textContent = replied; scroll(); }
-            else if (ev === "done") { replied = data.reply || replied; chips = data.chips || chips; trigger = data.trigger || null; if (data.ctx !== undefined) ctx = data.ctx; }
+            else if (ev === "done") { replied = data.reply || replied; chips = data.chips || chips; trigger = data.trigger || null; if (data.ctx !== undefined) ctx = data.ctx; if (data.browser) browser = data.browser; }
           }
         }
         tEl.textContent = replied || tEl.textContent || "（没有返回内容）";
@@ -3218,6 +3405,7 @@
       if (S.ctx) $("#ctxTitle").textContent = "正在针对：《" + S.ctx.title + "》";
     }
     if (chips && chips.length) aiEl.appendChild(chipsRow(chips));
+    if (browser && browser.url) openBrowserTab(browser.url, browser.title || "");
     scroll();
     loadConvs();                                   // 首句会自动命名，列表要跟着更新
     if (trigger === "settings") { loadSettings(); loadMachine(); loadStatus(); loadFeed(false); }

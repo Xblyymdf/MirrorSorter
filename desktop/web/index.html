@@ -176,7 +176,7 @@
         <button class="svItem" data-sec="data"><svg class="ic"><use href="#i-trash"/></svg>数据</button>
         <button class="svItem" data-sec="disclaimer"><svg class="ic"><use href="#i-inbox"/></svg>免责声明</button>
       </div>
-      <div class="svVer">洞鉴虚明 v0.4.25dsk</div>
+      <div class="svVer">洞鉴虚明 v0.4.38dsk</div>
     </nav>
   </aside>
 
@@ -200,6 +200,19 @@
           <button id="noteSave">保存备注</button>
           <div class="fld"><span class="lbl">过滤档位</span>
             <select id="modeSel2"><option>严格</option><option>标准</option><option>宽松</option><option>严肃</option></select></div>
+          <div class="fld"><span class="lbl">浏览器（地址栏搜索与「+ 浏览器」新标签使用的搜索引擎）</span>
+            <div class="row" id="browserRow">
+              <button class="seg" data-v="google">谷歌</button>
+              <button class="seg" data-v="baidu">百度</button>
+              <button class="seg" data-v="bing">Bing</button>
+            </div>
+            <p class="tip">默认 Bing。地址栏里输入文字（不是网址）后回车，会用这里选中的引擎搜索。</p></div>
+          <div class="fld"><span class="lbl">启动时打开浏览器（每次启动软件自动开一个浏览器标签页）</span>
+            <div class="row" id="browserStartRow">
+              <button class="seg" data-v="1">开启</button>
+              <button class="seg" data-v="0">关闭</button>
+            </div>
+            <p class="tip">默认关闭。开启后，下次启动软件会直接用上面的搜索引擎首页开一个标签页。</p></div>
         </section>
 
         <section class="svPanel" data-sec="look">
@@ -582,7 +595,7 @@
           <h3>免责声明</h3>
           <div id="disclaimerBody" class="disc"></div>
           <button id="btnDisclaimer">我已阅读并同意</button>
-          <p class="tip" style="margin-top:14px">洞鉴虚明 v0.4.25dsk · 数据只存本机</p>
+          <p class="tip" style="margin-top:14px">洞鉴虚明 v0.4.38dsk · 数据只存本机</p>
         </section>
       </div>
     </div>

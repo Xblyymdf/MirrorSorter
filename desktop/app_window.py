@@ -65,6 +65,37 @@ BG_PAGE = "#17181a"
 
 _URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 
+# 地址栏搜索: 设置 → 常规 → 浏览器 里选, 默认 Bing。
+# 设置值直接读库(与主页面同一份), 不在壳里再存一份。
+SEARCH_ENGINES = {
+    "google": ("谷歌", "https://www.google.com/search?q=",
+               "https://www.google.com/"),
+    "baidu": ("百度", "https://www.baidu.com/s?wd=",
+              "https://www.baidu.com/"),
+    "bing": ("Bing", "https://www.bing.com/search?q=",
+             "https://www.bing.com/"),
+}
+DEFAULT_SEARCH_ENGINE = "bing"
+
+
+def search_engine_key():
+    try:
+        v = str(app.sget("ui_search_engine") or "").strip().lower()
+    except Exception:
+        v = ""
+    return v if v in SEARCH_ENGINES else DEFAULT_SEARCH_ENGINE
+
+
+def search_engine_url(query, engine=None):
+    from urllib.parse import quote_plus
+    key = engine if engine in SEARCH_ENGINES else search_engine_key()
+    return SEARCH_ENGINES[key][1] + quote_plus(str(query or "").strip())
+
+
+def search_engine_home(engine=None):
+    key = engine if engine in SEARCH_ENGINES else search_engine_key()
+    return SEARCH_ENGINES[key][2], SEARCH_ENGINES[key][0]
+
 
 def _norm_nav_url(raw):
     """地址栏输入 → 可导航 URL; 不合法返回 None。
@@ -278,6 +309,9 @@ class ShellApi:
                        "pinned": True, "opened": True, "float": False}]
         self._active = self.HOME_ID
         self._next_id = 1
+        # 激活标签最近一次导航状态(收藏 ☆ 的「当前网页」); 0 号信息流永远为空
+        self._live_id = self.HOME_ID
+        self._live_url = ""
 
     def attach(self, win, app_url):
         """主窗口创建后绑定窗口引用(供控件池 marshal 与窗口按钮使用)。"""
@@ -453,6 +487,24 @@ class ShellApi:
         self._render()   # 即时反馈: 标签栏立刻高亮新标签(不等页面加载完)
         return "ok"
 
+    def drop_miss(self, types=""):
+        """拖拽诊断: 页面认不出拖入内容时上报 MIME 类型, 只记日志(用户不可见)。"""
+        try:
+            _log_line("drop-miss types=%s" % str(types or "")[:200])
+        except Exception:
+            pass
+        return "ok"
+
+    def on_drop(self, tab_key, url):
+        """外部浏览器把网页/链接拖进窗口(站点控件的 document-start 脚本经 WebMessage 上报)。
+        拖进来的链接一律作为**主窗口新标签页**打开 —— 拖进窗口 = 窗口内新开, 不打断
+        当前页; 「信息以新窗口形式打开」只决定点开信息的默认方式, 不跟着变。"""
+        u = _norm_nav_url(url)
+        if not u:
+            return "bad-url"
+        _log_line("drop-open tab=%s url=%s" % (tab_key, u[:200]))
+        return self.open_in_app(u, mode="tab")
+
     def _open_float(self, tab):
         """把标签的页面放进一个独立悬浮窗(控件池缺失时退化为主窗口标签)。"""
         pages, mgr = self._pages, self._floats
@@ -468,6 +520,37 @@ class ShellApi:
             tab["opened"] = True
             pages.create(tab["url"], tab["id"])
         mgr.open(tab, pages)
+
+    def tab_new(self, kind="browser"):
+        """标签栏「+」新建菜单: browser=搜索引擎首页, feed=副信息流。
+        两者都可关闭; 0 号信息流仍是固定首页。"""
+        kind = str(kind or "").strip()
+        if kind not in ("browser", "feed"):
+            return "bad-kind"
+        if kind == "browser":
+            url, title = search_engine_home()
+        else:
+            url, title = self._app_url, "副信息流"
+        with self._lock:
+            tab = {"id": self._next_id, "url": url, "title": title,
+                   "pinned": False, "opened": False, "float": False}
+            self._next_id += 1
+            self._tabs.append(tab)
+            self._active = tab["id"]
+        self._activate(tab)
+        self._render()
+        return "ok"
+
+    def open_startup_browser(self):
+        """设置「启动时打开浏览器」= 开启 → 窗口就绪后开一个搜索引擎首页标签。
+        由 gui_ready 延迟调用(不能更早: 新控件要借 0 号控件的 WebView2 数据目录)。"""
+        try:
+            if app.sget("ui_browser_on_start") != "1":
+                return False
+            return self.tab_new("browser") == "ok"
+        except Exception:
+            _log_exc("startup-browser")
+            return False
 
     def tab_switch(self, tid=None):
         try:
@@ -626,6 +709,18 @@ class ShellApi:
         with self._lock:
             return self._active
 
+    def active_page(self):
+        """当前激活标签页的网址/标题/是否固定首页(收藏栏与 ☆ 按钮用)。
+        信息流固定页是本地服务, 网址对外一律视为空。"""
+        with self._lock:
+            t = next((x for x in self._tabs if x["id"] == self._active), None)
+            if t is None:
+                return {"id": None, "url": "", "title": "", "pinned": True}
+            pinned = bool(t.get("pinned"))
+            url = "" if pinned else (self._live_url if self._live_id == t["id"] else "")
+            return {"id": t["id"], "url": url,
+                    "title": str(t.get("title") or ""), "pinned": pinned}
+
     def nav_back(self):
         pages = self._pages
         if pages is not None:
@@ -657,6 +752,23 @@ class ShellApi:
         pages.show(tid)   # 焦点交回页面(浏览器习惯: 导航后地址栏失焦)
         return "ok"
 
+    def nav_input(self, raw):
+        """地址栏回车入口: 网址直接去; 普通文字按默认搜索引擎搜。
+        带协议头却不是 http(s) 的输入(file:/javascript: 等)仍然拒绝。"""
+        raw = str(raw or "").strip()
+        u = _norm_nav_url(raw)
+        if u is not None:
+            return self.nav_goto(u)
+        if not raw or re.match(r"^[a-zA-Z][a-zA-Z0-9+.\-]*://", raw):
+            return "bad-url"
+        pages = self._pages
+        if pages is None:
+            return "no-pages"
+        tid = self._active_id()
+        pages.goto(tid, search_engine_url(raw))
+        pages.show(tid)
+        return "ok"
+
     # ---- 内部 ----
     def _activate(self, tab):
         """显示 tab(无控件则异步创建), 隐藏当前控件 —— 纯可见性切换, 页面零重载。"""
@@ -669,9 +781,12 @@ class ShellApi:
         if not tab["pinned"] and not tab["opened"]:
             tab["opened"] = True
             pages.create(tab["url"], tab["id"])
+        # 顺序要紧: 先 show 新控件再 hide 旧的。直接隐藏持有键盘焦点的 WebView2
+        # 会让 Windows 把焦点甩给地址栏(它因 GotFocus 全选), 切标签时网址会闪一下
+        # 被选中。新控件先拿到焦点, 焦点就不会经过地址栏。
+        pages.show(tab["id"])
         if prev_id != tab["id"]:
             pages.hide(prev_id)
-        pages.show(tab["id"])
         pages.push_nav(tab["id"])   # 切标签后补推导航状态(防地址栏显示旧 URL)
 
     def update_title(self, tab_key, title):
@@ -723,7 +838,11 @@ class ShellApi:
         if tab_key != active:
             return
         # 信息流是本地服务(127.0.0.1), 网址没有意义 —— 地址栏留空(用户要求)
-        self._push_nav("" if pinned else url, can_back, can_fwd)
+        u = "" if pinned else str(url or "")
+        with self._lock:
+            self._live_id = tab_key
+            self._live_url = u
+        self._push_nav(u, can_back, can_fwd)
 
     def _push_nav(self, url, can_back, can_fwd):
         fn = self._navbar_update
@@ -1357,7 +1476,7 @@ def shell_main(e2e_url=None, e2e_float_url=None, e2e_float_resize_url=None):
                 return v
             # bug6: 网页(视频)全屏 → 隐藏标签栏与导航栏, 窗口内只剩画面(整窗纯播放);
             # 退出全屏再显回来。strip/nav 实例的装配晚于 create_pool, 这里用字典迟绑定。
-            chrome = {"strip": None, "nav": None}
+            chrome = {"strip": None, "nav": None, "bm": None}
 
             def on_fs(_key, on):
                 hidden = bool(on)
@@ -1378,11 +1497,22 @@ def shell_main(e2e_url=None, e2e_float_url=None, e2e_float_resize_url=None):
                             nb.Visible = not hidden
                     except Exception:
                         _log_exc("fullscreen/navbar")
+                bm = chrome.get("bm")
+                if bm is not None:
+                    try:
+                        bmfs = getattr(bm, "set_fullscreen", None)
+                        if bmfs is not None:
+                            bmfs(hidden)
+                        else:
+                            bm.Visible = not hidden
+                    except Exception:
+                        _log_exc("fullscreen/bookmarks")
 
             # 站点自身弹新页(target=_blank 等)一律进主窗口标签, 不弹悬浮窗(旧行为)
             pages = create_pool(
                 win, api.update_title, lambda _k, u: api.open_in_app(u, mode="tab"),
-                theme_getter=_current_theme, port=port, on_nav=api._on_nav, on_fs=on_fs)
+                theme_getter=_current_theme, port=port, on_nav=api._on_nav, on_fs=on_fs,
+                on_drop=api.on_drop)
             pages.init()          # 等窗体就绪 + WS_THICKFRAME 无边框缩放补丁
             api.bind_pages(pages)
         except Exception:
@@ -1408,20 +1538,51 @@ def shell_main(e2e_url=None, e2e_float_url=None, e2e_float_resize_url=None):
                     tabstrip_h=int(getattr(strip_update, "bar_h", 0) or 0)))
         except Exception:
             _log_exc("shell_float/install")
+        bm_store = None
+        try:
+            from shell_bookmarks import BookmarkStore
+            bm_store = BookmarkStore()
+        except Exception:
+            _log_exc("shell_bookmarks/store")
         try:
             from shell_navbar import install_navbar
             # top=标签栏高度(install_strip 暴露): 工具栏紧贴标签栏下沿
             nav_update = install_navbar(
                 win, api, top=getattr(strip_update, "bar_h", 32) if strip_update else 32,
-                bg_getter=lambda: app.sget("ui_bg_scheme"))
+                bg_getter=lambda: app.sget("ui_bg_scheme"),
+                bookmarks=bm_store,
+                title_getter=lambda: (api.active_page() or {}).get("title") or "")
             api.bind_navbar(nav_update)
             chrome["nav"] = getattr(nav_update, "bar", None)
         except Exception:
             _log_exc("shell_navbar/install")
         try:
+            from shell_bookmarks import install_bookmarks
+            if bm_store is not None:
+                from shell_navbar import nav_h as _nav_h
+                _scale = float(getattr(win.native, "_scale", 1.0) or 1.0)
+                _nav_top = int(getattr(strip_update, "bar_h", 32) if strip_update else 32)
+                _bm_top = _nav_top + _nav_h(_scale)
+
+                def _bm_size(hh, _top=_bm_top):
+                    if pages is not None:
+                        pages.set_content_top(_top + int(hh))
+
+                bm_update = install_bookmarks(
+                    win, api, top=_bm_top, store=bm_store, on_height=_bm_size,
+                    bg_getter=lambda: app.sget("ui_bg_scheme"))
+                chrome["bm"] = bm_update
+        except Exception:
+            _log_exc("shell_bookmarks/install")
+        try:
             _install_mouse_side_buttons(api, win)
         except Exception:
             _log_exc("mouse-side-buttons")
+        # 设置「启动时打开浏览器」: 等标签栏/导航栏装好再开, 新标签立刻有 chrome;
+        # 稍等一拍是让首页控件完成初始化(新标签要复制它的 WebView2 配置)。
+        _stb = threading.Timer(0.8, api.open_startup_browser)
+        _stb.daemon = True
+        _stb.start()
         if e2e_url:
             time.sleep(8)   # 等主窗口与服务就绪
             api.open_in_app(e2e_url, "E2E 视频标签页", mode="tab")
