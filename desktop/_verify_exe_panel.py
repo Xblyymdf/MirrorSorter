@@ -8,6 +8,7 @@
 但必须逐字节比对，确认打包时采到的是最终版（改完 web/ 没重新打包是最常见的坑）。
 """
 import os
+import re
 import sys
 
 from PyInstaller.archive.readers import CArchiveReader, ZlibArchiveReader
@@ -29,6 +30,10 @@ exe = sys.argv[1] if len(sys.argv) > 1 else _latest_exe()
 if not exe or not os.path.isfile(exe):
     raise SystemExit("exe 不存在: " + (exe or "(dist 下没有 洞鉴虚明v*.exe)"))
 print("校验:", os.path.basename(exe), "%.1f MB" % (os.path.getsize(exe) / 1048576.0))
+
+# 版本号从 exe 文件名反推(洞鉴虚明v0.4.44dsk.exe → v0.4.44dsk): 升版本不用改本脚本
+_m = re.search(r"(v[0-9A-Za-z.]+)\.exe$", os.path.basename(exe))
+VER = _m.group(1) if _m else ""
 
 PASS = 0
 FAILS = []
@@ -133,21 +138,30 @@ if "app" in pyz_mods:
 # 这两个模块是 app_window 顶层 import 的，不会漏；但**改完没重新打包**是常见坑
 # （PyInstaller 在 Analysis 阶段采集源码，打包中途改文件不会进包）。
 for mod, kws in (("shell_tabstrip", ("install_strip", "_tab_path", "_fav", "_mix",
-                                     "FAV_COLORS", "hover_close", "set_bg_scheme")),
+                                     "FAV_COLORS", "hover_close", "set_bg_scheme",
+                                     # v0.4.44dsk: 首页画软件图标 + 其它标签画真实 favicon
+                                     "load_app_logo", "_logo_path", "_tab_icon",
+                                     "_LOGO_CACHE", "favicons")),
                  ("shell_navbar", ("install_navbar", "_pill_rect", "_recalc_omni",
-                                   "_circle", "NAV_H"))):
+                                   "_circle", "NAV_H",
+                                   # v0.4.44dsk: 空/非 http 的地址栏给放大镜
+                                   "search"))):
     if mod in pyz_mods:
         c = pyz.extract(mod)
         for kw in kws:
             ok("%s 字节码含 %s" % (mod, kw), has(c, kw))
     else:
         ok("PYZ 含 " + mod, False)
-# index.html 里的版本页脚必须已经是新版（防止打了旧 web/）
+# index.html 里的版本页脚必须**就是** exe 的版本（防止打了旧 web/）。
+# ★ 别写成 "含 v0.4.43dsk 且不含 v0.4.42dsk" —— 那种断言每升一版就要改一次,
+#   漏改就变成假 PASS。这里改成"页脚里出现的所有版本号都等于 exe 的版本"。
 hit = [n for n in names if n.replace("\\", "/").endswith("web/index.html")]
 if hit:
     html = car.extract(hit[0]).decode("utf-8", "replace")
-    ok("归档 web/index.html 页脚已是 v0.4.43dsk", "v0.4.43dsk" in html
-       and "v0.4.42dsk" not in html)
+    foot = re.findall(r"洞鉴虚明 (v[0-9A-Za-z.]+)", html)
+    ok("归档 web/index.html 页脚已是 %s" % (VER or "(未知版本)"),
+       bool(VER) and bool(foot) and all(v == VER for v in foot),
+       "页脚 %s / exe %s" % (sorted(set(foot)), VER))
 
 print("\nRESULT: %s" % ("PASS(%d)" % PASS if not FAILS else "FAIL(%d): %s" % (len(FAILS), " | ".join(FAILS))))
 sys.exit(1 if FAILS else 0)

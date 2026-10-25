@@ -34,6 +34,7 @@ TABS = [
      "url": "https://www.zhihu.com/"},
 ]
 ACTIVE = 2          # 激活标签放中间: 才能看出它的"脚"压住左右邻居
+URL = "https://www.bilibili.com/video/BV1xx411c7mD"
 
 
 class _Api(object):
@@ -71,7 +72,7 @@ class _Win(object):
         self.native = form
 
 
-def _render(scheme, path, states=None, width=1200):
+def _render(scheme, path, states=None, width=1200, url=URL):
     import clr
     clr.AddReference("System.Windows.Forms")
     clr.AddReference("System.Drawing")
@@ -101,7 +102,7 @@ def _render(scheme, path, states=None, width=1200):
     u_strip.set_scheme(scheme)
     u_nav.set_scheme(scheme)
     u_strip(TABS, ACTIVE)
-    u_nav("https://www.bilibili.com/video/BV1xx411c7mD", True, False)
+    u_nav(url, True, False)
     for k, v in (states or {}).items():
         # 直接改内部状态: 悬停态在无真鼠标的环境下没法靠事件触发, 但绘制分支必须覆盖到
         if k.startswith("nav:"):
@@ -143,6 +144,8 @@ def main(argv):
         _render(DARK, os.path.join(OUT, "chrome_dark.png"))
     if which in ("both", "light"):
         _render(LIGHT, os.path.join(OUT, "chrome_light.png"))
+    # 搜索态(空地址): 地址栏左侧应该是放大镜, 而不是地球/锁
+    _render(DARK, os.path.join(OUT, "chrome_search.png"), url="")
     # 悬停态全家桶: 悬停标签 / 悬停 ✕ / 悬停 + / 悬停窗口关闭键 / 悬停地址栏
     # 窄窗: 标签会被挤窄(旧版这里会把最右标签的 ✕ 顶出栏外, 用户截过图)
     _render(DARK, os.path.join(OUT, "chrome_narrow.png"), width=760,

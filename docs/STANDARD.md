@@ -181,11 +181,11 @@ node  _test_ai_page_js.js  :: 注入网页的助手脚本（vm + 假 DOM，断�
 
 `test_smoke.py` 要用系统 `C:\Python314\python.exe`（托管 3.13 无 tkinter，「体检:本机可跑悬浮窗」会 FAIL）。
 
-### 本版专项（v0.4.43dsk 顶栏视觉重做）
+### 本版专项（v0.4.44dsk 顶栏视觉重做 + 图标归位）
 
 ```bat
 python _shot_chrome.py        :: 出图肉眼比对 Chrome/Edge；改顶栏必跑
-python test_shell.py          :: 其中「顶栏结构1~6」是这次的结构性约定
+python test_shell.py          :: 其中「顶栏结构1~8」是这次的结构性约定
 :: 真窗口版: 打开真窗、真 WebView2、真配色, 渲染顶栏并断言"标签条末行 == 导航栏首行"
 set MIRRORSORTER_DATA_DIR=%TEMP%\msx-chrome-e2e
 set MIRRORSORTER_WV2_DATA=%TEMP%\msx-chrome-e2e-wv2
@@ -197,10 +197,10 @@ python app_window.py --e2e-chrome
 `_shot_chrome.py` 与 `--e2e-chrome` 是**互补**的两层：前者拿假数据单独渲染两个 Panel（快、
 可重复、能造悬停/窄窗等极端态）；后者是唯一能证明"激活标签和工具栏真的连成一片"的地方——
 两个 Panel 的**真实贴合**差 1px 就会露出接缝，而这在假数据图里永远看不出来。
-本机 150% DPI 下实测 `bar_h=54`（= 36×1.5，`form._scale` 由 pywebview 给），
-断言必须按运行时的实际像素比，不能写死 36。
+本机 150% DPI 下实测 `bar_h=57`（= 38×1.5，`form._scale` 由 pywebview 给），
+断言必须按运行时的实际像素比，不能写死 38。
 
-对标 Chrome/Edge 的差距在**结构**不在配色，只调颜色救不回来：
+**结构**（第一轮）：对标 Chrome/Edge 的差距在结构不在配色，只调颜色救不回来：
 
 - 标签**相邻无缝隙**，激活标签顶角圆角 + 底边平直，左右各有向外张开的"脚"；
 - 激活标签**下沿与工具栏齐平且同色** → 视觉上与下方内容连成一片。所以工具栏底色必须取
@@ -210,10 +210,50 @@ python app_window.py --e2e-chrome
 - ✕ / + / ─ □ ✕ 全部改成 1px 矢量线（文字符号粗细不匀、基线乱飘）；
 - 悬停底色取 `active ↔ bar` 的中点，**不要**直接用页面给的 `hover`（深色下它比 `active`
   还亮，悬停一个非激活标签会比激活标签更显眼，层次整个反了）；
-- 地址栏是**胶囊**（半径 = 半高），站点图标（https 给锁/其余给地球）画在胶囊**内**；
-  原生 TextBox 必须内缩在胶囊里，否则它这个不透明矩形会把圆角切方；
-- 每个标签带 16px 站点图标瓦片（域名取色 + 首字母，没有真实 favicon 时的兜底）——
-  为此 `app_window._render()` 的标签数据里加了 `url`。
+- 地址栏是**胶囊**（半径 = 半高），原生 TextBox 必须内缩在胶囊里，否则它这个不透明矩形
+  会把圆角切方。
+
+**"廉价感"**（第二轮，用户原话"还是一股廉价感，不如谷歌和 edge 的好"）。逐项消因，按影响
+从大到小：
+
+- ★ **ClearType**：`g.TextRenderingHint = ClearTypeGridFit`。GDI+ 默认是灰度 AA，9pt 的
+  中文/拉丁字母发虚、笔画糊在一起 —— 这是廉价感最直接的来源，**比配色影响大**。两个
+  Panel 的 `on_paint` 开头都要设。
+- ★ **字体换 `Segoe UI`**（原来用「Microsoft YaHei」）：雅黑的拉丁字母又宽又钝，一行网址里
+  英文数字占大头，一眼廉价。Segoe UI 缺中文字形时 GDI+ 会自动 font-linking 到雅黑，于是
+  "英文按 Segoe UI、中文按雅黑" —— 和 Chrome/Edge 在 Windows 上的做法一致。
+- 胶囊**平时不描边**（Chrome 的 omnibox 就是一块无边框实色胶囊；描一圈线立刻变成"输入框
+  控件"的味道）。悬停给淡描边、聚焦给强调色描边，状态靠边表达。
+- 胶囊底色 `_blend(strip, bar, 0.85)`（原 0.55，太淡显得脏）；地址栏字色未悬停时 `0.82`
+  （原 0.7，那一档在深色下像"禁用态"）。
+- 激活标签顶边加一道 `alpha=30` 的白内高光，让它像"浮起来的一张纸"而不是纯色矩形；
+  分隔线降到 `alpha=150`（满色在深色条上像表格框线）。
+- 后退/前进/刷新 **BTN_GAP=0 贴紧成一组**（Chrome 就是这样），圆形悬停底才连得起来；
+  按钮直径 `-6*scale`（原 -8，太小气）。
+- AI 圆钮打开时改成**强调色实心圆 + 白字**（原来 56 alpha 淡底 + 同色字，太虚）；
+- 高度：标签条 38 / 导航栏 40（原 36/38），接近 Chrome 的 40 上下。
+
+**图标**（第三轮，用户明确要求"信息流的图标改成软件图标，搜索界面的图标改成放大镜"）：
+
+- 信息流（首页/固定页，`not closable`）→ **软件自己的图标** `web/favicon.ico`；
+- 其它标签 → **真实站点图标**（`FaviconCache.image`，只读内存/磁盘命中，绝不联网等待），
+  拿不到才退化成"域名取色 + 首字母"瓦片；
+- 地址栏**空 / 非 http(s)** → **放大镜**（此时它是搜索框，不是网页）；https → 锁；其余 → 地球。
+- ★★ 随包 `web/favicon.ico` 是**单帧 PNG 压缩** ico，`System.Drawing.Icon.ToBitmap()` /
+  `BmpFrame()` 解不了（实测抛 `ArgumentOutOfRangeException: 请求的范围扩展超过了数组的结尾`）。
+  必须按 ICO 目录项 `struct.unpack("<BBBBHHII", …)` 取出 PNG 字节交给 `Image.FromStream`。
+- ★ 标签栏与收藏栏**共用同一个 `FaviconCache`**（`app_window` 里建 `fav_cache`，再分别传
+  `favicons=` / `icons=`）。各自 new 一个会把同一站点抓两遍，两处缓存命中还不同步。
+- ★ 图标是后台抓的，`favicons.subscribe(_on_icon)` 抓到就 `Invalidate`，否则要等下一次
+  鼠标事件才更新。
+
+**两个验收的坑**（都踩过）：
+
+- `--e2e-chrome` 的"工具栏同色"断言**不能用单点采样**：中间行会撞上图标/文字，开了 ClearType
+  之后连字形边缘都是彩色的（实测撞出 `#96795a` 次像素边）。改成扫首末行整条
+  （`range(0, width, 37)`）—— 首末行不会被任何元素占用（胶囊上下内缩 6 逻辑像素，圆形按钮居中收窄）。
+- 断言"导航栏首行 == 导航栏底色"是**同义反复**（接缝再大也 PASS），必须写成
+  "标签条末行 == 导航栏首行 == 工具栏底色"。
 
 ### 本版专项（v0.4.42dsk 右侧 AI 面板）
 

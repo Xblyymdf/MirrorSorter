@@ -581,11 +581,12 @@ check("全屏事件按标签去重(同状态重复事件直接丢, 否则反复�
       and "_Pool._fs_last[tab_key] = on" in _sp_src)
 
 # bug7 地址栏文字纯白/纯黑太刺眼 → 未悬停时 70% 不透明度
-check("bug7 地址栏文字未悬停时 70% 不透明度(悬停/编辑回满)",
+check("bug7 地址栏文字未悬停时降低不透明度(悬停/编辑回满)",
       '"tb_hover": False' in _nb_src
       and "def _blend(c, bg, k)" in _nb_src
       and "def _apply_tb_fg()" in _nb_src
-      and 'else _blend(st["fg"], st["tb_bg"], 0.7))' in _nb_src
+      # 比例是调过的(0.7 在深色下像"禁用态", 现为 0.82), 所以只锁"用了混色"这件事
+      and 'else _blend(st["fg"], st["tb_bg"], 0.' in _nb_src
       and "def _set_tb_hover(v)" in _nb_src
       and "tb.MouseEnter" in _nb_src and "tb.MouseLeave" in _nb_src)
 
@@ -629,9 +630,29 @@ check("顶栏结构6 悬停底色取 active↔bar 中点(层次: 栏底 < 悬停
       and 'st["tab_hover"] = _mix(st["tab_active"], st["bar"], 0.5)' in _st_src
       # 页面给的 hover 在深色下比 active 还亮, 直接用会把层次弄反
       and 'st["tab_hover"] = _c("hover", st["tab_hover"])' not in _st_src)
-
-
-# bug8 开启评论筛选屏蔽后评论偶发无法继续向下滚动
+# 用户原话: "信息流的图标改成软件图标, 然后搜索界面的图标改成放大镜"。
+# 顺带把"其它标签优先画真实站点图标"也钉住 —— 这条容易变成死代码(参数没接上就静默失效)。
+check("顶栏结构7 首页标签画软件自己的图标, 其它标签优先真实 favicon(拿不到才退化成色块)",
+      "def _tab_icon(t, size)" in _st_src
+      and 'if not t.get("closable"):' in _st_src      # 固定页(首页) = 软件图标
+      and "return load_app_logo(size)" in _st_src
+      and 'favicons.image(str(t.get("url") or ""))' in _st_src
+      # ★ 随包 ico 是单帧 PNG 压缩, System.Drawing.Icon 解不了(实测抛越界),
+      #   必须按目录项取出 PNG 交给 Image.FromStream
+      and 'struct.unpack("<BBBBHHII"' in _st_src
+      and "Image.FromStream(ms)" in _st_src
+      # 图标是后台抓的: 抓到一个就得重画, 否则要等下一次鼠标事件才更新
+      and "favicons.subscribe(_on_icon)" in _st_src
+      # 接线 —— 窗口壳必须真的把缓存传进去, 不传上面全是死代码
+      and "favicons=fav_cache" in _aw_src
+      # 标签栏与收藏栏共用一份缓存(各自 new 会把同一站点抓两遍)
+      and "icons=fav_cache" in _aw_src)
+check("顶栏结构8 地址栏空/非 http 时显示放大镜(此时它是搜索框, 不是网页)",
+      r'"search": "\uE721"' in _nb_src
+      # 判据: 空 或 非 http(s) → 放大镜; https → 锁; 其余 → 地球
+      and 'if not u or not (u.startswith("http://") or u.startswith("https://")):' in _nb_src
+      and 'sic = glyphs.get("search")' in _nb_src
+      and 'sic = glyphs.get("lock")' in _nb_src)
 check("bug8 主评论列表一条不删(只标记, 组件才会继续翻页) + 补泵翻页(屏蔽后仍能一路下滑)",
       "function isMainList(u)" in _cf_c and "/x/v2/reply/wbi/main" in _cf_c
       and "if (isMain) { markBlocked(r); out.push(r); continue; }" in _cf_c

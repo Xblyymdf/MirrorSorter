@@ -16,11 +16,90 @@
   所以工具栏(shell_navbar)的底色必须取 scheme 的 active, 标签条取 bar;
 - 分隔线只画在两个"都非激活/非悬停"的相邻标签之间;
 - ✕ / + / ─ □ ✕ 全部改成 1px 矢量线(旧版用文字符号, 粗细不匀、基线乱飘);
-- 每个标签带 16px 站点图标瓦片(域名取色 + 首字母, 没有真实 favicon 时的兜底)。
+- 每个标签带 16px 站点图标: 有真实 favicon 就画真的(shell_bookmarks.FaviconCache),
+  没有就退化成"域名取色 + 首字母"瓦片; 信息流首页固定画**软件自己的图标**。
+- 文字用 ClearType + Segoe UI(GDI+ 默认是灰度 AA + 雅黑, 小字号发虚、拉丁字母偏宽,
+  这是"廉价感"的一大来源, 比配色影响更大)。
 验收: `_shot_chrome.py` 把本模块与导航栏真渲染成 PNG(深/浅/悬停/窄窗四张), 肉眼比对。
 """
+import os
 import re
+import struct
+import sys
 import threading
+
+# 软件图标缓存: size -> Bitmap。绘制在 UI 线程高频发生, 不能每次都解 ico。
+_LOGO_CACHE = {}
+
+
+def _logo_path():
+    """随包的软件图标: 打包态在 _MEIPASS/web/, 源码态在 desktop/web/。"""
+    cands = []
+    mp = getattr(sys, "_MEIPASS", None)
+    if mp:
+        cands.append(os.path.join(mp, "web", "favicon.ico"))
+    here = os.path.dirname(os.path.abspath(__file__))
+    cands.append(os.path.join(here, "web", "favicon.ico"))
+    cands.append(os.path.join(here, "djxm_icon_128x128.ico"))
+    for p in cands:
+        try:
+            if os.path.isfile(p):
+                return p
+        except Exception:
+            pass
+    return ""
+
+
+def load_app_logo(size):
+    """软件自己的图标 → size×size 的 Bitmap; 拿不到返回 None。
+
+    ★ 不能用 `System.Drawing.Icon`: 随包的 web/favicon.ico 是**单帧 PNG 压缩**
+      (Vista 之后很常见), .NET 的 `Icon.ToBitmap()` / `Icon.BmpFrame()` 解不了,
+      直接抛 ArgumentOutOfRangeException(实测)。这里按 ICO 目录项取出 PNG 字节,
+      交给 Image.FromStream —— 这才是这类 ico 的正确读法。
+    """
+    try:
+        size = max(8, int(size))
+    except Exception:
+        return None
+    hit = _LOGO_CACHE.get(size)
+    if hit is not None:
+        return hit
+    path = _logo_path()
+    if not path:
+        return None
+    try:
+        import clr
+        clr.AddReference("System.Drawing")
+        from System.Drawing import Bitmap, Graphics, GraphicsUnit, Image, Rectangle
+        from System.Drawing.Drawing2D import InterpolationMode, PixelOffsetMode
+        from System.IO import MemoryStream
+
+        with open(path, "rb") as f:
+            data = f.read()
+        n = struct.unpack("<H", data[4:6])[0]
+        best, off = None, 6
+        for _ in range(n):
+            w, _h, _c, _r, _p, _b, sz, o = struct.unpack("<BBBBHHII", data[off:off + 16])
+            off += 16
+            if best is None or (w or 256) > best[0]:
+                best = ((w or 256), sz, o)
+        if best is None:
+            return None
+        ms = MemoryStream(data[best[2]:best[2] + best[1]])
+        src = Image.FromStream(ms)
+        bmp = Bitmap(size, size)
+        g = Graphics.FromImage(bmp)
+        g.InterpolationMode = InterpolationMode.HighQualityBicubic
+        g.PixelOffsetMode = PixelOffsetMode.HighQuality
+        g.DrawImage(src, Rectangle(0, 0, size, size),
+                    Rectangle(0, 0, int(src.Width), int(src.Height)), GraphicsUnit.Pixel)
+        g.Dispose()
+        src.Dispose()
+        _LOGO_CACHE[size] = bmp
+        return bmp
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------- 撕出悬浮窗的拖拽判定
@@ -50,17 +129,24 @@ def detach_verdict(dx, dy, scale=1.0):
     return ""
 
 
-def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=None):
+def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=None,
+                  favicons=None):
     """在窗口顶部安装原生标签栏并下移 WebView2 内容区。须在 GUI 就绪后调用(GUI 线程之外
     调用安全, 内部已 marshal)。返回 update(tabs, active) —— 传入
-    [{"id":..,"title":..,"closable":..}] 与激活 id 即重绘。"""
+    [{"id":..,"title":..,"closable":..,"url":..}] 与激活 id 即重绘。
+
+    favicons: shell_bookmarks.FaviconCache —— 给出时标签画**真实站点图标**(内存/磁盘命中,
+    不联网等待), 没有则退化成"域名取色 + 首字母"瓦片。
+    """
     import clr
     clr.AddReference("System.Drawing")
     from System.Drawing import (Color, ContentAlignment, Font, FontStyle, Pen,
                                 Rectangle, SolidBrush, StringFormat,
                                 StringAlignment, StringFormatFlags, StringTrimming,
                                 RectangleF, Point, Size)
-    from System.Drawing.Drawing2D import GraphicsPath, SmoothingMode
+    from System.Drawing.Drawing2D import GraphicsPath, InterpolationMode, \
+        PixelOffsetMode, SmoothingMode
+    from System.Drawing.Text import TextRenderingHint
     import System.Windows.Forms as WinForms
 
     form = win.native
@@ -70,10 +156,13 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
     # **下沿与工具栏齐平** —— 齐平 + 与工具栏同色, 激活标签才会和下方内容连成一片。
     # 旧版标签是"浮在深色条上的一张独立圆角小卡片", 这是最致命的差距: 结构不像浏览器,
     # 再怎么调颜色也救不回来。
-    bar_h = max(30, int(36 * scale))
+    bar_h = max(32, int(38 * scale))
     tab_top = int(5 * scale)          # 标签顶部留白(上方露出的是标签条底色)
     tab_h = bar_h - tab_top           # 标签高度 = 一直到栏底(不减去底部留白)
-    font = Font("Microsoft YaHei", 8.5 * scale)
+    # ★ 字体用 Segoe UI 而不是雅黑: 雅黑的拉丁字母又宽又钝, 中英混排一眼廉价。
+    #   Segoe UI 缺中文字形时 GDI+ 会自动 font-linking 到雅黑, 于是"英文按 Segoe UI、
+    #   中文按雅黑" —— 和 Chrome/Edge 在 Windows 上的做法一致。
+    font = Font("Segoe UI", 9.0 * scale)
     btn_font = Font("Microsoft YaHei", 10.0 * scale)   # 自绘弹出菜单用
     fav_font = Font("Segoe UI", 8.0 * scale, FontStyle.Bold)   # 站点图标瓦片里的字母
     TAB_ACTIVE = Color.FromArgb(22, 25, 32)     # 激活标签(= 工具栏底色, 两者必须同色)
@@ -214,16 +303,40 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
         c = FAV_COLORS[h % len(FAV_COLORS)]
         return Color.FromArgb(c[0], c[1], c[2]), host[:1].upper()
 
+    def _tab_icon(t, size):
+        """标签图标: 首页/固定页 → 软件自己的图标; 其它 → 真实站点图标。
+
+        真实图标走 FaviconCache(只读内存/磁盘命中, 绝不联网等待), 没有就返回 None,
+        由调用方退化成"域名取色 + 首字母"瓦片 —— 绝不让绘制线程等网络。
+        """
+        if not t.get("closable"):
+            return load_app_logo(size)
+        if favicons is None:
+            return None
+        try:
+            return favicons.image(str(t.get("url") or ""))
+        except Exception:
+            return None
+
     def on_paint(_sender, e):
         g = e.Graphics
         g.SmoothingMode = SmoothingMode.AntiAlias
+        # ★ 小字号必须开 ClearType: GDI+ 默认是灰度 AA, 9pt 的中文和拉丁字母会发虚、
+        #   笔画糊在一起 —— 这是"看着廉价"最直接的来源, 比配色影响大得多。
+        #   本栏背景是实色, 开 ClearType 不会有彩边问题。
+        try:
+            g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit
+        except Exception:
+            pass
         g.Clear(st["bar"])
         boxes = _layout(strip.Width)
         rad = int(8 * scale)                     # 顶角半径(Chrome ≈ 8)
         foot = max(2, int(4 * scale))            # 标签底部"脚"的外扩量
         n = len(st["tabs"])
         act_id, hov_id = st["active"], st["hover_tab"]
-        pen_sep = Pen(st["sep"], 1.0)
+        # 分隔线压到 60% 不透明度: 满色的 sep 在深色条上会显得脏、像表格框线
+        pen_sep = Pen(Color.FromArgb(150, st["sep"].R, st["sep"].G, st["sep"].B), 1.0)
+        pen_top = Pen(Color.FromArgb(30, 255, 255, 255), 1.0)   # 激活标签顶部内高光
 
         # ---- 1) 分隔线: 只在"两侧都不是激活/悬停"的相邻标签之间(Chrome 同款) ----
         for i in range(1, min(n, len(boxes))):
@@ -245,6 +358,10 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
             if act:
                 g.FillPath(SolidBrush(st["tab_active"]),
                            _tab_path(x, tab_top, tw, tab_h, rad, foot))
+                # 顶边一道极淡的内高光: 让激活标签看起来是"浮起来的一张纸",
+                # 而不是一块纯色矩形(Chrome 的标签也有这层 1px 亮边)
+                g.DrawLine(pen_top, float(x + rad), float(tab_top + 0.5),
+                           float(x + tw - rad), float(tab_top + 0.5))
             elif hov:
                 # 悬停: 内缩 1px 的"上圆下平"底, 不画脚(脚是激活态专属)
                 g.FillPath(SolidBrush(st["tab_hover"]),
@@ -260,18 +377,24 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
                 except Exception:
                     pass
             fg = st["fg_on"] if act else st["fg_off"]
-            # ---- 站点图标瓦片: 16px 圆角方块 + 首字母(窄标签自动省掉) ----
+            # ---- 站点图标: 软件图标(首页) > 真实 favicon > 域名取色瓦片(兜底) ----
             pad = int(10 * scale)
             tile = int(16 * scale)
             left = x + pad
             if tw >= int(104 * scale):
-                fc, letter = _fav(t)
                 ty_ = tab_top + (tab_h - tile) // 2
-                g.FillPath(SolidBrush(fc),
-                           _rounded_path(left, ty_, tile, tile, int(4 * scale)))
-                g.DrawString(letter, fav_font, SolidBrush(Color.White),
-                             RectangleF(float(left), float(ty_), float(tile), float(tile)),
-                             sf_c)
+                ico = _tab_icon(t, tile)
+                if ico is not None:
+                    g.InterpolationMode = InterpolationMode.HighQualityBicubic
+                    g.PixelOffsetMode = PixelOffsetMode.HighQuality
+                    g.DrawImage(ico, Rectangle(left, ty_, tile, tile))
+                else:
+                    fc, letter = _fav(t)
+                    g.FillPath(SolidBrush(fc),
+                               _rounded_path(left, ty_, tile, tile, int(4 * scale)))
+                    g.DrawString(letter, fav_font, SolidBrush(Color.White),
+                                 RectangleF(float(left), float(ty_), float(tile),
+                                            float(tile)), sf_c)
                 left += tile + int(8 * scale)
             close_w = int(26 * scale) if t.get("closable") else int(4 * scale)
             right = x + tw - close_w
@@ -794,6 +917,21 @@ def install_strip(win, api, bg_rgb=(15, 17, 21), accent_getter=None, bg_getter=N
     strip.Paint += on_paint
     strip.MouseClick += on_mouse_click
     strip.Resize += lambda _s, _e: strip.Invalidate()
+
+    if favicons is not None:
+        # 站点图标是后台抓的: 抓到一个就重画一次(否则要等下一次鼠标事件才更新)
+        def _on_icon():
+            try:
+                if strip.InvokeRequired:
+                    strip.BeginInvoke(WinForms.MethodInvoker(strip.Invalidate))
+                else:
+                    strip.Invalidate()
+            except Exception:
+                pass
+        try:
+            favicons.subscribe(_on_icon)
+        except Exception:
+            pass
 
     def _install():
         try:

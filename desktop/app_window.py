@@ -1619,9 +1619,14 @@ def _e2e_chrome_shot(form, strip_update, nav_update):
                p_last == p_top == c_nav.ToArgb(),
                "%s / %s / %s" % (b1.GetPixel(mid, sh - 1).Name,
                                  b2.GetPixel(mid, 0).Name, c_nav.Name))
-            p_deep = b2.GetPixel(mid, nh // 2).ToArgb()
-            ok("5 工具栏同列上下同色(没有横向色带切断)", p_deep == c_nav.ToArgb(),
-               b2.GetPixel(mid, nh // 2).Name)
+            # 用"首行+末行整条同色"代替单点采样: 中间行会撞上图标/文字, 开了 ClearType
+            # 之后连字形边缘都是彩色的(实测撞出一个 #96795a 的次像素边缘), 单点必误判。
+            # 首末行不会被任何元素占用(胶囊上下各内缩 6 逻辑像素, 圆形按钮也居中收窄)。
+            bad = [x for x in range(0, int(b2.Width), 37)
+                   if b2.GetPixel(x, 0).ToArgb() != c_nav.ToArgb()
+                   or b2.GetPixel(x, nh - 1).ToArgb() != c_nav.ToArgb()]
+            ok("5 工具栏首末行整条同色(没有被横向色带切断)", not bad,
+               "异常列 %d 处 %s" % (len(bad), bad[:5]))
             # 反面: 激活标签两侧应该露出**标签条**底色, 证明不是整条染色
             far = max(2, min(xs[0] - 30, int(b1.Width) - 3))
             ok("6 激活标签左侧露出标签条底色", b1.GetPixel(far, y).ToArgb() == c_strip.ToArgb(),
@@ -2127,11 +2132,20 @@ def shell_main(e2e_url=None, e2e_float_url=None, e2e_float_resize_url=None,
             api.bind_pages(pages)
         except Exception:
             _log_exc("shell_pages/init")
+        # 站点图标缓存: 标签栏与收藏栏**共用一份** —— 各自 new 一个会把同一站点的图标
+        # 下载两遍, 两处缓存命中还不同步(一边有了另一边仍是色块)。创建失败只是退化成
+        # "域名取色 + 首字母"瓦片, 不影响启动。
+        fav_cache = None
+        try:
+            from shell_bookmarks import FaviconCache
+            fav_cache = FaviconCache()
+        except Exception:
+            _log_exc("shell_bookmarks/favicon-cache")
         try:
             from shell_tabstrip import install_strip
             strip_update = install_strip(
                 win, api, accent_getter=lambda: app.sget("float_ball_accent"),
-                bg_getter=lambda: app.sget("ui_bg_scheme"))
+                bg_getter=lambda: app.sget("ui_bg_scheme"), favicons=fav_cache)
             api.bind_strip(strip_update)
             chrome["strip"] = strip_update
         except Exception:
@@ -2180,7 +2194,7 @@ def shell_main(e2e_url=None, e2e_float_url=None, e2e_float_resize_url=None,
 
                 bm_update = install_bookmarks(
                     win, api, top=_bm_top, store=bm_store, on_height=_bm_size,
-                    bg_getter=lambda: app.sget("ui_bg_scheme"))
+                    bg_getter=lambda: app.sget("ui_bg_scheme"), icons=fav_cache)
                 chrome["bm"] = bm_update
         except Exception:
             _log_exc("shell_bookmarks/install")

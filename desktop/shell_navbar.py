@@ -16,7 +16,7 @@
 import re
 import threading
 
-NAV_H = 38   # 逻辑高度(px); DPI 换算经 nav_h(scale) —— 对标 Chrome/Edge 的 40 上下
+NAV_H = 40   # 逻辑高度(px); DPI 换算经 nav_h(scale) —— 对标 Chrome/Edge 的 40 上下
 
 
 def nav_h(scale=1.0):
@@ -33,10 +33,11 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
     """
     import clr
     clr.AddReference("System.Drawing")
-    from System.Drawing import (Color, Font, Pen, RectangleF, SolidBrush,
-                                Point, Size, StringFormat, StringAlignment,
-                                StringFormatFlags, StringTrimming)
+    from System.Drawing import (Color, Font, FontStyle, Pen, RectangleF,
+                                SolidBrush, Point, Size, StringFormat,
+                                StringAlignment, StringFormatFlags, StringTrimming)
     from System.Drawing.Drawing2D import GraphicsPath, SmoothingMode
+    from System.Drawing.Text import TextRenderingHint
     import System.Windows.Forms as WinForms
 
     form = win.native
@@ -67,19 +68,22 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
     try:
         from System.Drawing import FontFamily
         FontFamily("Segoe MDL2 Assets")
-        icon_font = Font("Segoe MDL2 Assets", 10.0 * scale)
+        icon_font = Font("Segoe MDL2 Assets", 11.0 * scale)
         glyphs = {"back": "\uE72B", "fwd": "\uE72A", "reload": "\uE72C",
-                  "lock": "\uE72E", "globe": "\uE774",
+                  "lock": "\uE72E", "globe": "\uE774", "search": "\uE721",
                   "star": "\uE734", "star_on": "\uE735"}
     except Exception:
-        icon_font = Font("Microsoft YaHei", 10.0 * scale)
+        icon_font = Font("Microsoft YaHei", 10.5 * scale)
         glyphs = {"back": "\u2190", "fwd": "\u2192", "reload": "\u21BB",
-                  "lock": "", "globe": "\u25CB",
+                  "lock": "", "globe": "\u25CB", "search": "\u2315",
                   "star": "\u2606", "star_on": "\u2605"}
-    tb_font = Font("Microsoft YaHei", 8.5 * scale)
-    ai_font = Font("Microsoft YaHei", 8.0 * scale)   # AI 圆钮里的 "AI"
+    # ★ 地址栏用 Segoe UI(缺中文时 GDI+ 自动 font-linking 到雅黑): 雅黑的拉丁字母
+    #   又宽又钝, 一行网址里英文/数字占大头, 用雅黑一眼就廉价。
+    tb_font = Font("Segoe UI", 9.0 * scale)
+    ai_font = Font("Segoe UI", 8.0 * scale, FontStyle.Bold)   # AI 圆钮里的 "AI"
 
-    BTN_W, BTN_GAP, MARGIN = int(34 * scale), int(2 * scale), int(10 * scale)
+    # 按钮贴紧成一"组"(Chrome 的后退/前进/刷新之间没有间隙), 圆形悬停底才连得起来
+    BTN_W, BTN_GAP, MARGIN = int(32 * scale), 0, int(8 * scale)
     PILL_INSET = int(6 * scale)      # 地址栏胶囊的上下内缩 → 胶囊高 = h - 2*inset
 
     bar = WinForms.Panel()
@@ -173,12 +177,14 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
         工具栏是浅一档的 active, 胶囊回到更深的 bar 附近; 浅色主题工具栏近白, 胶囊
         退成浅灰。写死一个颜色在两个主题下必有一边糊在一起。
         """
-        st["tb_bg"] = _blend(st["strip"], st["bar"], 0.55)
+        st["tb_bg"] = _blend(st["strip"], st["bar"], 0.85)
 
     def _apply_tb_fg():
+        # 0.82 而不是 0.7: 0.7 那档在深色主题下像"禁用态", 地址栏显得死气沉沉;
+        # 0.82 既压住了纯白的刺眼, 又保住了"这是当前地址"的可读性。
         try:
             tb.ForeColor = (st["fg"] if (st["edit"] or st["tb_hover"])
-                            else _blend(st["fg"], st["tb_bg"], 0.7))
+                            else _blend(st["fg"], st["tb_bg"], 0.82))
         except Exception:
             pass
 
@@ -217,12 +223,17 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
 
     def _circle(bx, by, bw, bh):
         """按钮框 → 居中圆形(Chrome/Edge 的按钮悬停是正圆, 不是圆角方块)。"""
-        d = min(bw, bh) - int(8 * scale)
+        d = min(bw, bh) - int(6 * scale)
         return (bx + (bw - d) / 2.0, by + (bh - d) / 2.0, d)
 
     def on_paint(_sender, e):
         g = e.Graphics
         g.SmoothingMode = SmoothingMode.AntiAlias
+        # ★ ClearType: GDI+ 默认灰度 AA, 图标字形和小字号网址都会发虚(廉价感主因之一)
+        try:
+            g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit
+        except Exception:
+            pass
         g.Clear(st["bar"])
         rects = _btn_rects()
         for name in _names():
@@ -248,16 +259,21 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
         prad = ph // 2
         g.FillPath(SolidBrush(st["tb_bg"]),
                    _rounded_path(px, py, pw, ph, prad))
+        # 平时**不描边**(Chrome 的 omnibox 就是一块无边框的实色胶囊, 描一圈线立刻变成
+        # "输入框控件"的味道); 悬停给一圈淡描边, 聚焦给强调色描边 —— 状态靠边表达。
         if st["edit"]:
-            bc, bpen = st["accent"], max(1.0, 1.4 * scale)
+            g.DrawPath(Pen(st["accent"], max(1.0, 1.4 * scale)),
+                       _rounded_path(px, py, pw, ph, prad))
         elif st["tb_hover"]:
-            bc, bpen = st["fg_dim"], 1.0
+            g.DrawPath(Pen(st["fg_dim"], 1.0), _rounded_path(px, py, pw, ph, prad))
+        # 站点图标: 空地址/非 http(s) = 这是搜索框 → 放大镜; https = 锁; 其余 = 地球
+        u = str(st["url"]).strip().lower()
+        if not u or not (u.startswith("http://") or u.startswith("https://")):
+            sic = glyphs.get("search")
+        elif u.startswith("https://"):
+            sic = glyphs.get("lock")
         else:
-            bc, bpen = st["tb_border"], 1.0
-        g.DrawPath(Pen(bc, bpen), _rounded_path(px, py, pw, ph, prad))
-        # 站点图标: https 给锁, 其余给地球(Chrome 的 omnibox 也是这一对)
-        sic = glyphs.get("lock") if str(st["url"]).lower().startswith("https://") \
-            else glyphs.get("globe")
+            sic = glyphs.get("globe")
         if sic:
             iw = _site_icon_w()
             g.DrawString(sic, icon_font, SolidBrush(st["fg_dim"]),
@@ -268,10 +284,8 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
         acx, acy, ad = _circle(ar[0], ar[1], ar[2], ar[3])
         ai_on = bool(st.get("ai_on"))
         if ai_on:
-            g.FillEllipse(SolidBrush(Color.FromArgb(56, st["accent"].R,
-                                                   st["accent"].G, st["accent"].B)),
-                          float(acx), float(acy), float(ad), float(ad))
-            g.DrawEllipse(Pen(st["accent"], max(1.0, 1.2 * scale)),
+            # 开着 = 强调色实心圆 + 白字: 一眼看出"面板现在开着"(淡底+同色字太虚)
+            g.FillEllipse(SolidBrush(st["accent"]),
                           float(acx), float(acy), float(ad), float(ad))
         elif st["hover"] == "ai":
             g.FillEllipse(SolidBrush(st["hover_bg"]),
@@ -281,7 +295,7 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
             g.DrawEllipse(Pen(st["tb_border"], 1.0),
                           float(acx), float(acy), float(ad), float(ad))
         g.DrawString("AI", ai_font,
-                     SolidBrush(st["accent"] if ai_on
+                     SolidBrush(Color.White if ai_on
                                 else (st["fg"] if st["hover"] == "ai" else st["fg_dim"])),
                      RectangleF(float(ar[0]), float(ar[1]), float(ar[2]), float(ar[3])), sf)
 
