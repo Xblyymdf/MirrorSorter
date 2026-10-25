@@ -176,7 +176,7 @@
         <button class="svItem" data-sec="data"><svg class="ic"><use href="#i-trash"/></svg>数据</button>
         <button class="svItem" data-sec="disclaimer"><svg class="ic"><use href="#i-inbox"/></svg>免责声明</button>
       </div>
-      <div class="svVer">洞鉴虚明 v0.4.38dsk</div>
+      <div class="svVer">洞鉴虚明 v0.4.42dsk</div>
     </nav>
   </aside>
 
@@ -337,7 +337,7 @@
           <div class="fld"><span class="lbl">API 地址</span><input id="aiBase" placeholder="https://api.deepseek.com/v1"></div>
           <div class="fld"><span class="lbl">API Key</span><input id="aiKey" type="password" placeholder="sk-..."></div>
           <div class="fld"><span class="lbl">模型（可直接输入，或从下拉里选预置）</span>
-            <input id="aiModel" list="modelPresets" placeholder="deepseek-chat" autocomplete="off">
+            <input id="aiModel" list="modelPresets" placeholder="deepseek-flash" autocomplete="off">
             <datalist id="modelPresets"></datalist></div>
           <button id="aiSave">保存</button>
           <div class="mGroup" style="margin-top:14px">
@@ -595,7 +595,7 @@
           <h3>免责声明</h3>
           <div id="disclaimerBody" class="disc"></div>
           <button id="btnDisclaimer">我已阅读并同意</button>
-          <p class="tip" style="margin-top:14px">洞鉴虚明 v0.4.38dsk · 数据只存本机</p>
+          <p class="tip" style="margin-top:14px">洞鉴虚明 v0.4.42dsk · 数据只存本机</p>
         </section>
       </div>
     </div>
@@ -627,13 +627,13 @@
     <div id="msgs"><div class="msg ai">告诉 AI 你想看什么样的信息</div></div>
     <div class="convList" id="convList"></div>
     <div class="chatrow">
-      <select id="chatEffort" class="effSel" title="AI 改设置前的思考强度（关 = 直接改；高 = 想得更久更难改错）">
+      <select id="chatEffort" class="effSel" title="思考强度：同时管聊天作答和改设置（关 = 不看思维链，直接回答）">
         <option value="off">思考关</option>
         <option value="low">思考低</option>
         <option value="mid">思考中</option>
         <option value="high">思考高</option>
       </select>
-      <input id="chatInput" placeholder="如：多推点独立游戏">
+      <input id="chatInput" placeholder="问点什么，或说「换成双栏」">
       <button id="chatStop" hidden aria-label="停止生成" title="停止生成"><svg class="ic"><use href="#i-x"/></svg></button>
       <button id="chatSend" aria-label="发送" title="发送"><svg class="ic"><use href="#i-send"/></svg></button>
     </div>

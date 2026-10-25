@@ -127,6 +127,10 @@ input[type=range]:hover::-webkit-slider-thumb,input[type=range]:focus-visible::-
   font-size:12.5px;flex:none}
 .sidehead .ttl{flex:1;font-weight:600;overflow:hidden;text-overflow:ellipsis}
 .splitter{cursor:col-resize;position:relative}
+/* 拖动分栏期间: 关掉中间栏的指针事件 —— 宽度每帧都在变, 鼠标扫过的卡片会一路触发
+   hover 状态(每个都改 class → 又一次重排), 这是"拖动卡"的另一半来源。 */
+body.splitting{cursor:col-resize;user-select:none}
+body.splitting #center,body.splitting .side{pointer-events:none}
 .splitter::after{content:"";position:absolute;left:2px;top:0;bottom:0;width:2px;background:var(--line)}
 .splitter:hover::after{background:var(--accent-ink)}
 /* 收起时不画任何线：栏自身边框 + 分割线都隐掉（浅色主题下也不会出现黑线） */
@@ -378,7 +382,52 @@ html[data-theme="light"] .pb.xhh,html[data-theme="light"] .mark.xhh{color:#8a641
 .msg{max-width:88%;padding:7px 10px;border-radius:11px;font-size:12.5px;line-height:1.6;white-space:pre-wrap;
   word-break:break-word}
 .msg.me{align-self:flex-end;background:var(--accent-strong);color:#fff}
-.msg.ai{align-self:flex-start;background:var(--panel2);border:1px solid var(--line)}
+.msg.ai{align-self:flex-start;background:var(--panel2);border:1px solid var(--line);
+  max-width:96%;font-size:13px}
+.msg-text.md{white-space:normal}
+/* 思维链（DeepSeek 网页式）: 思考时展开流动, 正文开始后自动收起, 点标题可再看 */
+.thinkBox{margin:0 0 7px;padding:2px 0 2px 8px;border-left:3px solid var(--line);
+  font-size:11.5px;color:var(--fg2)}
+.thinkBox .thinkHead{display:flex;align-items:center;gap:6px;width:100%;padding:2px 0;
+  background:none;border:0;color:var(--fg2);font-size:11.5px;text-align:left;cursor:pointer}
+.thinkBox .thinkHead:hover{color:var(--accent-ink);border:0}
+.thinkBox .thinkTitle{font-weight:600}
+.thinkBox .thinkChev{width:13px;height:13px;margin-left:auto;transition:transform .16s}
+.thinkBox.open .thinkChev{transform:rotate(90deg)}
+.thinkDot{width:6px;height:6px;border-radius:50%;background:var(--accent-ink);flex:none;
+  animation:thinkPulse 1.1s ease-in-out infinite}
+.thinkBox .thinkBody{display:none;margin-top:4px;padding-right:4px;max-height:200px;overflow:auto;
+  white-space:pre-wrap;line-height:1.65;color:var(--fg3);word-break:break-word}
+.thinkBox.show .thinkBody,.thinkBox.open .thinkBody{display:block}
+@keyframes thinkPulse{0%,100%{opacity:.25}50%{opacity:1}}
+/* 等正文时的三点动画: 没有思维链的模型也不会看着像死机 */
+.typing{display:inline-flex;gap:3px;align-items:center;padding:3px 0}
+.typing i{width:5px;height:5px;border-radius:50%;background:var(--fg3);
+  animation:thinkPulse 1.1s ease-in-out infinite}
+.typing i:nth-child(2){animation-delay:.15s}
+.typing i:nth-child(3){animation-delay:.3s}
+.msgHint{display:block;margin-top:6px;color:var(--fg3);font-size:11px}
+/* AI 回答里的 Markdown */
+.msg-text.md p{margin:0 0 7px}
+.msg-text.md p:last-child{margin-bottom:0}
+.msg-text.md h1,.msg-text.md h2,.msg-text.md h3,.msg-text.md h4{margin:10px 0 6px;
+  line-height:1.35;font-weight:600}
+.msg-text.md h1{font-size:15px}.msg-text.md h2{font-size:14px}
+.msg-text.md h3{font-size:13.5px}.msg-text.md h4{font-size:13px}
+.msg-text.md ul,.msg-text.md ol{margin:4px 0 7px;padding-left:19px}
+.msg-text.md li{margin:2px 0}
+.msg-text.md code{font-family:ui-monospace,Consolas,"Cascadia Mono",monospace;font-size:11.5px;
+  background:var(--bg);border:1px solid var(--line);border-radius:4px;padding:0 4px}
+.msg-text.md pre.mdCode{margin:6px 0;padding:8px 9px;background:var(--bg);border:1px solid var(--line);
+  border-radius:7px;overflow:auto;max-height:320px}
+.msg-text.md pre.mdCode code{background:none;border:0;padding:0;white-space:pre;font-size:11.5px}
+.msg-text.md blockquote{margin:5px 0;padding:2px 0 2px 9px;border-left:3px solid var(--line);color:var(--fg2)}
+.msg-text.md hr{border:0;border-top:1px solid var(--line);margin:9px 0}
+.msg-text.md a{color:var(--accent-ink)}
+.msg-text.md table{border-collapse:collapse;margin:6px 0;width:100%;font-size:11.5px;
+  display:block;overflow:auto}
+.msg-text.md th,.msg-text.md td{border:1px solid var(--line);padding:3px 6px;text-align:left}
+.msg-text.md th{background:var(--panel);font-weight:600}
 .chatrow{display:flex;gap:6px;padding:9px;border-top:1px solid var(--line);flex:none;align-items:center}
 .chatrow input{flex:1}
 /* 思考强度档位: 常驻在输入框左边, 窄归窄但要能一眼点开 */
@@ -429,6 +478,13 @@ html[data-theme="light"] .pb.xhh,html[data-theme="light"] .mark.xhh{color:#8a641
 .chips-row{display:flex;flex-wrap:wrap;gap:5px;margin-top:7px}
 .chips-row button{font-size:11.5px;padding:3px 9px;background:var(--panel);border-color:var(--line);color:var(--fg2)}
 .chips-row button:hover{border-color:var(--accent-ink);color:var(--accent-ink)}
+
+/* 智能体正在执行/已经执行的操作（一行小标签: ✓ 搜索「x」 ✓ 厌恶备注 +5 词） */
+.agentPhase{margin:0 0 6px;color:var(--fg3);font-size:11.5px}
+.acts-row{display:flex;flex-wrap:wrap;gap:5px;margin-top:7px}
+.acts-row .actTag{font-size:11px;line-height:1.5;padding:2px 8px;border-radius:999px;
+  background:var(--panel);border:1px solid var(--line);color:var(--fg3)}
+.acts-row .actTag.bad{border-color:var(--danger);color:var(--danger)}
 
 /* ---------- 中间的内容视图容器 ---------- */
 /* 中间是"内容展示区"：视图 A 列表(信息流/历史/收藏)、视图 B 设置, 都渲染在这一层，不用浮层 */

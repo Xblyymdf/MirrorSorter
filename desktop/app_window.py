@@ -302,6 +302,7 @@ class ShellApi:
         self._strip_update = None  # 原生标签栏重绘回调, bind_strip() 注入
         self._navbar_update = None  # 导航工具栏重绘回调, bind_navbar() 注入
         self._floats = None       # 独立悬浮窗管理器(shell_float), bind_floats() 注入
+        self._ai = None           # 内置浏览器右侧 AI 面板(shell_ai), bind_ai_panel() 注入
         self._lock = threading.Lock()
         self._update_started = False
         # float=True 的标签不在主窗口标签栏显示, 而由独立悬浮窗承载(见 shell_float.py)
@@ -772,6 +773,7 @@ class ShellApi:
     # ---- 内部 ----
     def _activate(self, tab):
         """显示 tab(无控件则异步创建), 隐藏当前控件 —— 纯可见性切换, 页面零重载。"""
+        self._sync_ai(tab)   # 网页标签才显示右侧 AI 面板
         pages = self._pages
         if pages is None or tab.get("float"):
             return   # 悬浮标签不在主窗口显示(由 shell_float 承载)
@@ -818,6 +820,57 @@ class ShellApi:
     def bind_floats(self, mgr):
         """注入悬浮窗管理器(shell_float.install_floats 的返回值)。"""
         self._floats = mgr
+
+    def bind_ai_panel(self, panel):
+        """注入内置浏览器右侧 AI 面板(shell_ai.install_ai_panel 的返回值)。"""
+        self._ai = panel
+        if panel is not None:
+            try:
+                # 面板自己开合(面板里的 ✕ / 展开按钮)后, 导航栏那颗 AI 按钮要跟着变
+                panel.on_change = self._push_ai_state
+            except Exception:
+                pass
+        self._sync_ai()
+
+    def _sync_ai(self, tab=None):
+        """按当前标签决定面板显不显示: 只有网页标签显示(信息流自带右栏 AI 聊天)。"""
+        p = self._ai
+        if p is None:
+            return
+        try:
+            if tab is None:
+                with self._lock:
+                    tid = self._active
+                    tab = next((x for x in self._tabs if x["id"] == tid), None)
+            browser_tab = bool(tab) and not tab.get("pinned") and not tab.get("float")
+            p.sync_for_tab(browser_tab)
+        except Exception:
+            _log_exc("ai/sync")
+
+    def _push_ai_state(self, on=None):
+        fn = self._navbar_update
+        if fn is None:
+            return
+        try:
+            setter = getattr(fn, "set_ai", None)
+            if setter is not None:
+                setter(bool(on) if on is not None else
+                       bool(self._ai is not None and self._ai.is_open()))
+        except Exception:
+            pass
+
+    def toggle_ai_panel(self):
+        """导航栏 AI 按钮: 开/关右侧助手面板。"""
+        p = self._ai
+        if p is None:
+            return "no-panel"
+        try:
+            on = p.toggle()
+        except Exception:
+            _log_exc("ai/toggle")
+            return "err"
+        self._push_ai_state(on)
+        return "on" if on else "off"
 
     def bind_strip(self, update_fn):
         """注入原生标签栏重绘回调(shell_tabstrip.install_strip 的返回值)。"""
@@ -903,6 +956,12 @@ def main(argv=None):
             e2e_float_url = argv[argv.index("--e2e-float") + 1]
         except IndexError:
             e2e_float_url = None
+    e2e_ai_url = None
+    if "--e2e-ai" in argv:     # 测试钩子: 内置浏览器右侧 AI 面板(停靠/让位/网页操作)
+        try:
+            e2e_ai_url = argv[argv.index("--e2e-ai") + 1]
+        except IndexError:
+            e2e_ai_url = None
     e2e_float_resize_url = None
     if "--e2e-float-resize" in argv:  # 测试钩子: 真鼠标消息驱动悬浮窗八向缩放
         try:
@@ -935,7 +994,8 @@ def main(argv=None):
         _serve_forever_cli(server)
         return 0
     return shell_main(e2e_url=e2e_url, e2e_float_url=e2e_float_url,
-                      e2e_float_resize_url=e2e_float_resize_url)
+                      e2e_float_resize_url=e2e_float_resize_url,
+                      e2e_ai_url=e2e_ai_url)
 
 
 def _install_mouse_side_buttons(api, win):
@@ -1249,6 +1309,244 @@ def _e2e_float_resize_run(api, url):
             pass
 
 
+def _e2e_panel_cdp(form, ctrl, method, params="{}", timeout=8.0):
+    """在面板控件上跑一次 CDP 调用, 返回原始结果字符串(失败返回 "err:...")。
+
+    WebView2 是 DirectComposition 合成的, GDI/DrawToBitmap 抓不到画面, 截图只能走 CDP。
+    非 UI 线程等 Task: 只在 UI 线程"发起", 等待留在当前线程(否则死锁)。
+    """
+    holder = {}
+    ev = threading.Event()
+
+    def start():
+        try:
+            holder["t"] = ctrl.CoreWebView2.CallDevToolsProtocolMethodAsync(method, params)
+        except Exception as e:
+            holder["e"] = repr(e)
+        finally:
+            ev.set()
+
+    try:
+        import System.Windows.Forms as _WF
+        form.BeginInvoke(_WF.MethodInvoker(start))
+    except Exception as e:
+        return "err:begininvoke %r" % (e,)
+    if not ev.wait(5.0):
+        return "err:start-timeout"
+    if holder.get("e"):
+        return "err:" + holder["e"]
+    t = holder.get("t")
+    deadline = time.time() + timeout
+    while time.time() < deadline and not t.IsCompleted:
+        time.sleep(0.03)
+    if not t.IsCompleted:
+        return "err:timeout"
+    try:
+        return str(t.Result)
+    except Exception as e:
+        return "err:task %r" % (e,)
+
+
+def _e2e_panel_shot(form, ctrl, path):
+    """给面板控件截一张真图(CDP Page.captureScreenshot)。"""
+    import base64
+    import json as _json
+    raw_res = _e2e_panel_cdp(form, ctrl, "Page.captureScreenshot", '{"format":"png"}')
+    if raw_res.startswith("err:"):
+        return raw_res
+    try:
+        data = _json.loads(raw_res).get("data") or ""
+        raw = base64.b64decode(data)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(raw)
+        return "ok:%d" % len(raw)
+    except Exception as e:
+        return "decode:%r" % (e,)
+
+
+def _e2e_ai_panel(api, panel, pages, url):
+    """真机自测: 开一个标签页 → 面板停靠/让位 → 网页快照/查找/填写/滚动 → 开合。
+
+    只在 `--e2e-ai <url>` 下跑, 结果落 build/probe/ai_panel_e2e.log。
+    为什么必须真机: WebView2 的 ExecuteScriptAsync 只有在真控件里才有意义(控件创建、
+    Task 完成回调、UI 线程 marshalling 全是原生行为, 单测替不了)。
+    """
+    import json as _json
+    lines = []
+    fails = [0]
+
+    def say(msg):
+        lines.append(str(msg))
+        print("[ai-e2e] %s" % msg, flush=True)
+
+    def ok(name, cond, detail=""):
+        if not cond:
+            fails[0] += 1
+        say(("PASS  " if cond else "FAIL  ") + name + (("  " + str(detail)) if detail else ""))
+        return bool(cond)
+
+    try:
+        try:
+            api.open_in_app(url, "面板自测", mode="tab")
+        except Exception as e:
+            say("open_in_app 失败: %r" % (e,))
+        # 等页面真的可交互(最多 25 秒)
+        snap = None
+        for _i in range(50):
+            time.sleep(0.5)
+            r = panel.browser_call("snapshot", {"limit": 30, "text": 300})
+            if isinstance(r, dict) and r.get("ok") and str(r.get("url") or "").find("panel") >= 0:
+                snap = r
+                break
+        ok("1 标签页可被面板读到(快照有网址/标题)", bool(snap),
+           (snap or {}).get("url", ""))
+        if snap:
+            els = snap.get("els") or []
+            ok("2 快照返回可点元素(带连续序号)",
+               len(els) >= 3 and all(e.get("i") == i for i, e in enumerate(els)),
+               "%d 个" % len(els))
+            tags = [str(e.get("tag")) for e in els]
+            ok("3 快照里能看到输入框(textarea)", "textarea" in tags, str(tags[:12]))
+            ta = next((e for e in els if str(e.get("tag")) == "textarea"), None)
+            if ta is not None:
+                r = panel.browser_call("type", {"index": ta["i"], "text": "面板自测文本",
+                                                "submit": False})
+                ok("4 往页面输入框填字(原生 setter + input 事件)", r.get("ok") is True,
+                   r.get("msg") or r.get("error"))
+                r2 = panel.browser_call("snapshot", {"limit": 30, "text": 100})
+                got = ""
+                for e in (r2.get("els") or []):
+                    if str(e.get("tag")) == "textarea":
+                        got = str(e.get("v") or "")
+                        break
+                ok("5 填进去的字被页面读到(说明事件真的生效)", got == "面板自测文本", got)
+            r = panel.browser_call("find", {"text": "AI 助手"})
+            ok("6 页内查找命中", r.get("ok") is True and int(r.get("hits") or 0) >= 1,
+               str(r.get("hits")))
+            r = panel.browser_call("scroll", {"bottom": True})
+            ok("7 滚动到底", r.get("ok") is True, r.get("msg") or r.get("error"))
+            r = panel.browser_call("click", {"index": 9999})
+            ok("8 越界序号给的是错误而不是崩溃",
+               bool(r.get("error")) or r.get("ok") is False, str(r)[:80])
+            r = panel.browser_call("eval", {"code": "return document.title"})
+            ok("9 eval 能拿到页面数据", r.get("ok") is True and "AI" in str(r.get("value")), str(r.get("value"))[:40])
+
+        # ---- 几何: 面板停靠 + 网页区让位 ----
+        time.sleep(1.0)
+        geo = pages.geometry()
+        ok("10 面板占住了内容区右侧(inset>0)", int(geo.get("inset") or 0) > 0, str(geo))
+        try:
+            import System.Windows.Forms as WinForms
+            form = api._win.native
+            W = int(form.ClientSize.Width)
+            tid = (api.active_page() or {}).get("id")
+            c = pages.ctrl(tid)
+            want = W - int(geo.get("inset") or 0)
+            ok("11 网页区宽度 = 窗口宽 - 面板让位", c is not None and abs(int(c.Size.Width) - want) <= 2,
+               "ctrl=%s want=%s" % (getattr(c, "Size", None), want))
+            pw = panel.st.get("ctrl")
+            ok("12 面板控件可见且宽度合理", pw is not None and bool(pw.Visible)
+               and int(pw.Size.Width) >= 300, getattr(pw, "Size", None))
+            sp = panel.st.get("split")
+            ok("13 分栏热区在面板左侧", sp is not None and bool(sp.Visible)
+               and abs(int(sp.Location.X) + int(sp.Size.Width) - int(pw.Location.X)) <= 1,
+               "split=%s panel=%s" % (getattr(sp, "Location", None), getattr(pw, "Location", None)))
+            ok("14 面板上沿与网页区对齐(让开标签栏/导航栏)",
+               abs(int(pw.Location.Y) - int(geo.get("top") or 0)) <= 1,
+               "y=%s top=%s" % (int(pw.Location.Y), geo.get("top")))
+            # 拖动: 直接调内部摆位(模拟一帧), 再松手对齐
+            panel.st["w"] = 460
+            panel._place_live(460)
+            time.sleep(0.3)
+            ok("15 改宽度后网页区跟着缩",
+               abs(int(c.Size.Width) - (W - 460 - 6)) <= 2, int(c.Size.Width))
+            panel.st["w"] = 380
+            panel._drag_up(None, None)
+            time.sleep(0.6)
+            geo2 = pages.geometry()
+            ok("16 松手后按新宽度重新对齐(inset 同步)", int(geo2.get("inset") or 0) == 380 + 6,
+               str(geo2))
+            # 面板本身的真实渲染(WebView2 里 380/300 两档, 供人眼检查窄面板版式)
+            probe = os.path.join(HERE, "build", "probe")
+            pctrl = panel.st.get("ctrl")
+            panel.st["w"] = 380
+            panel.layout()
+            time.sleep(0.8)
+            demo = (
+                "(function(){var P=window.__msxPanel;if(!P)return 'no-hook';"
+                "P.clear();"
+                "P.add('me','帮我把这个视频的简介要点整理一下');"
+                "var b=P.add('ai','');"
+                "var a=document.createElement('div');a.className='acts';b.appendChild(a);"
+                "P.act({acts:a},'读取网页: 【测试】视频标题');"
+                "P.act({acts:a},'已点击「展开简介」');"
+                "b.insertAdjacentHTML('beforeend',P.md("
+                "'## 这页讲了什么\\n\\n这是**测试**视频，主要讲了三件事：\\n\\n"
+                "1. 第一点\\n2. 第二点，带 `code` 片段\\n3. 第三点\\n\\n"
+                "> 引用一句原文\\n\\n想让我点开第一个推荐视频吗？'));"
+                "return 'ok';})()"
+            )
+            r = _e2e_panel_cdp(form, pctrl, "Runtime.evaluate",
+                               _json.dumps({"expression": demo, "returnByValue": True}))
+            ok("16b 面板示例对话注入", '"ok"' in r, r[:80])
+            time.sleep(0.6)
+            r = _e2e_panel_shot(form, pctrl, os.path.join(probe, "panel_w380.png"))
+            ok("16c 面板 380px 真图落盘(深色/含对话)", str(r).startswith("ok:"), r)
+            # 浅色主题
+            _e2e_panel_cdp(form, pctrl, "Runtime.evaluate", _json.dumps(
+                {"expression": "document.documentElement.setAttribute('data-theme','light')"}))
+            time.sleep(0.5)
+            r = _e2e_panel_shot(form, pctrl, os.path.join(probe, "panel_light.png"))
+            ok("16d 面板浅色真图落盘", str(r).startswith("ok:"), r)
+            _e2e_panel_cdp(form, pctrl, "Runtime.evaluate", _json.dumps(
+                {"expression": "document.documentElement.setAttribute('data-theme','dark')"}))
+            # 最窄档
+            panel.st["w"] = 300
+            panel.layout()
+            time.sleep(0.8)
+            r = _e2e_panel_shot(form, pctrl, os.path.join(probe, "panel_w300.png"))
+            ok("16e 面板 300px 真图落盘", str(r).startswith("ok:"), r)
+            panel.st["w"] = 380
+            panel.layout()
+            time.sleep(0.5)
+        except Exception as e:
+            ok("10-16 几何断言", False, repr(e)[:120])
+
+        # ---- 开合: 收起后面板让位归零, 网页区恢复整宽 ----
+        try:
+            panel.set_open(False)
+            time.sleep(1.0)
+            geo3 = pages.geometry()
+            ok("17 收起面板: 让位归零", int(geo3.get("inset") or 0) == 0, str(geo3))
+            pw = panel.st.get("ctrl")
+            ok("18 收起面板: 面板控件不可见", pw is None or not bool(pw.Visible))
+            panel.set_open(True)
+            time.sleep(1.0)
+            geo4 = pages.geometry()
+            ok("19 再展开: 让位恢复", int(geo4.get("inset") or 0) > 0, str(geo4))
+        except Exception as e:
+            ok("17-19 开合断言", False, repr(e)[:120])
+
+        # ---- 面板页面本身(它自己也是网页: 能读到自己的输入框) ----
+        try:
+            st = panel.state()
+            ok("20 面板上报状态带当前网页网址", "panel" in str(st.get("url") or "")
+               or str(st.get("url") or "").startswith("http"), str(st.get("url"))[:60])
+        except Exception as e:
+            ok("20 面板状态", False, repr(e)[:120])
+    finally:
+        try:
+            os.makedirs(os.path.join(HERE, "build", "probe"), exist_ok=True)
+            with io.open(os.path.join(HERE, "build", "probe", "ai_panel_e2e.log"),
+                         "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        except Exception:
+            pass
+        say("RESULT: %s" % ("FAIL(%d)" % fails[0] if fails[0] else "PASS"))
+    return fails[0]
+
+
 def _e2e_float_run(api, url):
     """v0.3.1.34 自测: 新窗口 → 塞回标签页 → 拖出悬浮窗 → 关闭, 每步 dump 控件归属
     (父窗体标题/可见性 + 悬浮窗存在性), 验证控件实例跨窗口迁移、页面不重载。
@@ -1415,7 +1713,8 @@ def _e2e_drag_to_tabbar(api, tid, say):
         return False
 
 
-def shell_main(e2e_url=None, e2e_float_url=None, e2e_float_resize_url=None):
+def shell_main(e2e_url=None, e2e_float_url=None, e2e_float_resize_url=None,
+               e2e_ai_url=None):
     """窗口壳主流程: 起/复用服务 → WebView2 检测 → 主窗口(含标签页) → 全关后收尾。
 
     e2e_url 仅测试用(_e2e_shell.py): 主窗口就绪后自动走一次 open_in_app 桥调用,
@@ -1476,7 +1775,7 @@ def shell_main(e2e_url=None, e2e_float_url=None, e2e_float_resize_url=None):
                 return v
             # bug6: 网页(视频)全屏 → 隐藏标签栏与导航栏, 窗口内只剩画面(整窗纯播放);
             # 退出全屏再显回来。strip/nav 实例的装配晚于 create_pool, 这里用字典迟绑定。
-            chrome = {"strip": None, "nav": None, "bm": None}
+            chrome = {"strip": None, "nav": None, "bm": None, "ai": None}
 
             def on_fs(_key, on):
                 hidden = bool(on)
@@ -1497,6 +1796,12 @@ def shell_main(e2e_url=None, e2e_float_url=None, e2e_float_resize_url=None):
                             nb.Visible = not hidden
                     except Exception:
                         _log_exc("fullscreen/navbar")
+                ai = chrome.get("ai")
+                if ai is not None:
+                    try:
+                        ai.set_fullscreen(hidden)
+                    except Exception:
+                        _log_exc("fullscreen/ai")
                 bm = chrome.get("bm")
                 if bm is not None:
                     try:
@@ -1574,6 +1879,17 @@ def shell_main(e2e_url=None, e2e_float_url=None, e2e_float_resize_url=None):
                 chrome["bm"] = bm_update
         except Exception:
             _log_exc("shell_bookmarks/install")
+        # 内置浏览器右侧 AI 面板(v0.4.42)。装在收藏栏之后 —— 它要按内容区高度定位,
+        # 而内容区高度由「标签栏+导航栏+收藏栏」三段算出来。
+        try:
+            from shell_ai import install_ai_panel
+            if pages is not None:
+                _ai = install_ai_panel(win, api, pages, port)
+                if _ai is not None:
+                    chrome["ai"] = _ai
+                    api.bind_ai_panel(_ai)
+        except Exception:
+            _log_exc("shell_ai/install")
         try:
             _install_mouse_side_buttons(api, win)
         except Exception:
@@ -1612,6 +1928,25 @@ def shell_main(e2e_url=None, e2e_float_url=None, e2e_float_resize_url=None):
             try:
                 _e2e_float_resize_run(
                     api, url if e2e_float_resize_url == "local" else e2e_float_resize_url)
+            except Exception:
+                import traceback
+                traceback.print_exc()
+            finally:
+                try:
+                    time.sleep(1)
+                    win.destroy()
+                except Exception:
+                    pass
+                try:
+                    app.shutdown(server)
+                except Exception:
+                    pass
+                os._exit(0)
+        if e2e_ai_url:
+            # 面板自测: 不能最小化 —— 最小化后 ClientSize 变成 0, 几何类断言全量不出来。
+            # 跑完自动关窗退出(约 15 秒)。
+            try:
+                _e2e_ai_panel(api, chrome.get("ai"), pages, e2e_ai_url)
             except Exception:
                 import traceback
                 traceback.print_exc()

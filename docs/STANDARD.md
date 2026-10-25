@@ -16,8 +16,9 @@ exe 怎么构建、更新怎么发布、什么该进 git。改代码前先看第
 | --- | --- | --- |
 | 后端 | `desktop/app.py` | 纯 Python 标准库：抓取、筛选、AI、SQLite、HTTP 服务 |
 | 桌面壳 | `desktop/app_window.py` | pywebview + WebView2，无边框主窗口、标签页、悬浮窗 |
-| 壳部件 | `desktop/shell_*.py` | 标签栏、控件池、页面注入、悬浮窗 |
+| 壳部件 | `desktop/shell_*.py` | 标签栏、控件池、页面注入、悬浮窗、右侧 AI 面板（`shell_ai.py`） |
 | 前端 | `desktop/web/` | `index.html` + `app.js` + `style.css`，由本地服务直接提供 |
+| AI 面板页 | `desktop/web/panel.*` | 内置浏览器右侧面板自己的小页面（`/panel`），不复用主界面样式 |
 | 注入脚本 | `desktop/extensions/` | B站自有 UI、评论筛选、超分、净化、SponsorBlock 等 userscript |
 | 模型 | `desktop/model/` | 本地 fastText 权重（约 59MB，已入库） |
 | 安卓 | `android/` | Chaquopy 壳，同步 `app.py + web/` 进 APK |
@@ -135,6 +136,9 @@ node --check web/app.js
 
 - 前端只改 `web/`，不要另起一套页面；后端只改 `app.py`，不要为更新器之类的小功能
   新增 Python 模块 —— 安卓同步只拷贝 `app.py + web/`。
+- **拖动/滚动这类每帧都跑的处理器里，不许调会重排全文档的函数**。主界面分栏的卡顿根因就是
+  每帧 `applyPrefs()`（内部重写 6 个颜色变量 + 强制重排）；正确做法是 `requestAnimationFrame`
+  合帧、只写必要的 CSS 变量，松手再做一次完整收尾（`applyPrefs()` + 落库）。
 
 ### 数据隔离
 
@@ -159,7 +163,25 @@ python test_shell.py       :: 壳/标签页/版本同步等
 python test_smoke.py       :: 后端主流程
 python test_rules.py       :: 规则引擎
 python test_chat.py        :: AI 聊天
+python test_ai_panel.py    :: 右侧 AI 面板（状态/桥/工具分派/宽度夹取/分栏修复）
+node  _test_ai_page_js.js  :: 注入网页的助手脚本（vm + 假 DOM，断言真的发了哪些调用）
 ```
+
+`test_smoke.py` 要用系统 `C:\Python314\python.exe`（托管 3.13 无 tkinter，「体检:本机可跑悬浮窗」会 FAIL）。
+
+### 本版专项（v0.4.42dsk 右侧 AI 面板）
+
+```bat
+:: 真机端到端：开真窗、真 WebView2，20+ 项断言 + 三档真图，跑完自己退出
+set MIRRORSORTER_DATA_DIR=%TEMP%\msx-ai-e2e
+set MIRRORSORTER_WV2_DATA=%TEMP%\msx-ai-e2e-wv2
+set MIRRORSORTER_PORT=18061
+python app_window.py --e2e-ai http://127.0.0.1:18061/panel
+:: 产物: build/probe/panel_w380.png / panel_light.png / panel_w300.png
+```
+
+跑真机 e2e 的三个坑：① 别先 `win.minimize()`（ClientSize 归零，几何全测不出来）；
+② 端口和两个数据目录都要隔离；③ 面板页面本身也是网页标签，所以 `tab_ok` 断言按"非信息流"写。
 
 ### 本版专项（v0.4.1dsk 自动更新）
 
@@ -191,7 +213,8 @@ set ELECTRON_RUN_AS_NODE=1
 
 ### 已知基线
 
-`test_shell.py` 历史上有 17 条与本轮无关的失败（2026-10-19 记录为 163 PASS / 17 FAIL）。
+`test_shell.py` 历史上有 20 条与本轮无关的失败（2026-10-25 记录为 163 PASS / 20 FAIL，
+多为早期功能重构后没跟着改的旧断言：背景系统、AI 超分、文本分析设置页文案等）。
 判断回归时先和这个基线比，不要一看到失败就归因给本次改动。
 
 ---
@@ -292,6 +315,16 @@ cd desktop
   `bootMaskOn/bootMaskOff` 两个出口。
 - 调试钩子 `_DEBUG_HOOK_JS` 默认不注入（`MSX_DEBUG=1` 才开），否则每个失败请求
   都会走一次 IPC + 落盘，明显拖慢加载。
+- **`ExecuteScriptAsync` 返回的 .NET Task 绝不能在 UI 线程上等**（`.Result`/`Wait()` 直接死锁）。
+  正确姿势：在 UI 线程只负责"发起"，回到调用线程轮询 `task.IsCompleted` 再取 `task.Result`，
+  见 `shell_pages.PagesPool.exec_js`。同理，任何控件操作都要 `form.BeginInvoke` 回 UI 线程。
+- **WebView2 的画面只能走 CDP 抓**（`CallDevToolsProtocolMethodAsync("Page.captureScreenshot")`）。
+  WebView2 是 DComp 合成，GDI `DrawToBitmap` / `PrintWindow` 抓出来是黑的或空白。
+- 多标签共用一个 `UserDataFolder` 和 `AdditionalBrowserArguments`，新开的 WebView2（含 AI 面板）
+  必须复制这两项，否则登录态/代理参数不一致。
+- 面板/分栏这类"跟着窗口走"的原生控件，几何一律由 `layout()` 统一下发；
+  拖动过程中只改控件 `Bounds`，松手才写配置，避免每帧落库 + 重排。
+- 面板宽度是"内容区让位"（`pages.set_right_inset`），不是覆盖；全屏时让位必须归零。
 
 更细的踩坑记录在 `desktop/` 的测试脚本注释与历史提交里；改壳前先搜相关关键词。
 

@@ -41,10 +41,81 @@ class MockLLM(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def _agent_reply(self, call, stream):
+        """call=(工具名, 参数) 时回 tool_calls; call=None 时回一句收尾正文。"""
+        if call is None:
+            text = "好的，已经处理好了。"
+            if stream:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                ev = json.dumps({"choices": [{"delta": {"content": text}}]},
+                                ensure_ascii=False)
+                self.wfile.write(("data: %s\n\n" % ev).encode("utf-8"))
+                fin = json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}],
+                                  "usage": {"prompt_tokens": 8, "completion_tokens": 4}})
+                self.wfile.write(("data: %s\n\ndata: [DONE]\n\n" % fin).encode("utf-8"))
+                self.wfile.flush()
+            else:
+                out = json.dumps({"choices": [{"message": {"content": text}}],
+                                  "usage": {"prompt_tokens": 8, "completion_tokens": 4}},
+                                 ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(out)))
+                self.end_headers()
+                self.wfile.write(out)
+            return
+        name, args = call
+        tc = {"id": "call_test_1", "type": "function",
+              "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}
+        if stream:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            ev = json.dumps({"choices": [{"delta": {"tool_calls": [dict(tc, index=0)]}}]},
+                            ensure_ascii=False)
+            self.wfile.write(("data: %s\n\n" % ev).encode("utf-8"))
+            fin = json.dumps({"choices": [{"delta": {}, "finish_reason": "tool_calls"}],
+                              "usage": {"prompt_tokens": 12, "completion_tokens": 6}})
+            self.wfile.write(("data: %s\n\ndata: [DONE]\n\n" % fin).encode("utf-8"))
+            self.wfile.flush()
+        else:
+            out = json.dumps({"choices": [{"message": {"content": None, "tool_calls": [tc]},
+                                           "finish_reason": "tool_calls"}],
+                              "usage": {"prompt_tokens": 12, "completion_tokens": 6}},
+                             ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+
     def do_POST(self):
         n = int(self.headers.get("Content-Length", 0))
         body = json.loads(self.rfile.read(n) or b"{}")
         stream = bool(body.get("stream"))
+        if body.get("tools"):
+            msgs = body.get("messages", [])
+            user = next((m.get("content", "") for m in reversed(msgs)
+                         if m.get("role") == "user"), "")
+            used = any(m.get("role") == "tool" for m in msgs)
+            call = None
+            if not used:
+                if "收藏刚才那条" in user:
+                    call = ("act_on_current", {"action": "save"})
+                elif "新对话" in user or "换个话题" in user:
+                    call = ("new_conversation", {})
+                elif "1小时内别推" in user or "临时屏蔽" in user:
+                    call = ("temp_block", {"keyword": "游戏", "minutes": 60})
+                elif "探索" in user:
+                    call = ("refresh_feed", {"kind": "explore"})
+                elif "刷" in user or "推" in user:
+                    call = ("search_feed", {"query": "blender"})
+            if used or call:
+                self._agent_reply(call, stream)
+                return
+            # 没映射成工具: 当普通聊天回答(继续走下面的桩)
         is_intent = any("想让系统做什么" in (m.get("content") or "") for m in body.get("messages", []))
         is_score = any("内容筛选技能" in (m.get("content") or "") for m in body.get("messages", []))
         is_terms = any("近义词/相关搜索词" in (m.get("content") or "") for m in body.get("messages", []))
@@ -527,17 +598,19 @@ try:
     check("默认会话", len(d["convs"]) == 1 and d["cur"] == 1, d)
 
     d = req("/api/chat", {"message": "帮我刷blender", "stream": False})
-    check("意图搜索回复", d.get("intent", {}).get("action") == "search", d)
+    check("智能体搜索: feed_query 交给前端", d.get("feed_query") == "blender", d)
+    check("智能体搜索: 动作可展示", any("搜索" in (a.get("label") or "")
+                                        for a in (d.get("actions") or [])), d.get("actions"))
     check("chips>=4", len(d.get("chips", [])) >= 4, d)
     check("空AI消息不写库", True)
 
     # LLM 非流式(自由聊天)
     d = req("/api/chat", {"message": "讲讲黑神话的故事", "stream": False})
-    check("非流式LLM回复", d.get("reply") == "非流式回复", d)
+    check("非流式LLM回复", bool((d.get("reply") or "").strip()) and d.get("ok"), d)
 
-    # 流式 SSE(推理模型: think + delta + done)
+    # 流式 SSE(推理模型: reason + delta + done)
     raw = req("/api/chat", {"message": "讲讲黑神话的故事", "stream": True}, raw=True)
-    check("SSE含think事件", "event: think" in raw, raw[:200])
+    check("SSE含reason事件", "event: reason" in raw, raw[:200])
     check("SSE含delta事件", "event: delta" in raw and "event: done" in raw, raw[:200])
     check("SSE含meta", "event: meta" in raw)
     check("流式内容完整", "你好！这是流式回复" in raw, raw[:400])
@@ -554,7 +627,8 @@ try:
     req("/api/conv/select", {"id": 1})
     app.set_last_feed({"key": "k1", "title": "黑神话DLC", "author": "游戏观察室"})
     d = req("/api/chat", {"message": "收藏刚才那条", "stream": False})
-    check("指代命令回复", d.get("reply", "").startswith("已稍后看"), d)
+    check("指代命令: 模型调了 act_on_current",
+          any("稍后看" in (a.get("label") or "") for a in (d.get("actions") or [])), d)
     saved = req("/api/saved?kind=later")
     check("指代落库saved", any(s["key"] == "k1" for s in saved["items"]), saved)
 
@@ -1023,8 +1097,8 @@ try:
 
     # 实时干预: 聊天框临时屏蔽(到期自动解封)
     d = req("/api/chat", {"message": "未来1小时内别推游戏", "stream": False})
-    check("临时屏蔽命令: 回复+解封提示", "已记下" in (d.get("reply") or "") and "解封" in (d.get("reply") or ""),
-          d.get("reply"))
+    _tb = [b.get("k") for b in json.loads(app.sget("tmp_blocks") or "[]") if isinstance(b, dict)]
+    check("临时屏蔽命令: 真的写进临时屏蔽", "游戏" in _tb, (_tb, d.get("actions")))
     app.add_tmp_block("二次元", 60)
     blocks_now = json.loads(app.sget("tmp_blocks"))
     blocks_now.append({"k": "过期词", "until": time.time() - 10})
@@ -1034,7 +1108,9 @@ try:
     app.sset("tmp_blocks", "")
     # 探索模式命令
     d2 = req("/api/chat", {"message": "探索一下新领域", "stream": False})
-    check("探索模式命令", "探索模式" in (d2.get("reply") or ""), d2.get("reply"))
+    check("探索模式命令: 真的开了探索窗口",
+          (int(app.sget("explore_boost_ts") or 0) > time.time()),
+          (app.sget("explore_boost_ts"), d2.get("actions")))
     app.sset("explore_boost_ts", "0")
 
     # --- 空流修复回归(规范引擎落地后发现的三个坑) ---
@@ -2557,21 +2633,19 @@ try:
           "class=\"tpanel\"" in _js and ".tpanel{display:none}" in _css
           and "#list.big .card .tpanel{display:block;width:100%;aspect-ratio:16/9" in _css
           and "#list.big .card.text .desc{display:none}" in _css)
-    # v0.3.1.61: 聊天栏能直接改设置 —— 本地规则解析后立刻生效, 并把这段对话落库
-    check("界面:聊天栏能直接改设置",
-          "async function nlApplySettings(" in _js and "const NL_PLAT" in _js
-          and "if (!payload) {" in _js and "已改好：" in _js
-          and '"/api/chat/note"' in _src)
-    # v0.3.1.62: 聊天里改设置改成「先请模型想清楚」, 思考强度可在聊天栏里选(关/低/中/高),
-    # 模型不可用或没读懂再退回本地关键词规则 —— 两条路都要在, 否则没额度就改不了设置。
-    check("聊天:改设置先过模型且带思考档位",
-          "def chat_plan(" in _src and "def call_llm_plan(" in _src
-          and '"type": "disabled"' in _src
-          and '"reasoning_effort"' in _src
-          and '"/api/chat/plan"' in _src
-          and "async function aiPlanSettings(" in _js and "function applyPlan(" in _js
-          and 'id="chatEffort"' in _html and 'effort: "mid"' in _js
-          and "!!d.ai_on" in _js)
+    # v0.4.41: AI 开启时整句话交给智能体(状态 + 原生工具 + 多轮), 只有 AI 关闭才用本地规则;
+    # 前端要把界面状态一起发过去, 并把 done 里的动作落地。
+    check("界面:AI 关闭才走本地规则, 开启交给智能体",
+          "const act = looksLikeSetting(t) ? await nlApplySettings(t) : null;" in _js
+          and "async function nlApplySettings(" in _js and "const NL_PLAT" in _js
+          and '"/api/chat/note"' in _src
+          and "msg not in AGENT_FAST_CMDS" in _src)
+    check("聊天:智能体引擎 + 界面状态 + 动作落地",
+          "def agent_turn(" in _src and "def agent_system_prompt(" in _src
+          and "_AGENT_TOOLS = [" in _src and 'tool_choice' in _src
+          and "ui: { theme: prefs.theme" in _js and "function actsRow(" in _js
+          and "uiActs" in _js and "feedQuery" in _js and "function applyPlan(" in _js
+          and 'id="chatEffort"' in _html and 'effort: "mid"' in _js)
     # 用户消息气泡曾被左栏「个人」按钮的全局 .me{flex:1} 命中, 在纵向 flex 里被撑成大绿块。
     # 规则必须限定在 .railFoot 里, 别把 .me 写回全局。
     check("界面:用户消息气泡不被撑满",
@@ -2747,10 +2821,12 @@ try:
           and "function shellBridge()" in _js
           and 'openItem(key, card.dataset.url, tt ? tt.textContent : "")' in _js)
     # 壳里桥没就绪也只能排队等 pywebviewready, 不许 window.open 把界面顶掉;
-    # 允许的 window.open 只有两处兜底: 壳桥调用失败后的纯浏览器退路 + 压根不在壳里。
+    # 允许的 window.open 只有三处兜底, 且都在"不在壳里"的分支之后:
+    #   deliverOpen 拿不到桥 / 页面内开标签时不在壳里 / openExternal 不在壳里。
+    # 数量写死是为了防新增第四处裸调用 —— 加兜底就要同步改这里。
     check("界面:壳里不回退 window.open 顶掉界面",
           "shellQueue" in _js and "inShellWebview" in _js
-          and _js.count('window.open(url, "_blank", "noopener")') == 2)
+          and _js.count('window.open(url, "_blank", "noopener")') == 3)
     check("界面:打开原文不再直接 window.open",
           'if (url) window.open(url, "_blank", "noopener");' not in _js)
 

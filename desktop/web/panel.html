@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI 助手</title>
+<link rel="stylesheet" href="/panel.css">
+</head>
+<body>
+<div id="app">
+
+  <header id="head">
+    <div class="hTitle">
+      <span class="dot" id="aiDot"></span>
+      <span class="tt">AI 助手</span>
+    </div>
+    <div class="hBtns">
+      <button id="btnNew" class="iconBtn" title="新对话" aria-label="新对话">
+        <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+      </button>
+      <button id="btnClose" class="iconBtn" title="收起面板" aria-label="收起面板">
+        <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <div id="pageBar" title="">
+    <svg viewBox="0 0 24 24" class="pg"><circle cx="12" cy="12" r="9"/><path d="M3.6 9h16.8M3.6 15h16.8M12 3a15 15 0 0 1 0 18a15 15 0 0 1 0-18z"/></svg>
+    <span id="pageTitle">正在读取当前网页…</span>
+  </div>
+
+  <main id="msgs">
+    <div class="msg ai">
+      <div class="bubble">
+        我可以直接看和操作 <b>右边这个网页</b>：读页面、点按钮、填搜索框、翻页、控制视频播放。
+        <div class="hintRow">
+          <button class="hint" data-q="这页讲了什么？帮我总结一下重点">总结这页</button>
+          <button class="hint" data-q="把这个页面上值得看的内容挑出来，告诉我先看哪个">挑重点</button>
+          <button class="hint" data-q="帮我搜一下 ">帮我搜…</button>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <footer id="foot">
+    <div id="composer">
+      <textarea id="input" rows="1" placeholder="问问这个页面…"></textarea>
+      <button id="btnStop" class="iconBtn danger" title="停止生成" aria-label="停止生成" hidden>
+        <svg viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="2"/></svg>
+      </button>
+      <button id="btnSend" class="send" title="发送 (Enter)" aria-label="发送">
+        <svg viewBox="0 0 24 24"><path d="M4 12l16-8-6 8 6 8z"/></svg>
+      </button>
+    </div>
+    <div id="footHint">Enter 发送 · Shift+Enter 换行</div>
+  </footer>
+
+</div>
+<script src="/panel.js"></script>
+</body>
+</html>

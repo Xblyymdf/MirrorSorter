@@ -1,0 +1,195 @@
+/* 内置浏览器右侧 AI 面板 —— 独立小页面, 不引 style.css(那套是主界面的, 依赖太多)。
+   配色跟壳的导航栏一套: 深色底 #0f1115 / 面板 #171a21 / 描边 #2b3040。 */
+* { box-sizing: border-box; }
+:root {
+  --bg: #0f1115;
+  --panel: #14171d;
+  --panel2: #1a1e26;
+  --line: #262b36;
+  --fg: #e3e7ef;
+  --fg2: #9aa3b2;
+  --fg3: #6b7383;
+  --accent: #fb7299;
+  --accent-soft: rgba(251, 114, 153, .14);
+  --danger: #ff6b6b;
+  --ok: #4ec9a5;
+  --radius: 10px;
+}
+html[data-theme="light"] {
+  --bg: #f7f8fa;
+  --panel: #ffffff;
+  --panel2: #f1f3f7;
+  --line: #dfe3ea;
+  --fg: #1b1f27;
+  --fg2: #5a6270;
+  --fg3: #8b93a1;
+  --accent-soft: rgba(76, 141, 255, .12);
+}
+html, body { height: 100%; margin: 0; }
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font: 13px/1.55 "Microsoft YaHei UI", "Microsoft YaHei", system-ui, -apple-system, "Segoe UI", sans-serif;
+  overflow: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+#app { display: flex; flex-direction: column; height: 100%; }
+
+/* ---------------- 头部 ---------------- */
+#head {
+  flex: none; height: 38px; display: flex; align-items: center;
+  justify-content: space-between; padding: 0 6px 0 12px;
+  border-bottom: 1px solid var(--line); background: var(--panel);
+}
+.hTitle { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.hTitle .tt { font-size: 12.5px; font-weight: 600; letter-spacing: .2px; }
+.dot {
+  width: 7px; height: 7px; border-radius: 50%; background: var(--fg3);
+  box-shadow: 0 0 0 3px transparent; transition: background .2s, box-shadow .2s;
+}
+.dot.on { background: var(--ok); box-shadow: 0 0 0 3px rgba(78, 201, 165, .16); }
+.dot.off { background: var(--danger); box-shadow: 0 0 0 3px rgba(255, 107, 107, .14); }
+.hBtns { display: flex; gap: 2px; }
+.iconBtn {
+  width: 28px; height: 28px; border: 0; border-radius: 7px; background: transparent;
+  color: var(--fg2); cursor: pointer; display: grid; place-items: center; padding: 0;
+}
+.iconBtn:hover { background: var(--panel2); color: var(--fg); }
+/* [hidden] 必须赢过 .iconBtn 的 display:grid, 否则停止键会一直占位成一个空方块 */
+[hidden] { display: none !important; }
+.iconBtn svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; }
+.iconBtn.danger:hover { color: var(--danger); }
+
+/* ---------------- 当前网页 ---------------- */
+#pageBar {
+  flex: none; display: flex; align-items: center; gap: 6px;
+  padding: 5px 12px; font-size: 11.5px; color: var(--fg3);
+  background: var(--panel2); border-bottom: 1px solid var(--line);
+  white-space: nowrap; overflow: hidden;
+}
+#pageBar .pg { width: 12px; height: 12px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.6; }
+#pageTitle { overflow: hidden; text-overflow: ellipsis; }
+
+/* ---------------- 消息 ---------------- */
+#msgs {
+  flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden;
+  padding: 12px 12px 4px; display: flex; flex-direction: column; gap: 10px;
+  scrollbar-width: thin;
+}
+#msgs::-webkit-scrollbar { width: 8px; }
+#msgs::-webkit-scrollbar-thumb { background: var(--line); border-radius: 8px; }
+#msgs::-webkit-scrollbar-track { background: transparent; }
+.msg { display: flex; }
+.msg.me { justify-content: flex-end; }
+.bubble {
+  max-width: 92%; padding: 9px 11px; border-radius: var(--radius);
+  background: var(--panel); border: 1px solid var(--line);
+  word-break: break-word; overflow-wrap: anywhere;
+}
+.msg.me .bubble {
+  background: var(--accent-soft); border-color: transparent; color: var(--fg);
+}
+/* 未配置 AI 的引导气泡: 虚线描边, 不抢眼但看得出是"提示"而不是回答 */
+.bubble.notice {
+  border-style: dashed; color: var(--fg2); font-size: 12.5px; line-height: 1.6;
+}
+.bubble.notice b { color: var(--fg); }
+.bubble p { margin: 0 0 7px; }
+.bubble p:last-child { margin-bottom: 0; }
+.bubble ul, .bubble ol { margin: 4px 0 8px; padding-left: 20px; }
+.bubble li { margin: 2px 0; }
+.bubble h1, .bubble h2, .bubble h3 { margin: 10px 0 6px; font-size: 13.5px; }
+.bubble h1:first-child, .bubble h2:first-child, .bubble h3:first-child { margin-top: 0; }
+.bubble code {
+  background: var(--panel2); border: 1px solid var(--line); border-radius: 4px;
+  padding: 0 4px; font: 12px/1.4 Consolas, "Courier New", monospace;
+}
+.bubble pre {
+  background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
+  padding: 8px 10px; overflow-x: auto; margin: 6px 0;
+}
+.bubble pre code { background: none; border: 0; padding: 0; }
+.bubble a { color: var(--accent); text-decoration: none; }
+.bubble a:hover { text-decoration: underline; }
+.bubble strong { color: var(--fg); }
+.bubble blockquote {
+  margin: 6px 0; padding: 2px 0 2px 9px; border-left: 2px solid var(--line); color: var(--fg2);
+}
+.bubble table { border-collapse: collapse; margin: 6px 0; font-size: 12px; }
+.bubble th, .bubble td { border: 1px solid var(--line); padding: 3px 7px; text-align: left; }
+
+/* 智能体动作 / 阶段 */
+.acts { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+.act {
+  display: flex; align-items: flex-start; gap: 6px; font-size: 11.5px;
+  color: var(--fg2); background: var(--panel2); border: 1px solid var(--line);
+  border-radius: 7px; padding: 4px 8px;
+}
+.act .k { flex: none; font-weight: 700; }
+.act.ok .k { color: var(--ok); }
+.act.bad .k { color: var(--danger); }
+.phase {
+  font-size: 11.5px; color: var(--fg3); margin-bottom: 6px;
+  display: flex; align-items: center; gap: 6px;
+}
+.phase::before {
+  content: ""; width: 8px; height: 8px; border-radius: 50%;
+  border: 1.5px solid var(--fg3); border-top-color: transparent;
+  animation: spin .8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* 打字指示 */
+.typing { display: inline-flex; gap: 3px; padding: 2px 0; }
+.typing i {
+  width: 5px; height: 5px; border-radius: 50%; background: var(--fg3);
+  animation: blink 1.2s infinite ease-in-out;
+}
+.typing i:nth-child(2) { animation-delay: .18s; }
+.typing i:nth-child(3) { animation-delay: .36s; }
+@keyframes blink { 0%, 60%, 100% { opacity: .28; } 30% { opacity: 1; } }
+
+.msgHint { display: block; margin-top: 6px; font-size: 11px; color: var(--fg3); }
+
+/* 空对话引导 */
+.hintRow { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
+.hint {
+  border: 1px solid var(--line); background: var(--panel2); color: var(--fg2);
+  border-radius: 999px; padding: 3px 10px; font-size: 11.5px; cursor: pointer;
+}
+.hint:hover { border-color: var(--accent); color: var(--fg); }
+
+/* ---------------- 输入区 ---------------- */
+#foot {
+  flex: none; padding: 8px 10px 7px; border-top: 1px solid var(--line);
+  background: var(--panel);
+}
+#composer {
+  display: flex; align-items: flex-end; gap: 6px;
+  border: 1px solid var(--line); border-radius: var(--radius);
+  background: var(--panel2); padding: 5px 5px 5px 9px;
+  transition: border-color .15s;
+}
+#composer:focus-within { border-color: var(--accent); }
+#input {
+  flex: 1; min-width: 0; border: 0; outline: 0; resize: none; background: transparent;
+  color: var(--fg); font: inherit; line-height: 1.5; padding: 4px 0; max-height: 132px;
+  height: 26px; overflow-y: auto;
+}
+#input::placeholder { color: var(--fg3); }
+/* 输入框自己会随内容长高(autoGrow), 窄面板下再冒一根滚动条很脏 */
+#input::-webkit-scrollbar { width: 0; height: 0; }
+.send {
+  flex: none; width: 30px; height: 30px; border: 0; border-radius: 8px;
+  background: var(--accent); color: #fff; cursor: pointer; display: grid; place-items: center;
+}
+.send:disabled { opacity: .45; cursor: default; }
+.send svg { width: 15px; height: 15px; fill: currentColor; }
+#footHint { margin-top: 5px; font-size: 10.5px; color: var(--fg3); text-align: right; }
+
+/* 窄面板(300px 左右)时收紧间距 */
+@media (max-width: 380px) {
+  #msgs { padding: 9px 9px 4px; }
+  .bubble { max-width: 96%; }
+  #footHint { display: none; }
+}

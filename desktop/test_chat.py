@@ -102,5 +102,16 @@ check("删除后回退", len(convs) == 2 and app.sget("cur_conv") in ("1", "2"),
 # --- 命名/重命名 ---
 check("重命名", app.conv_rename(2, "独立游戏") and app.db().execute("SELECT title FROM conv WHERE id=2").fetchone()[0] == "独立游戏")
 
+# --- v0.4.40: 要一批屏蔽词时, 本地正则不能把整句吞成一个脏词 ---
+check("归一化:去前缀", app._clean_kw("任何关于手机测评") == "手机测评",
+      app._clean_kw("任何关于手机测评"))
+check("归一化:过长堆叠截断", app._clean_kw("任何手机推荐和讲解手机还有手机性") == "手机推荐",
+      app._clean_kw("任何手机推荐和讲解手机还有手机性"))
+check("要提示词交给AI意图",
+      app.handle_command("我不想看任何手机测评视频，给我写各种提示词去屏蔽这类东西") is None)
+new_note, added = app._note_add("任何关于手机测评", ["手机推荐"])
+check("追加时清理历史脏词", new_note == "手机测评，手机推荐" and added == ["手机推荐"],
+      (new_note, added))
+
 print("\n==== %d PASS / %d FAIL ====" % (PASS, FAIL))
 sys.exit(1 if FAIL else 0)

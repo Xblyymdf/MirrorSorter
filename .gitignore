@@ -139,3 +139,7 @@ desktop/_vis/fasttext_demo/*.json
 
 # v0.4.7dsk: 清池/信息流回归 + 反解校验
 !desktop/_verify_exe_v047.py
+
+# v0.4.42dsk: 内置浏览器右侧 AI 面板。_test_ai_page_js.js 用 node 沙盒跑注入网页的
+# 助手脚本(假 DOM + 断言真的点了哪个元素/发了哪些请求), 静态断言证明不了行为。
+!desktop/_test_ai_page_js.js

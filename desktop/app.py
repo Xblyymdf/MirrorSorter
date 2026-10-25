@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-洞鉴虚明 · 基础版 (v0.4.38dsk)
+洞鉴虚明 · 基础版 (v0.4.42dsk)
 ==========================
 本地运行的洞鉴虚明：读取 B站 内容 → 黑白名单/AI 分拣 → 推荐流 + 数据源状态 + AI 聊天。
 
@@ -70,7 +70,7 @@ if _PORT_ENV:
         PORTS = (int(_PORT_ENV),)
     except Exception:
         pass
-APP_VER = "v0.4.38dsk"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
+APP_VER = "v0.4.42dsk"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
 # 本机回环请求必须绕过系统代理: 用户开着 Clash/V2Ray/公司代理时, 环境里的 http_proxy 会把
 # 127.0.0.1 的请求转给代理服务器, 轻则 502, 重则心跳连续失败 -> 悬浮球探活 2 轮不过自我了断,
 # 表现为「球莫名消失/点定位没反应」。这里建一个禁用代理的 opener 专供本地调用; 外网 API 仍走
@@ -973,7 +973,7 @@ def db():
 DEFAULTS = {
     "ai_base": "https://api.deepseek.com/v1",
     "ai_key": "",
-    "ai_model": "deepseek-chat",
+    "ai_model": "deepseek-flash",
     "ai_enabled": "1",        # AI 总开关: 0=全部AI功能停用(评分/聊天/添词都不烧钱), 1=按其它设置运行
     "mode": "标准",
     "prefs_note": "",
@@ -5129,17 +5129,19 @@ def record_usage(usage):
         pass   # 统计失败不影响聊天; 下次调用继续累计
 
 
-def llm_body(messages, max_tokens, temperature=0.3):
+def llm_body(messages, max_tokens, temperature=0.3, think=None):
     # 注意: 非流式请求**不能**带 "stream": False 字段——v4-flash 会返回空content/finish=length(bug)
-    return json.dumps({
-        "model": sget("ai_model"), "messages": messages,
-        "max_tokens": max_tokens, "temperature": temperature,
-    }).encode("utf-8")
+    obj = {"model": sget("ai_model"), "messages": messages,
+           "max_tokens": max_tokens, "temperature": temperature}
+    # 意图识别这类「只输出 JSON」的任务不需要思考: 开着会吃掉 max_tokens 且白等几秒
+    if think is False and "deepseek" in str(sget("ai_model")).lower():
+        obj["thinking"] = {"type": "disabled"}
+    return json.dumps(obj).encode("utf-8")
 
 
-def call_llm(messages, max_tokens=1200, temperature=0.3):
+def call_llm(messages, max_tokens=1200, temperature=0.3, think=None):
     """调用 OpenAI 兼容接口, 返回 (content, usage) 或抛异常。"""
-    body = llm_body(messages, max_tokens, temperature)
+    body = llm_body(messages, max_tokens, temperature, think)
     req = urllib.request.Request(
         sget("ai_base").rstrip("/") + "/chat/completions", data=body,
         headers={"Content-Type": "application/json",
@@ -5341,20 +5343,72 @@ def chat_plan(text, effort="mid", prefs=None, weights=None, live=None, history=N
             "actions": acts, "effort": effort, "reasoning_chars": rchars}
 
 
-def llm_stream(messages, max_tokens=1200, on_reasoning=None):
-    """流式调用: 逐段 yield 增量文本; 推理模型(如 deepseek-v4-flash)先出
-    reasoning_content 再出 content——思考期间通过 on_reasoning 回调通知,
-    思考字节忽略(否则 max_tokens 会被思考吃光导致 content 为空)。"""
-    body = json.dumps({
-        "model": sget("ai_model"), "messages": messages,
-        "max_tokens": max_tokens, "temperature": 0.3, "stream": True,
-    }).encode("utf-8")
+# 聊天思考档位 → 官方 reasoning_effort。官方取值 low/high/max(medium 会被映射到 high)。
+_CHAT_THINK_EFFORT = {"low": "low", "mid": "high", "high": "max"}
+
+
+def _thinking_payload(effort):
+    """思考参数。只对 DeepSeek 模型发: 其它 OpenAI 兼容服务不认这些字段。"""
+    eff = effort if effort in ("off", "low", "mid", "high") else "mid"
+    if "deepseek" not in str(sget("ai_model")).lower():
+        return {}
+    if eff == "off":
+        return {"thinking": {"type": "disabled"}}
+    return {"thinking": {"type": "enabled"},
+            "reasoning_effort": _CHAT_THINK_EFFORT[eff]}
+
+
+def _chat_err_text(e):
+    """把 API 异常翻成用户能照做的中文提示。"""
+    code = getattr(e, "code", None)
+    body = ""
+    try:
+        body = e.read().decode("utf-8", "replace")
+    except Exception:
+        pass
+    detail = ""
+    try:
+        detail = ((json.loads(body).get("error") or {}).get("message") or "")[:160]
+    except Exception:
+        detail = body[:160]
+    if code == 401:
+        return "API Key 无效或已过期（401）。请到左侧「设置 → AI」换一把 Key。"
+    if code == 402:
+        return "DeepSeek 账户余额不足（402）。充值后再发一次。"
+    if code == 429:
+        return "请求太频繁被限流（429），缓几秒再发。"
+    if code and code >= 500:
+        return "DeepSeek 服务端暂时出错（%s），稍后再试。" % code
+    return "AI 调用失败（%s%s）。请检查左侧设置里的 API 地址 / Key / 模型。" % (
+        code or "网络异常", ("：" + detail) if detail else "")
+
+
+def llm_stream(messages, max_tokens=16384, on_reasoning=None, effort="mid",
+               on_usage=None, tools=None, on_tool_calls=None, temperature=1.0):
+    """流式调用: 正文逐段 yield; 思考增量走 on_reasoning 回调。
+
+    DeepSeek 官方说明 max_tokens 含思考 token, 所以额度必须给够(默认 16k),
+    否则长思考会把回答额度吃光、正文为空; 思考也必须真的转给前端, 否则
+    正文出来前那几秒用户只看到空屏(实测思考 0.5s 开始、正文 3s 才出)。
+
+    tools: 原生 function calling 工具目录。流式响应里的 tool_calls 分片按 index
+    合并, 整轮结束后通过 on_tool_calls(calls, reasoning) 一次性交给调用方。
+    """
+    payload = {"model": sget("ai_model"), "messages": messages,
+               "max_tokens": max_tokens, "temperature": temperature, "stream": True}
+    payload.update(_thinking_payload(effort))
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
     req = urllib.request.Request(
-        sget("ai_base").rstrip("/") + "/chat/completions", data=body,
+        sget("ai_base").rstrip("/") + "/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json",
                  "Authorization": "Bearer %s" % sget("ai_key"),
                  "Accept": "text/event-stream"})
     usage = {}
+    tcs = {}
+    reasoning_all = []
     with urllib.request.urlopen(req, timeout=180) as resp:
         for raw in resp:
             line = raw.decode("utf-8", "replace").strip()
@@ -5373,12 +5427,42 @@ def llm_stream(messages, max_tokens=1200, on_reasoning=None):
             if not choices:
                 continue
             delta = choices[0].get("delta") or {}
-            if delta.get("reasoning_content") and on_reasoning:
-                on_reasoning(delta["reasoning_content"])
+            if delta.get("reasoning_content"):
+                reasoning_all.append(delta["reasoning_content"])
+                if on_reasoning:
+                    on_reasoning(delta["reasoning_content"])
+            for tc in (delta.get("tool_calls") or []):
+                i = tc.get("index", 0)
+                slot = tcs.setdefault(i, {"id": "", "name": "", "arguments": ""})
+                if tc.get("id"):
+                    slot["id"] = tc["id"]
+                fn = tc.get("function") or {}
+                if fn.get("name"):
+                    slot["name"] += fn["name"]
+                if fn.get("arguments"):
+                    slot["arguments"] += fn["arguments"]
             c = delta.get("content")
             if c:
                 yield c
     record_usage(usage)
+    if on_usage:
+        try:
+            on_usage(usage)
+        except Exception:
+            pass
+    if on_tool_calls:
+        calls = []
+        for i in sorted(tcs):
+            slot = tcs[i]
+            if not slot.get("name"):
+                continue
+            calls.append({"id": slot.get("id") or ("call_%d" % i), "type": "function",
+                          "function": {"name": slot["name"],
+                                       "arguments": slot.get("arguments") or "{}"}})
+        try:
+            on_tool_calls(calls, "".join(reasoning_all))
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------- 联网证据: 事实核查 / 回怼 (AI 悬浮窗)
@@ -8468,9 +8552,9 @@ def handle_command(msg):
     for w in ("严格", "标准", "宽松", "严肃"):
         if w in m and ("档" in m or "模式" in m or len(m) <= 4):
             sset("mode", w)
-            return {"reply": "已切到【%s】档（引战剔除阈值 %s，%s）" % (
-                w, MODE_THRESH[w],
-                "严肃模式：只推硬核教程与知识" if w == "严肃" else ""), "trigger": "settings"}
+            note = "；严肃模式：只推硬核教程与知识" if w == "严肃" else ""
+            return {"reply": "已切到【%s】档（引战剔除阈值 %s%s）" % (
+                w, MODE_THRESH[w], note), "trigger": "settings"}
     # --- 时间窗 ---
     mm = re.search(r"最近\s*(\d+)\s*个?月", m)
     if mm:
@@ -8514,6 +8598,11 @@ def handle_command(msg):
     # --- 探索模式(实时干预): 临时拉高探索区配额并预览新领域 ---
     if any(w in m for w in ("探索", "发现新领域", "来点新东西", "看看别的", "换换领域", "新鲜领域")):
         return {"reply": _open_explore(), "trigger": "random"}
+    # 用户要的是「一批屏蔽词/提示词」, 不是单个词: 交给下面的 AI 意图识别去扩词。
+    # 本地正则做不到这件事——实测把整句截成「任何手机推荐和讲解手机还有手机性」写进备注。
+    if re.search(r"(提示词|关键词|屏蔽词|过滤词|(?:屏蔽|过滤)(?:掉)?(?:这类|这些|这种|那些)"
+                 r"|不想看(?:这类|这些|这种))", m):
+        return None
     # --- 厌恶追加(把不想看的内容写进厌恶备注) ---
     # 隐含句式: "我不想看/别看/别推/少来 X" (取动词后的关键词, 到标点为止)
     mdis = re.search(r"(?:别|不要|别再|不想再|不想|少来|别看|别刷|别推)[^。，,\s]*?(?:推|看|刷|来)\s*([^。，,\s]{2,16})", m)
@@ -8523,11 +8612,10 @@ def handle_command(msg):
     mdir = re.search(r"(?:少来|别来|别整|别看)\s*([^。，,\s]{2,16})", m)
     extra = (mdis.group(1) if mdis else (mex.group(1) if mex else (mdir.group(1) if mdir else "")))
     if extra:
-        # 去掉常见后缀(把"男女对立视频"归一成核心词"男女对立", 匹配更通用)
-        extra = re.sub(r"(视频|内容|话题|帖子|相关|之类|东西|这类|这些)+$", "", extra).strip("的了啊吧 ，, ")
-        if 2 <= len(extra) <= 16:
-            cur = sget("dislike_note")
-            sset("dislike_note", (cur + "，" + extra).strip("，") if cur else extra)
+        extra = _clean_kw(extra)
+        if extra:
+            new, _added = _note_add(sget("dislike_note"), [extra])
+            sset("dislike_note", new)
             clear_score_cache()   # 厌恶画像变化 → 旧语义分数过时, 强制重评
             force_rebuild()       # 非全扫模式下厌恶词靠机器层过滤, 必须重建池子才立即生效
             return {"reply": "已记下：以后不给你看「%s」相关的内容" % extra, "trigger": "settings"}
@@ -8553,17 +8641,54 @@ def handle_command(msg):
     return None
 
 
+_KW_LEAD = re.compile(r"^(?:任何|所有|一切|全部|关于|有关|这类|这种|那些|这些|一些|各种)+")
+_KW_TAIL = re.compile(r"(?:视频|内容|话题|帖子|相关|之类|东西|这类|这些)+$")
+
+
+def _clean_kw(k):
+    """把一句口语归一成能用于子串匹配的关键词。
+    实测脏数据: 「任何关于手机测评」「任何手机推荐和讲解手机还有手机性」——
+    前缀「任何/关于」和过长的「和/还有」堆叠会让这个词永远匹配不到内容。"""
+    k = str(k or "").strip().strip("，,、;；。！？!? ")
+    k = _KW_TAIL.sub("", k).strip()
+    while True:
+        n = _KW_LEAD.sub("", k).strip()
+        if n == k:
+            break
+        k = n
+    k = re.sub(r"[了的啊吧呀嘛呢]+$", "", k).strip()
+    if len(k) > 12:
+        k = re.split(r"和|还有|以及", k)[0].strip()
+    return k if 2 <= len(k) <= 16 else ""
+
+
+def _clean_legacy(p):
+    """历史备注里已有的词原样保留 —— 用户可能故意写「垃圾视频」「带货视频」,
+    把它们裁成「垃圾」「带货」会悄悄放宽过滤。只清理明显是整句话的脏串:
+    以「任何/所有/关于…」开头, 或长度超过 16 字。"""
+    s = str(p or "").strip().strip("，,、;；。！？!? ")
+    if not s:
+        return ""
+    if _KW_LEAD.match(s) or len(s) > 16:
+        return _clean_kw(s)
+    return s
+
+
 def _note_add(note, kws):
-    """把关键词追加进逗号分隔备注(去重)。返回 (新备注, 实际新增列表)。"""
-    new, added = note, []
+    """把关键词追加进逗号分隔备注(去重 + 清理历史整句脏串)。
+    返回 (新备注, 实际新增列表)。"""
+    parts = []
+    for p in re.split(r"[，,、;；]", note or ""):
+        c = _clean_legacy(p)
+        if c and c not in parts:
+            parts.append(c)
+    added = []
     for k in kws:
-        k = (k or "").strip()
-        if not k:
-            continue
-        if k not in new:
-            new = (new + "，" + k).strip("，") if new else k
-            added.append(k)
-    return new, added
+        c = _clean_kw(k)
+        if c and c not in parts:
+            parts.append(c)
+            added.append(c)
+    return "，".join(parts), added
 
 
 def _note_remove(note, kws):
@@ -8645,6 +8770,1254 @@ def handle_chat_payload(payload):
     if op == "noop":
         return {"reply": "好的，没有做任何改动。", "trigger": None}
     return {"reply": "未知操作，已忽略。", "trigger": None}
+
+
+# ---------------------------------------------------------------- 网页助手桥(v0.4.42)
+# 「内置浏览器右侧 AI 面板」要模型能**看见并操作**当前网页, 但真正执行 JS 的只能是
+# 窗口壳(WebView2 必须在 UI 线程跑)。所以这里只留两个**回调槽**, 由壳启动时注册:
+#   set_browser_bridge(fn)  fn(action, args) -> dict   同步执行一次网页操作
+#   set_panel_hook(obj)     obj.state()/set_open(bool) 面板开合与当前页信息
+# 后端不 import 任何壳模块(安卓/纯服务模式照样能跑), 壳不在时工具直接回"不可用"。
+_BROWSER_BRIDGE = {"fn": None}
+_PANEL_HOOK = {"fn": None}
+
+
+def set_browser_bridge(fn):
+    _BROWSER_BRIDGE["fn"] = fn
+
+
+def browser_bridge_ready():
+    return _BROWSER_BRIDGE.get("fn") is not None
+
+
+def set_panel_hook(obj):
+    _PANEL_HOOK["fn"] = obj
+
+
+def panel_hook():
+    return _PANEL_HOOK.get("fn")
+
+
+def panel_theme():
+    """面板配色跟主界面走(与壳里 _current_theme 同一套回退)。"""
+    v = sget("ui_theme")
+    if v not in ("light", "dark"):
+        v = "light" if sget("float_ball_light") == "1" else "dark"
+    return v
+
+
+def panel_state():
+    """面板轮询的实时状态: 主题/强调色/AI 是否可用 + 当前标签页网址标题。"""
+    st = {"ok": True, "ai_on": bool(ai_on()), "theme": panel_theme(),
+          "accent": (str(sget("float_ball_accent") or "") or "#fb7299")[:9],
+          "shell": browser_bridge_ready(), "open": False, "w": 0,
+          "url": "", "title": "", "tab_id": None}
+    hook = panel_hook()
+    if hook is not None:
+        try:
+            live = hook.state() or {}
+            if isinstance(live, dict):
+                st.update({k: v for k, v in live.items() if k in st})
+        except Exception:
+            pass
+    return st
+
+
+def panel_set(body):
+    """面板自己的按钮(展开/收起)落到壳上。"""
+    hook = panel_hook()
+    if hook is None:
+        return {"ok": False, "error": "桌面壳未就绪"}
+    if "open" in body:
+        try:
+            hook.set_open(bool(body.get("open")))
+        except Exception as e:
+            return {"ok": False, "error": str(e)[:120]}
+    return panel_state()
+
+
+# ---------------------------------------------------------------- AI 智能体(v0.4.41)
+# 旧链路有三套并行又互相截胡的机制: 本地正则(handle_command) / 单次 JSON 意图分类
+# (extract_intent) / 前端"设置计划"(/api/chat/plan)。实际表现是:
+#   · "给我写各种提示词去屏蔽" 被正则截成半句话写进备注;
+#   · 模型拿不到当前状态, 只能猜;
+#   · 能做的事只有十一种, 而且执行完只能回一句固定话术;
+#   · 闲聊提示词还明确写着"你不能改设置、不能推视频"。
+# 现在统一成: 实时状态 + 原生 tools + 多轮执行 + 模型自己总结。模型是操作者, 不是分类器。
+
+AGENT_MAX_ROUNDS = 6          # 一轮对话最多几次"模型 → 工具 → 模型"
+AGENT_MAX_CALLS = 20          # 单轮最多执行多少个工具, 防跑飞
+
+_AGENT_LAYOUT_CN = {"single": "单栏", "dual": "双栏", "big": "大图"}
+_AGENT_COVER_CN = {"s": "小", "m": "中", "l": "大", "xl": "特大"}
+_AGENT_FONT_CN = {"small": "小", "medium": "中", "large": "大"}
+_AGENT_THEME_CN = {"dark": "黑夜", "light": "白天"}
+_AGENT_TRIGGER_RANK = {"random": 1, "browser": 2, "settings": 3}
+
+# 界面上固定按钮的原话: 语义唯一, 保留本地秒回(不烧 token、不等模型)
+AGENT_FAST_CMDS = {"随机来一批", "今日简报", "今日统计", "当前配置",
+                   "关掉游戏", "只看游戏", "更严格点", "宽松点"}
+
+_AGENT_PHASE = {
+    "get_state": "正在读取当前状态…",
+    "set_interface": "正在调整界面…",
+    "set_info_filters": "正在调整信息流筛选…",
+    "set_moderation": "正在调整评论/弹幕筛选…",
+    "set_partitions": "正在切换分区…",
+    "manage_dislike": "正在更新厌恶备注…",
+    "manage_prefs": "正在更新偏好备注…",
+    "manage_blacklist": "正在更新黑名单…",
+    "temp_block": "正在设置临时屏蔽…",
+    "search_feed": "正在搜索信息流…",
+    "refresh_feed": "正在刷新信息流…",
+    "browse": "正在打开内置浏览器…",
+    "feed_items": "正在查看信息流…",
+    "get_stats": "正在统计…",
+    "daily_report": "正在汇总今天的观看数据…",
+    "act_on_current": "正在处理刚才那条…",
+    "set_ai": "正在调整 AI 设置…",
+    "floatball": "正在切换悬浮球…",
+    "new_conversation": "正在开新对话…",
+    "browser_snapshot": "正在读取网页…",
+    "browser_open": "正在打开网页…",
+    "browser_click": "正在点击页面元素…",
+    "browser_type": "正在填写页面…",
+    "browser_scroll": "正在滚动页面…",
+    "browser_media": "正在操作播放器…",
+    "browser_history": "正在前进/后退…",
+    "browser_find": "正在页面上查找…",
+    "browser_eval": "正在操作网页…",
+}
+
+# 模型可写的设置项(绝不含 ai_key / cookie 等凭据)。
+# int:   ("int", 下限, 上限, 中文名)
+# bool:  ("bool", 中文名)
+# enum:  ("enum", 可选值, 中文名)
+# str:   ("str", 最大长度, 中文名)
+_AGENT_SETTING_SPECS = {
+    "m_min_views": ("int", 0, 10 ** 9, "播放量下限"),
+    "m_max_views": ("int", 0, 10 ** 9, "播放量上限"),
+    "m_min_duration": ("int", 0, 86400, "时长下限(秒)"),
+    "m_max_duration": ("int", 0, 86400, "时长上限(秒)"),
+    "m_max_age_months": ("int", 0, 120, "时间窗(月)"),
+    "ser_max_age_months": ("int", 0, 120, "严肃模式时间窗(月)"),
+    "m_seen_hours": ("int", 0, 8760, "已看去重(小时)"),
+    "m_repeat_limit": ("int", 1, 1000, "重复展示上限"),
+    "m_repeat_cooldown_hours": ("int", 0, 8760, "重复冷却(小时)"),
+    "m_cold_start_n": ("int", 0, 5000, "启动预缓存条数"),
+    "cf_min_level": ("int", 0, 6, "评论屏蔽≤等级"),
+    "m_dm_multicand": ("int", 0, 2, "弹幕多候选策略"),
+    "m_filter_speed": ("int", 0, 3, "筛选加速档"),
+    "ft_thresh": ("int", 0, 100, "文本回退阈值%"),
+    "ai_interest_min": ("int", 0, 10, "兴趣门槛"),
+    "ai_batch": ("int", 5, 100, "每批评分条数"),
+    "ai_cache_hours": ("int", 1, 720, "评分缓存(小时)"),
+    "bili_weight": ("int", 0, 100, "B站占比"),
+    "tb_weight": ("int", 0, 100, "贴吧占比"),
+    "xhh_weight": ("int", 0, 100, "小黑盒占比"),
+    "live_weight": ("int", 0, 100, "B站直播占比"),
+    "live_min_viewers": ("int", 0, 10 ** 8, "直播人气门槛"),
+    "bili_follow_months": ("int", 0, 24, "关注时间窗(月)"),
+    "mode": ("enum", tuple(MODE_THRESH), "过滤档位"),
+    "ft_point": ("enum", ("strict", "standard", "loose"), "文本模型工作点"),
+    "ft_engine": ("enum", ("auto", "fasttext"), "文本模型引擎"),
+    "m_dedup": ("bool", "相似标题去重"),
+    "m_blocklist_sync": ("bool", "同步B站拉黑名单"),
+    "m_emotion": ("bool", "情绪/标题党过滤"),
+    "m_news_fresh": ("bool", "资讯24小时保鲜"),
+    "m_play_related": ("bool", "播放页推荐筛选"),
+    "bili_follow_emph": ("bool", "强调关注的UP主"),
+    "tb_allow_help": ("bool", "保留贴吧求助帖"),
+    "cf_blk_on": ("bool", "评论屏蔽黑名单"),
+    "m_block_mystery_bio": ("bool", "评论屏蔽空简介账号"),
+    "m_block_lottery": ("bool", "评论屏蔽抽奖账号"),
+    "m_block_empty_space": ("bool", "评论屏蔽空首页账号"),
+    "m_dm_on": ("bool", "弹幕按身份筛选"),
+    "ft_on": ("bool", "快速文本分析"),
+    "ft_video": ("bool", "文本分析作用于信息流"),
+    "ft_dm": ("bool", "文本分析作用于弹幕"),
+    "ft_cf": ("bool", "文本分析作用于评论"),
+    "ai_full_scan": ("bool", "AI全量评分"),
+    "live_only_followed": ("bool", "直播只看关注"),
+    "tb_bars": ("str", 1000, "贴吧吧名"),
+    "xhh_comm": ("str", 300, "小黑盒社区"),
+    "xhh_topic": ("str", 300, "小黑盒话题"),
+    "ft_labels": ("str", 100, "文本模型标签"),
+    "ft_bthr": ("str", 8, "BERT自定义阈值%"),
+}
+
+_AGENT_INFO_KEYS = {
+    "m_min_views", "m_max_views", "m_min_duration", "m_max_duration",
+    "m_max_age_months", "ser_max_age_months", "m_seen_hours", "m_repeat_limit",
+    "m_repeat_cooldown_hours", "m_cold_start_n", "m_dedup", "m_emotion",
+    "m_news_fresh", "m_play_related", "m_blocklist_sync", "tb_bars", "tb_allow_help",
+    "xhh_comm", "xhh_topic", "bili_follow_emph", "bili_follow_months",
+    "bili_weight", "tb_weight", "xhh_weight", "live_weight",
+    "live_min_viewers", "live_only_followed", "ai_full_scan", "ai_interest_min",
+    "ai_batch", "ai_cache_hours", "m_filter_speed", "mode",
+}
+_AGENT_MOD_KEYS = {
+    "cf_blk_on", "cf_min_level", "m_block_mystery_bio", "m_block_lottery",
+    "m_block_empty_space", "m_dm_on", "m_dm_multicand",
+    "ft_on", "ft_video", "ft_dm", "ft_cf", "ft_thresh", "ft_labels",
+    "ft_point", "ft_bthr", "ft_engine",
+}
+
+_AGENT_UI_LABELS = {
+    "theme": {"dark": "界面 → 黑夜", "light": "界面 → 白天"},
+    "layout": {"single": "布局 → 单栏", "dual": "布局 → 双栏", "big": "布局 → 大图"},
+    "cover": {"s": "封面 → 小", "m": "封面 → 中", "l": "封面 → 大", "xl": "封面 → 特大"},
+    "font": {"small": "字号 → 小", "medium": "字号 → 中", "large": "字号 → 大"},
+    "reason": {"show": "推荐理由 → 显示", "hide": "推荐理由 → 隐藏"},
+    "srcacc": {"0": "来源标识 → 品牌色", "1": "来源标识 → 跟随强调色"},
+}
+
+
+def _agent_onoff(k):
+    return "开" if str(sget(k)) == "1" else "关"
+
+
+def _agent_partition_text():
+    ids = enabled_source_ids()
+    full = {g[0] for g in SOURCE_GROUPS}
+    if ids == full:
+        return "全部 %d 个" % len(full)
+    names = [_ID2NAME[i] for i in sorted(ids) if i in _ID2NAME]
+    return "、".join(names) if names else "无"
+
+
+def _agent_notes(short=True):
+    prefs = (sget("prefs_note") or "").strip()
+    dislike = (sget("dislike_note") or "").strip()
+    if short:
+        prefs = prefs[:320] + ("…" if len(prefs) > 320 else "")
+        dislike = dislike[:320] + ("…" if len(dislike) > 320 else "")
+    return prefs or "(空)", dislike or "(空)"
+
+
+def agent_state_text(ui=None, full=False):
+    """给模型看的实时状态。前端上报的界面偏好 + 服务端设置 + 今日统计。"""
+    ui = ui if isinstance(ui, dict) else {}
+    st = day_stats()
+    funnel = funnel_stats()
+    prefs_note, dislike_note = _agent_notes(short=not full)
+    try:
+        authors = [r[0] for r in db().execute(
+            "SELECT value FROM blacklist WHERE kind='author' ORDER BY value LIMIT 80").fetchall()]
+        kws = [r[0] for r in db().execute(
+            "SELECT value FROM blacklist WHERE kind='keyword' ORDER BY value LIMIT 80").fetchall()]
+    except Exception:
+        authors, kws = [], []
+    try:
+        tmp = [str(b.get("k")) for b in json.loads(sget("tmp_blocks") or "[]")
+               if isinstance(b, dict) and b.get("k")]
+    except Exception:
+        tmp = []
+
+    theme = str(ui.get("theme") or sget("ui_theme") or "dark")
+    if theme not in ("dark", "light"):
+        theme = "dark"
+    parts = ["【软件实时状态】"]
+    ui_bits = ["主题=" + _AGENT_THEME_CN.get(theme, theme)]
+    if ui.get("layout"):
+        ui_bits.append("布局=" + _AGENT_LAYOUT_CN.get(str(ui["layout"]), str(ui["layout"])))
+    if ui.get("cover"):
+        ui_bits.append("封面=" + _AGENT_COVER_CN.get(str(ui["cover"]), str(ui["cover"])))
+    if ui.get("font"):
+        ui_bits.append("字号=" + _AGENT_FONT_CN.get(str(ui["font"]), str(ui["font"])))
+    if ui.get("reason"):
+        ui_bits.append("推荐理由=" + ("显示" if str(ui["reason"]) == "show" else "隐藏"))
+    if ui.get("srcacc") is not None:
+        ui_bits.append("来源标识=" + ("跟随强调色" if str(ui["srcacc"]) == "1" else "品牌色"))
+    if ui.get("accent"):
+        ui_bits.append("强调色=" + str(ui["accent"])[:9])
+    if ui.get("q"):
+        ui_bits.append("当前搜索=「%s」" % str(ui["q"])[:40])
+    parts.append("· 界面: " + " ｜ ".join(ui_bits))
+    parts.append("· 信息流: 档位=%s ｜ 时间窗=%s个月 ｜ 分区=%s ｜ 平台占比=B站%s%%/贴吧%s%%/小黑盒%s%%/直播%s%%" % (
+        sget("mode"), sget("m_max_age_months"), _agent_partition_text(),
+        sget("bili_weight"), sget("tb_weight"), sget("xhh_weight"), sget("live_weight")))
+    parts.append("· 过滤: 播放量=%s~%s ｜ 时长=%s~%s秒 ｜ 已看%s小时内不重复 ｜ 重复%s次后冷却%sh ｜ 去重%s ｜ 情绪%s ｜ 资讯保鲜%s" % (
+        sget("m_min_views") or "不限", sget("m_max_views") or "不限",
+        sget("m_min_duration") or "0", sget("m_max_duration") or "不限",
+        sget("m_seen_hours"), sget("m_repeat_limit"), sget("m_repeat_cooldown_hours"),
+        _agent_onoff("m_dedup"), _agent_onoff("m_emotion"), _agent_onoff("m_news_fresh")))
+    parts.append("· 评论/弹幕: 屏蔽≤%s级 ｜ 黑名单%s ｜ 空简介%s ｜ 抽奖号%s ｜ 空首页%s ｜ 弹幕身份%s ｜ 文本分析%s" % (
+        sget("cf_min_level"), _agent_onoff("cf_blk_on"),
+        _agent_onoff("m_block_mystery_bio"), _agent_onoff("m_block_lottery"),
+        _agent_onoff("m_block_empty_space"), _agent_onoff("m_dm_on"), _agent_onoff("ft_on")))
+    parts.append("· AI: 模型=%s ｜ 全量评分=%s ｜ 兴趣门槛=%s ｜ 今日调用%s次 ¥%s" % (
+        sget("ai_model"), _agent_onoff("ai_full_scan"), sget("ai_interest_min"),
+        st["ai_calls"], st["cost"] if st["cost"] >= 0.01 else "%.4f" % st["cost"]))
+    parts.append("· 偏好备注(多推): " + prefs_note)
+    parts.append("· 厌恶备注(屏蔽): " + dislike_note)
+    parts.append("· 黑名单: 作者%d个%s ｜ 关键词%d个%s" % (
+        len(authors), ("(" + "、".join(authors[:10]) + "…)" if authors else ""),
+        len(kws), ("(" + "、".join(kws[:10]) + "…)" if kws else "")))
+    if tmp:
+        parts.append("· 临时屏蔽: " + "、".join(tmp[:10]))
+    parts.append("· 今日漏斗: 抓回%s条 → 入池%s条%s" % (
+        funnel.get("fetched", 0), funnel.get("kept", 0),
+        (" ｜ 拦截最多: " + "、".join(
+            "%s×%s" % (_FUNNEL_LABELS.get(k, k), v) for k, v in sorted(
+                ((k, v) for k, v in funnel.items()
+                 if k not in ("fetched", "kept", "build_full", "build_quick")),
+                key=lambda kv: -kv[1])[:3])) if funnel else ""))
+    if full:
+        parts.append("· 更多设置: 文本工作点=%s ｜ BERT阈值=%s ｜ 筛选加速=%s ｜ 冷启动缓存=%s条 ｜ 关注时间窗=%s个月 ｜ 贴吧吧名=%s ｜ 小黑盒社区=%s ｜ 小黑盒话题=%s" % (
+            sget("ft_point"), sget("ft_bthr") or "跟随", sget("m_filter_speed"),
+            sget("m_cold_start_n"), sget("bili_follow_months"),
+            (sget("tb_bars") or "(空)")[:200], (sget("xhh_comm") or "(空)")[:120],
+            (sget("xhh_topic") or "(空)")[:120]))
+    return "\n".join(parts)
+
+
+def agent_system_prompt(state_text, extra_ctx="", browser=False, page_ctx=""):
+    return (
+        "你是「洞鉴虚明」里的 AI 助手（底层是 DeepSeek）。你不仅是聊天机器人，"
+        "还是这个软件的**操作者**：你有完整权限，能通过工具直接修改任何设置、管理屏蔽/偏好词、"
+        "黑名单、分区、平台占比、评论/弹幕筛选、搜索与刷新信息流、打开内置浏览器、看今天的统计。"
+        "工具就是你的手。\n"
+        "把用户当朋友，听懂口语，自己判断意图：能直接做的就做，不要反问「你确定吗」，"
+        "也不要说「我改不了」「你去设置页点」「我做不到」——这些事你都能做。\n"
+        "工作方式：\n"
+        "1. 用户让你改设置/管理内容/搜索/打开网页 → 直接调用对应工具，可以连续多步；"
+        "参数自己给出合理默认值；只有关键信息缺失、且猜错代价大时，才用一句话问。\n"
+        "2. 执行完用自然中文说明**实际做了什么**、结果如何（改了哪几项、加了哪些词、搜了什么），"
+        "简短但完整；不要复述 JSON、工具名或内部键名；不要声称没执行的动作，也不要编造工具没返回的数据。\n"
+        "3. 用户只是聊天/提问/让你分析 → 不要调用工具，像 DeepSeek 一样直接回答："
+        "结论先行，讲透，按需用 Markdown（列表、小标题、表格、代码块）；不要堆客套话，不要重复问题。\n"
+        "4. 用户抱怨「老是刷到 X」「这些很烦」→ 主动理解语义，用 manage_dislike 一次加多个具体屏蔽词"
+        "（5~15 个，2~16 字，例如二次元、游戏、带货、性别对立、贩卖焦虑），不要只把原话塞进去，"
+        "也不要加「任何/关于」这种前缀。用户说「多来点 X」→ manage_prefs，并可按需 search_feed。\n"
+        "5. 用户说「刚才那条/这条」时，指代【用户最近点开的条目】；要操作它就用 act_on_current。\n"
+        "6. 你看不到用户屏幕，只能通过工具读状态；没看到的数据不要编。改完想核对可调用 get_state。\n"
+        "7. 用户问软件怎么用、有哪些功能 → 据实回答，并结合当前状态给出贴心的建议。\n"
+        "8. 用户让你「写提示词」→ 直接给出成体系的提示词/关键词清单，同时把真正能用的词写进厌恶/偏好备注；"
+        "不要只回复一句「已记下」。\n"
+        + state_text
+        + (("\n\n" + page_ctx) if (browser and page_ctx) else "")
+        + (("\n\n" + _AGENT_BROWSER_PROMPT) if browser else "")
+        + (("\n\n" + extra_ctx) if extra_ctx else "")
+    )
+
+
+_AGENT_BROWSER_PROMPT = (
+    "【你现在在内置浏览器的 AI 面板里 —— 网页操作员模式】\n"
+    "你能直接看和操作**当前这个标签页**:\n"
+    "· 看: browser_snapshot 读网址/标题/正文摘要/可点元素序号/输入框/视频状态/滚动位置;\n"
+    "· 做: browser_click(序号) 点击、browser_type(序号,文字,submit) 填写并提交、"
+    "browser_scroll 滚动、browser_media 播放/暂停/静音/跳转、browser_history 前进后退刷新、"
+    "browser_find 页内查找、browser_open 打开新网页或搜索。\n"
+    "规矩:\n"
+    "1. 想操作网页 → **先 snapshot** 看清元素序号, 再 click/type; 动作做完再 snapshot 确认结果。\n"
+    "2. 序号只对最近一次 snapshot 有效; 页面变了(跳转/刷新/滚动加载)要重新 snapshot。\n"
+    "3. 用户说「这个视频/这页/这里」→ 指当前标签页; 说「帮我搜/打开 XX」→ browser_open。\n"
+    "4. 只讲快照里真正看到的东西; 看不到就再 snapshot, 不要凭标题猜内容。\n"
+    "5. 视频页可以直接用 browser_media 控制播放, 不必去点播放器。\n"
+    "6. 做完用一两句中文说清你点了什么/看到了什么, 不要念元素序号和工具名。"
+)
+
+
+def _T(name, desc, props, required=None):
+    return {"type": "function", "function": {
+        "name": name, "description": desc,
+        "parameters": {"type": "object", "properties": props,
+                       "required": required or []}}}
+
+
+def _P(desc, enum=None, typ="string"):
+    d = {"type": typ, "description": desc}
+    if enum:
+        d["enum"] = list(enum)
+    return d
+
+
+_AGENT_TOOLS = [
+    _T("get_state", "读取软件实时状态: 所有设置、厌恶/偏好备注全文、黑名单、分区、今日统计、筛选漏斗。改动前后想核对时调用。", {}),
+    _T("set_interface", "修改主界面外观(即时生效): 主题、布局、封面大小、字号、推荐理由、来源标识、强调色。", {
+        "theme": _P("界面主题", ("dark", "light")),
+        "layout": _P("信息流布局: single=单栏, dual=双栏, big=大图", ("single", "dual", "big")),
+        "cover": _P("封面大小", ("s", "m", "l", "xl")),
+        "font": _P("字号", ("small", "medium", "large")),
+        "reason": _P("推荐理由显示/隐藏", ("show", "hide")),
+        "srcacc": _P("来源标识 0=品牌色 1=跟随强调色", ("0", "1")),
+        "accent": _P("强调色 #rrggbb"),
+    }),
+    _T("set_info_filters", "修改信息流筛选。所有参数可选, 只传要改的; 数值 0 通常表示关闭/不限。", {
+        "mode": _P("过滤档位: 严格/标准/宽松/严肃", tuple(MODE_THRESH)),
+        "m_max_age_months": _P("只显示最近N个月(0=不限)", typ="integer"),
+        "ser_max_age_months": _P("严肃模式独立时间窗(月)", typ="integer"),
+        "m_min_views": _P("最低播放量(0=关)", typ="integer"),
+        "m_max_views": _P("最高播放量(0=关)", typ="integer"),
+        "m_min_duration": _P("最短时长秒(0=关)", typ="integer"),
+        "m_max_duration": _P("最长时长秒(0=关)", typ="integer"),
+        "m_seen_hours": _P("看过的内容N小时内不重复(0=不限)", typ="integer"),
+        "m_repeat_limit": _P("同一条累计展示N次后冷却", typ="integer"),
+        "m_repeat_cooldown_hours": _P("冷却小时数", typ="integer"),
+        "m_cold_start_n": _P("启动预缓存条数", typ="integer"),
+        "m_dedup": _P("相似标题去重", typ="boolean"),
+        "m_emotion": _P("情绪/引战/标题党过滤", typ="boolean"),
+        "m_news_fresh": _P("资讯热点只推24小时内", typ="boolean"),
+        "m_play_related": _P("播放页推荐也按规则筛选", typ="boolean"),
+        "m_blocklist_sync": _P("同步B站账号拉黑名单", typ="boolean"),
+        "tb_bars": _P("贴吧吧名(逗号分隔, 空=不采集)"),
+        "tb_allow_help": _P("保留贴吧求助帖", typ="boolean"),
+        "xhh_comm": _P("小黑盒社区筛选(逗号分隔)"),
+        "xhh_topic": _P("小黑盒话题筛选(逗号分隔)"),
+        "bili_follow_emph": _P("强调关注的UP主", typ="boolean"),
+        "bili_follow_months": _P("关注内容只强调最近N个月", typ="integer"),
+        "bili_weight": _P("B站占比%", typ="integer"),
+        "tb_weight": _P("贴吧占比%", typ="integer"),
+        "xhh_weight": _P("小黑盒占比%", typ="integer"),
+        "live_weight": _P("B站直播占比%", typ="integer"),
+        "live_min_viewers": _P("直播人气门槛", typ="integer"),
+        "live_only_followed": _P("直播只看关注", typ="boolean"),
+        "ai_full_scan": _P("AI全量评分(费token)", typ="boolean"),
+        "ai_interest_min": _P("兴趣分门槛(0=不限)", typ="integer"),
+        "ai_batch": _P("每批评分条数", typ="integer"),
+        "ai_cache_hours": _P("评分缓存小时", typ="integer"),
+        "m_filter_speed": _P("筛选加速档 0~3", typ="integer"),
+    }),
+    _T("set_moderation", "修改评论/弹幕/文本分析相关筛选。参数可选, 只传要改的。", {
+        "cf_blk_on": _P("评论屏蔽黑名单", typ="boolean"),
+        "cf_min_level": _P("屏蔽≤N级用户评论(0=关)", typ="integer"),
+        "m_block_mystery_bio": _P("屏蔽空简介账号评论", typ="boolean"),
+        "m_block_lottery": _P("屏蔽抽奖账号评论", typ="boolean"),
+        "m_block_empty_space": _P("屏蔽空首页账号评论", typ="boolean"),
+        "m_dm_on": _P("弹幕按发送者身份筛选", typ="boolean"),
+        "m_dm_multicand": _P("弹幕多候选策略 0=放行 1=全部命中 2=任一命中", typ="integer"),
+        "ft_on": _P("快速文本分析总开关", typ="boolean"),
+        "ft_video": _P("文本分析作用于信息流标题/简介", typ="boolean"),
+        "ft_dm": _P("文本分析作用于弹幕", typ="boolean"),
+        "ft_cf": _P("文本分析作用于评论", typ="boolean"),
+        "ft_thresh": _P("文本回退阈值%(越高越宽松)", typ="integer"),
+        "ft_labels": _P("启用的标签(逗号分隔: flame,spam,clickbait,yy,misinfo)"),
+        "ft_point": _P("BERT工作点", ("strict", "standard", "loose")),
+        "ft_bthr": _P("BERT自定义阈值%(空=跟随工作点, 如 99.8)"),
+        "ft_engine": _P("文本模型引擎", ("auto", "fasttext")),
+    }),
+    _T("set_partitions", "切换B站内容分区。", {
+        "groups": _P("分区名列表(必须来自当前分区清单)", typ="array"),
+        "mode": _P("only=只看这些 add=加上 remove=关掉", ("only", "add", "remove")),
+    }, ["groups", "mode"]),
+    _T("manage_dislike", "管理厌恶/屏蔽备注(用户不想看的内容)。words 要具体、2-16字; 用户说“别推X”时主动补充相关词(5-15个)。", {
+        "action": _P("add=追加词 remove=移除词 replace=整体重设 list=查看", ("add", "remove", "replace", "list")),
+        "words": _P("关键词数组", typ="array"),
+        "text": _P("replace 时的新备注全文(逗号分隔)"),
+    }, ["action"]),
+    _T("manage_prefs", "管理喜欢/偏好备注(想多推的内容)。", {
+        "action": _P("add=追加词 remove=移除词 replace=整体重设 list=查看", ("add", "remove", "replace", "list")),
+        "words": _P("关键词数组", typ="array"),
+        "text": _P("replace 时的新备注全文(逗号分隔)"),
+    }, ["action"]),
+    _T("manage_blacklist", "管理黑名单(作者或关键词)。", {
+        "action": _P("list / add_author / add_keyword / remove_author / remove_keyword",
+                     ("list", "add_author", "add_keyword", "remove_author", "remove_keyword")),
+        "values": _P("作者名或关键词数组", typ="array"),
+    }, ["action"]),
+    _T("temp_block", "临时屏蔽某关键词, 到点自动解封(不写永久厌恶备注)。", {
+        "keyword": _P("关键词"),
+        "minutes": _P("时长分钟(默认60, 最长1440)", typ="integer"),
+    }, ["keyword"]),
+    _T("search_feed", "把左侧信息流真正切到搜索某个关键词; clear=true 退出搜索回到信息流。", {
+        "query": _P("搜索词"),
+        "clear": _P("true=退出搜索", typ="boolean"),
+    }),
+    _T("refresh_feed", "刷新/重建信息流: quick=立刻补一批, full=重新筛全部, random=随机换一批, explore=探索新领域30分钟。", {
+        "kind": _P("刷新方式", ("quick", "full", "random", "explore")),
+    }, ["kind"]),
+    _T("browse", "用内置浏览器打开网址或搜索词。", {
+        "url": _P("完整网址 https://..."),
+        "query": _P("搜索词(没有网址时用)"),
+    }),
+    _T("feed_items", "查看最近展示过的信息流条目(标题/作者/主题), 用于回答“这些内容怎么样/为什么推给我”。", {
+        "limit": _P("条数(默认10, 最多30)", typ="integer"),
+    }),
+    _T("get_stats", "查看今日统计与筛选漏斗。", {}),
+    _T("daily_report", "获取今天的观看/喜欢/不喜欢/漏斗/成本原始汇总, 由你自己写成简报。", {}),
+    _T("act_on_current", "对【用户最近点开的条目】操作: 喜欢/不喜欢/稍后看/屏蔽作者/按关键词屏蔽。", {
+        "action": _P("操作", ("like", "dislike", "save", "block_author", "block_keyword")),
+        "keyword": _P("block_keyword 时的关键词(不给则用条目的主题/标签)"),
+    }, ["action"]),
+    _T("set_ai", "开关 AI 总开关或切换模型(不能改 API Key)。", {
+        "enabled": _P("AI 总开关", typ="boolean"),
+        "model": _P("模型名, 例如 deepseek-flash"),
+    }),
+    _T("floatball", "开关桌面 AI 悬浮球。", {
+        "enabled": _P("是否开启", typ="boolean"),
+    }, ["enabled"]),
+    _T("new_conversation", "开一个新对话(聊天另起一页)。用户说“新对话/换个话题/重新开”时调用。", {}),
+]
+
+# ---- 网页助手专用工具(只在「内置浏览器右侧 AI 面板」里挂出来) ----
+# 为什么单独一组: 主界面聊天没有"当前网页"这个概念, 挂出来模型就会瞎点。
+# 执行端在窗口壳(shell_ai.py 注入页面 JS), 这里只描述能力与参数。
+_AGENT_BROWSER_TOOLS = [
+    _T("browser_snapshot",
+       "读取当前网页: 网址/标题/正文摘要/可点元素(带序号)/输入框/视频状态/滚动位置。"
+       "操作网页前先调它; 点完或输入完再调一次确认结果。", {
+           "limit": _P("最多返回多少个可点元素(默认 60, 最多 160)", typ="integer"),
+           "text": _P("正文摘要字数(默认 1600, 最多 4000)", typ="integer"),
+       }),
+    _T("browser_open", "在内置浏览器打开网址或搜索词(不给网址时用搜索词搜)。", {
+        "url": _P("完整网址 https://..."),
+        "query": _P("搜索词"),
+        "new_tab": _P("true=新标签打开(默认, 不打断当前页); false=当前标签内跳转", typ="boolean"),
+    }),
+    _T("browser_click", "点击当前网页上第 index 个可点元素(序号来自最近一次 browser_snapshot)。", {
+        "index": _P("元素序号", typ="integer"),
+    }, ["index"]),
+    _T("browser_type", "在第 index 个输入框里填写文字, submit=true 时回车提交。", {
+        "index": _P("元素序号", typ="integer"),
+        "text": _P("要填入的文字"),
+        "submit": _P("是否回车提交", typ="boolean"),
+    }, ["index", "text"]),
+    _T("browser_scroll", "滚动页面: dy 相对滚动(负数向上), to 绝对位置, bottom=true 滚到底。", {
+        "dy": _P("相对滚动像素(正=向下)", typ="integer"),
+        "to": _P("滚到指定像素位置", typ="integer"),
+        "bottom": _P("true=滚到底部", typ="boolean"),
+    }),
+    _T("browser_media", "操作页面上的视频: play/pause/mute/unmute/seek/fullscreen。", {
+        "action": _P("动作", ("play", "pause", "mute", "unmute", "seek", "fullscreen")),
+        "seconds": _P("seek 时的目标秒数", typ="integer"),
+    }, ["action"]),
+    _T("browser_history", "网页前进/后退/刷新(back/forward/reload)。", {
+        "action": _P("动作", ("back", "forward", "reload")),
+    }, ["action"]),
+    _T("browser_find", "在当前网页里查找文字并滚动到第一个命中处(像 Ctrl+F)。", {
+        "text": _P("要查找的文字"),
+    }, ["text"]),
+    _T("browser_eval", "在网页里执行一段 JavaScript(逃生口: 上面工具都不够用时才用)。"
+                       "必须 return 一个能被 JSON 序列化的值。", {
+                           "code": _P("JS 代码, 例如 return document.title"),
+                       }, ["code"]),
+]
+
+
+def _browser_bridge():
+    return _BROWSER_BRIDGE.get("fn")
+
+
+def _fmt_page_snapshot(res):
+    """把壳回来的快照排成模型好读的纯文本(比 JSON 省一半 token)。"""
+    lines = ["网址: %s" % (res.get("url") or ""),
+             "标题: %s" % (res.get("title") or "(无)")]
+    sc = res.get("scroll") or {}
+    if sc:
+        lines.append("滚动: %s / %s (视口高 %s)" % (
+            sc.get("y", 0), sc.get("h", 0), sc.get("vh", 0)))
+    mv = res.get("media")
+    if isinstance(mv, dict):
+        lines.append("视频: %s %s/%s 秒%s" % (
+            "播放中" if not mv.get("paused") else "已暂停",
+            mv.get("t", 0), mv.get("dur", 0),
+            " (已静音)" if mv.get("muted") else ""))
+    txt = str(res.get("text") or "").strip()
+    if txt:
+        lines.append("正文摘要:")
+        lines.append(txt)
+    els = res.get("els") or []
+    if els:
+        lines.append("可点元素/输入框(序号 → 类型「文字」):")
+        for e in els:
+            if not isinstance(e, dict):
+                continue
+            tag = str(e.get("tag") or "")
+            label = str(e.get("t") or "").strip() or "(无文字)"
+            extra = ""
+            if tag in ("input", "textarea") and e.get("v"):
+                extra = " 值=%r" % str(e.get("v"))[:40]
+            lines.append("[%s] %s 「%s」%s" % (e.get("i"), tag, label[:40], extra))
+    else:
+        lines.append("可点元素: (无 —— 页面可能还在加载, 稍后再 snapshot)")
+    return "\n".join(lines)
+
+
+def _agent_browser_tool(name, args, ctx):
+    """网页工具的统一入口: 转成 action 交给壳执行, 把结果排版后回给模型。"""
+    fn = _browser_bridge()
+    if fn is None:
+        return {"ok": False, "msg": "当前没有可用的内置浏览器(桌面壳未启动或窗口已关闭), 无法操作网页。"}
+    if not ctx.get("browser_mode"):
+        return {"ok": False, "msg": "现在不在网页助手模式, 没有可操作的网页。"}
+    act = name[len("browser_"):]
+    try:
+        res = fn(act, args or {})
+    except Exception as e:
+        return {"ok": False, "msg": "网页操作失败: %s" % str(e)[:160]}
+    if not isinstance(res, dict):
+        return {"ok": False, "msg": "网页操作没有返回结果。"}
+    if res.get("error"):
+        return {"ok": False, "msg": "网页操作失败: %s" % str(res.get("error"))[:160]}
+    if act == "snapshot":
+        return {"ok": True, "msg": _fmt_page_snapshot(res),
+                "label": "读取网页: " + str(res.get("title") or res.get("url") or "")[:40]}
+    msg = str(res.get("msg") or "").strip()
+    if act == "open":
+        msg = msg or ("已打开 %s" % (res.get("url") or ""))
+    if act == "click":
+        msg = msg or "已点击"
+    if act == "type":
+        msg = msg or "已填写"
+    if act == "scroll":
+        sc = res.get("scroll") or {}
+        msg = msg or ("已滚动到 %s / %s" % (sc.get("y", 0), sc.get("h", 0)))
+    if act == "media":
+        msg = msg or "已操作播放器"
+    if act == "history":
+        msg = msg or "已执行"
+    if act == "find":
+        msg = msg or ("找到 %s 处" % res.get("hits", 0))
+    if act == "eval":
+        val = res.get("value")
+        msg = msg or ("执行结果: %s" % json.dumps(val, ensure_ascii=False)[:1200])
+    return {"ok": bool(res.get("ok", True)), "msg": msg or "已执行",
+            "label": str(res.get("label") or "")[:60]}
+
+
+def _agent_set_trigger(ctx, t):
+    if _AGENT_TRIGGER_RANK.get(t, 0) >= _AGENT_TRIGGER_RANK.get(ctx.get("trigger"), 0):
+        ctx["trigger"] = t
+
+
+def _agent_coerce(k, v):
+    spec = _AGENT_SETTING_SPECS.get(k)
+    if not spec:
+        return None
+    kind = spec[0]
+    if kind == "int":
+        try:
+            n = int(float(v))
+        except Exception:
+            return None
+        return str(max(spec[1], min(spec[2], n)))
+    if kind == "bool":
+        if isinstance(v, bool):
+            return "1" if v else "0"
+        s = str(v).strip().lower()
+        if s in ("1", "true", "on", "yes", "开", "是", "启用"):
+            return "1"
+        if s in ("0", "false", "off", "no", "关", "否", "关闭"):
+            return "0"
+        return None
+    if kind == "enum":
+        s = str(v).strip()
+        return s if s in spec[1] else None
+    if kind == "str":
+        s = str(v).strip()
+        if k == "ft_bthr" and s and not re.match(r"^\d{1,3}(\.\d+)?$", s):
+            return None
+        return s[:spec[1]]
+    return None
+
+
+def _agent_disp(k, v):
+    spec = _AGENT_SETTING_SPECS.get(k) or ()
+    if spec and spec[0] == "bool":
+        return "开" if str(v) == "1" else "关"
+    if spec and spec[0] == "enum" and k == "ft_point":
+        return {"strict": "严格", "standard": "标准", "loose": "宽松"}.get(str(v), str(v))
+    if spec and spec[0] == "enum" and k == "ft_engine":
+        return {"auto": "自动", "fasttext": "fastText"}.get(str(v), str(v))
+    if k == "mode":
+        return str(v)
+    if spec and spec[0] == "str":
+        return str(v)[:40] if str(v) else "(空)"
+    return str(v)
+
+
+def _agent_apply_settings(args, allowed, ctx):
+    changed, bad, same = [], [], []
+    for k, v in (args or {}).items():
+        if k not in allowed or k not in _AGENT_SETTING_SPECS:
+            bad.append(str(k))
+            continue
+        nv = _agent_coerce(k, v)
+        if nv is None:
+            bad.append("%s=%s" % (k, v))
+            continue
+        if str(sget(k)) == nv:
+            same.append(k)
+            continue
+        sset(k, nv)
+        changed.append("%s → %s" % (_AGENT_SETTING_SPECS[k][-1], _agent_disp(k, nv)))
+    if changed:
+        if "mode" in args:
+            with _db_lock:          # 与设置接口一致: 档位变了先清展示池, 不然旧内容回流
+                db().execute("DELETE FROM shown")
+                db().commit()
+        if "m_cold_start_n" in args:
+            try:
+                persist_cold_cache(force=True)
+            except Exception:
+                pass
+        if "ft_on" in args or "ft_engine" in args:
+            try:
+                ft_warmup()
+                bert_warmup()
+            except Exception:
+                pass
+        clear_score_cache()
+        force_rebuild()
+        _agent_set_trigger(ctx, "settings")
+    return changed, bad, same
+
+
+def _agent_words(args):
+    ws = args.get("words")
+    if isinstance(ws, str):
+        ws = re.split(r"[，,、;；\n]", ws)
+    if not isinstance(ws, list):
+        ws = []
+    return [str(w).strip() for w in ws if str(w).strip()]
+
+
+def _agent_current_item(ctx):
+    key = ((chat_ctx_get(ctx.get("cid")) or {}).get("key") or "").strip()
+    if key:
+        it = item_by_key(key)
+        if isinstance(it, dict):
+            return it
+    it = last_feed_item()
+    if isinstance(it, dict) and it.get("key"):
+        return item_by_key(it.get("key")) or it
+    return None
+
+
+def _agent_tool(name, args, ctx):
+    """执行一个工具。返回给模型看的 dict: ok / msg / label(给用户看的动作记录)。"""
+    args = args if isinstance(args, dict) else {}
+    try:
+        if name.startswith("browser_"):
+            return _agent_browser_tool(name, args, ctx)
+        if name == "get_state":
+            return {"ok": True, "msg": agent_state_text(ctx.get("ui_state"), full=True)}
+
+        if name == "set_interface":
+            acts, labels = [], []
+            for k in ("theme", "layout", "cover", "font", "reason", "srcacc"):
+                if k not in args:
+                    continue
+                v = str(args.get(k) or "").strip()
+                if v not in _AGENT_UI_LABELS[k]:
+                    continue
+                acts.append({"k": k, "v": v})
+                labels.append(_AGENT_UI_LABELS[k][v])
+            acc = str(args.get("accent") or "").strip().lower()
+            if re.match(r"^#[0-9a-f]{6}$", acc):
+                acts.append({"k": "accent", "v": acc})
+                labels.append("强调色 → " + acc)
+            if not acts:
+                return {"ok": False, "msg": "没有可识别的界面改动。可用: theme/layout/cover/font/reason/srcacc/accent。"}
+            ctx["ui_actions"].extend(acts)
+            _agent_set_trigger(ctx, "settings")
+            return {"ok": True, "label": "、".join(labels),
+                    "msg": "界面动作已交给客户端, 这条回复结束后立即生效。"}
+
+        if name == "set_info_filters":
+            changed, bad, same = _agent_apply_settings(args, _AGENT_INFO_KEYS, ctx)
+            if not changed:
+                return {"ok": not bad, "msg": ("没有改动。" + ("无效参数: " + "、".join(bad) if bad else
+                                                "这些值本来就是这样。"))}
+            msg = "已更新: " + "；".join(changed) + "。信息流已按新规则重建。"
+            if bad:
+                msg += " 未识别的参数: " + "、".join(bad[:5])
+            return {"ok": True, "label": "信息流筛选: " + "、".join(changed[:4]) +
+                           ("…" if len(changed) > 4 else ""), "msg": msg, "changed": changed}
+
+        if name == "set_moderation":
+            changed, bad, same = _agent_apply_settings(args, _AGENT_MOD_KEYS, ctx)
+            if not changed:
+                return {"ok": not bad, "msg": ("没有改动。" + ("无效参数: " + "、".join(bad) if bad else
+                                                "这些值本来就是这样。"))}
+            msg = "已更新: " + "；".join(changed) + "。"
+            if bad:
+                msg += " 未识别的参数: " + "、".join(bad[:5])
+            return {"ok": True, "label": "评论/弹幕筛选: " + "、".join(changed[:4]) +
+                           ("…" if len(changed) > 4 else ""), "msg": msg, "changed": changed}
+
+        if name == "set_partitions":
+            groups = [str(g).strip() for g in (args.get("groups") or [])
+                      if str(g).strip() in GROUP_NAMES]
+            mode = str(args.get("mode") or "only")
+            if not groups:
+                return {"ok": False, "msg": "没有有效的分区名。可用分区: " + "、".join(GROUP_NAMES)}
+            if mode not in ("only", "add", "remove"):
+                return {"ok": False, "msg": "mode 只能是 only/add/remove。"}
+            ids = {GROUP_NAMES[g] for g in groups}
+            full = {g[0] for g in SOURCE_GROUPS}
+            cur = enabled_source_ids()
+            if mode == "remove":
+                base = cur if (cur and cur != full) else full
+                ids = base - ids
+            elif mode == "add":
+                base = cur if (cur and cur != full) else set()
+                ids = base | ids
+            if not ids:
+                return {"ok": False, "msg": "这样切换后一个分区都不剩, 已取消。"}
+            names = apply_partition_ids(ids)
+            _agent_set_trigger(ctx, "settings")
+            return {"ok": True, "label": "分区 → %s" % names[:80],
+                    "msg": "已切换分区: %s (%d 个)" % (names, len(ids))}
+
+        if name in ("manage_dislike", "manage_prefs"):
+            is_bad = name == "manage_dislike"
+            key = "dislike_note" if is_bad else "prefs_note"
+            noun = "厌恶备注(屏蔽)" if is_bad else "偏好备注(多推)"
+            action = str(args.get("action") or "add")
+            cur = sget(key)
+            if action == "list":
+                return {"ok": True, "msg": "%s: %s" % (noun, cur or "(空)")}
+            if action == "replace":
+                raw = str(args.get("text") or "")
+                parts = []
+                for p in re.split(r"[，,、;；\n]", raw):
+                    c = _clean_legacy(p)
+                    if c and c not in parts:
+                        parts.append(c)
+                new = "，".join(parts)
+                removed = []
+            elif action == "remove":
+                words = [_clean_kw(w) for w in _agent_words(args)]
+                words = [w for w in words if w]
+                if not words:
+                    return {"ok": False, "msg": "没有给出要移除的词。"}
+                new, removed = _note_remove(cur, words)
+                parts = None
+            elif action == "add":
+                words = [_clean_kw(w) for w in _agent_words(args)]
+                words = [w for w in words if w]
+                if not words:
+                    return {"ok": False, "msg": "没有给出要加入的词。请用 words 数组传 5~15 个具体关键词。"}
+                new, added = _note_add(cur, words)
+                parts = None
+            else:
+                return {"ok": False, "msg": "action 只能是 add/remove/replace/list。"}
+            if action in ("replace", "remove", "add"):
+                if new != cur:
+                    sset(key, new)
+                    clear_score_cache()
+                    force_rebuild()
+                    _agent_set_trigger(ctx, "settings")
+            if action == "replace":
+                return {"ok": True, "label": "重设%s(%d个)" % (noun, len(parts)),
+                        "msg": "已重设%s: %s" % (noun, new or "(空)"), "note": new[:800]}
+            if action == "remove":
+                return {"ok": True, "label": ("移除%s %d个" % (noun, len(removed))) if removed else "",
+                        "msg": ("已从%s移除: %s" % (noun, "、".join(removed))) if removed
+                               else "备注里没有这些词, 无需改动。"}
+            return {"ok": True, "label": ("%s +%d" % ("屏蔽词" if is_bad else "偏好词", len(added)))
+                            if added else "",
+                    "msg": ("已加入%s: %s" % (noun, "、".join(added))) if added
+                           else "这些词已经在备注里了。",
+                    "note": new[:800]}
+
+        if name == "manage_blacklist":
+            action = str(args.get("action") or "list")
+            if action == "list":
+                a = [r[0] for r in db().execute(
+                    "SELECT value FROM blacklist WHERE kind='author' ORDER BY value LIMIT 100").fetchall()]
+                k = [r[0] for r in db().execute(
+                    "SELECT value FROM blacklist WHERE kind='keyword' ORDER BY value LIMIT 100").fetchall()]
+                return {"ok": True, "msg": "黑名单作者(%d): %s\n黑名单关键词(%d): %s" % (
+                    len(a), "、".join(a) or "(空)", len(k), "、".join(k) or "(空)")}
+            kind = {"add_author": "author", "remove_author": "author",
+                    "add_keyword": "keyword", "remove_keyword": "keyword"}.get(action)
+            if not kind:
+                return {"ok": False, "msg": "action 只能是 list/add_author/add_keyword/remove_author/remove_keyword。"}
+            vals = [str(v).strip()[:40] for v in _agent_words({"words": args.get("values")}) if str(v).strip()]
+            if not vals:
+                return {"ok": False, "msg": "没有给出要处理的作者/关键词。"}
+            doing_add = action.startswith("add")
+            for v in vals:
+                if doing_add:
+                    db().execute("INSERT OR IGNORE INTO blacklist(kind,value) VALUES(?,?)", (kind, v))
+                else:
+                    db().execute("DELETE FROM blacklist WHERE kind=? AND value=?", (kind, v))
+            db().commit()
+            if doing_add:
+                sset("feedback_sig", str(int(time.time())))
+                force_rebuild()
+                _agent_set_trigger(ctx, "settings")
+            label = ("黑名单%s %s %d个" % ("作者" if kind == "author" else "关键词",
+                                         "新增" if doing_add else "移除", len(vals)))
+            return {"ok": True, "label": label,
+                    "msg": ("已加入" if doing_add else "已移出") + "黑名单: " + "、".join(vals)}
+
+        if name == "temp_block":
+            kw = _clean_kw(args.get("keyword"))
+            if not kw:
+                return {"ok": False, "msg": "关键词无效(2~16 字)。"}
+            try:
+                mins = int(args.get("minutes") or 60)
+            except Exception:
+                mins = 60
+            mins = max(1, min(1440, mins))
+            add_tmp_block(kw, mins)
+            sset("feedback_sig", str(int(time.time())))
+            _agent_set_trigger(ctx, "random")
+            until = time.strftime("%H:%M", time.localtime(time.time() + mins * 60))
+            return {"ok": True, "label": "临时屏蔽「%s」%d分钟" % (kw, mins),
+                    "msg": "已临时屏蔽「%s」%d分钟, %s 自动解封。" % (kw, mins, until)}
+
+        if name == "search_feed":
+            if str(args.get("clear") or "").lower() in ("1", "true", "yes"):
+                ctx["feed_query"] = ""
+                _agent_set_trigger(ctx, "settings")
+                return {"ok": True, "label": "退出搜索", "msg": "已让左侧退出搜索, 回到普通信息流。"}
+            q = str(args.get("query") or "").strip()[:80]
+            if not q:
+                return {"ok": False, "msg": "没有给搜索词。"}
+            ctx["feed_query"] = q
+            _agent_set_trigger(ctx, "settings")
+            return {"ok": True, "label": "搜索「%s」" % q,
+                    "msg": "已把左侧信息流切到搜索「%s」, 这条回复结束后立刻显示结果。" % q}
+
+        if name == "refresh_feed":
+            kind = str(args.get("kind") or "quick")
+            if kind == "random":
+                _agent_set_trigger(ctx, "random")
+                return {"ok": True, "label": "随机换一批", "msg": "已让信息流随机换一批。"}
+            if kind == "explore":
+                msg = _open_explore()
+                _agent_set_trigger(ctx, "random")
+                return {"ok": True, "label": "探索模式30分钟", "msg": msg}
+            if kind == "full":
+                clear_score_cache()
+                force_rebuild()
+                ctx["feed_reload"] = True
+                _agent_set_trigger(ctx, "settings")
+                return {"ok": True, "label": "全量重建信息流", "msg": "已开始按当前规则重新筛选全部内容(需要一点时间)。"}
+            clear_score_cache()
+            force_rebuild()
+            ctx["feed_reload"] = True
+            _agent_set_trigger(ctx, "settings")
+            return {"ok": True, "label": "刷新信息流", "msg": "已开始补一批新内容。"}
+
+        if name == "browse" and ctx.get("browser_mode"):
+            # 网页助手模式: 「打开/搜索」必须走壳, 让面板继续操作同一个标签页,
+            # 而不是回一个 ctx["browser"] 让主界面去开标签(面板根本收不到)。
+            fn = _browser_bridge()
+            if fn is None:
+                return {"ok": False, "msg": "内置浏览器不可用, 打不开网页。"}
+            try:
+                res = fn("open", args or {})
+            except Exception as e:
+                return {"ok": False, "msg": "打开失败: %s" % str(e)[:160]}
+            if res.get("error"):
+                return {"ok": False, "msg": "打开失败: %s" % str(res.get("error"))[:160]}
+            return {"ok": True, "msg": res.get("msg") or ("已打开 %s" % (res.get("url") or "")),
+                    "label": "打开网页: " + str(res.get("title") or res.get("url") or "")[:40]}
+
+        if name == "browse":
+            url = str(args.get("url") or "").strip()
+            q = str(args.get("query") or "").strip()[:80]
+            if url and not re.match(r"^https?://", url, re.I):
+                url = ""
+            if not url and q:
+                url = browser_search_url(q)
+            if not url:
+                url, _nm = browser_home()
+            if not url:
+                return {"ok": False, "msg": "没有可打开的网址。"}
+            title = ("搜索：" + q[:20]) if q else "浏览器"
+            ctx["browser"] = {"url": url, "title": title}
+            _agent_set_trigger(ctx, "browser")
+            return {"ok": True, "label": ("浏览器搜索「%s」" % q[:20]) if q else "打开内置浏览器",
+                    "msg": "已" + ("在内置浏览器搜索「%s」" % q if q else "用内置浏览器打开 " + url[:120])
+                           + "。你看不到页面正文, 不要编造网页内容。"}
+
+        if name == "feed_items":
+            try:
+                n = int(args.get("limit") or 10)
+            except Exception:
+                n = 10
+            n = max(1, min(30, n))
+            rows = db().execute("SELECT key FROM shown ORDER BY ts DESC LIMIT ?", (n,)).fetchall()
+            items = items_by_keys([r[0] for r in rows])
+            out = []
+            for (k,) in rows:
+                it = items.get(k) or {}
+                if not it:
+                    continue
+                out.append({"title": (it.get("title") or "")[:60],
+                            "author": (it.get("author") or "")[:20],
+                            "platform": it.get("platform", ""),
+                            "topic": (it.get("topic") or it.get("tname") or "")[:20],
+                            "tag": (it.get("tag") or "")[:60]})
+            if not out:
+                return {"ok": True, "msg": "最近还没有展示过内容。", "items": []}
+            lines = ["%d. %s｜%s｜%s" % (i + 1, x["title"], x["author"] or "?", x["platform"])
+                     for i, x in enumerate(out)]
+            return {"ok": True, "msg": "最近展示的 %d 条:\n%s" % (len(out), "\n".join(lines)),
+                    "items": out}
+
+        if name == "get_stats":
+            st = day_stats()
+            fn = funnel_stats()
+            top = sorted(((k, v) for k, v in fn.items()
+                          if k not in ("fetched", "kept", "build_full", "build_quick")),
+                         key=lambda kv: -kv[1])[:8]
+            shown_n = db().execute("SELECT COUNT(*) FROM shown").fetchone()[0]
+            items_n = db().execute("SELECT COUNT(*) FROM items").fetchone()[0]
+            msg = ("今日: 收录%s条, 剔除%s条; AI调用%s次, 成本约¥%s。\n"
+                   "漏斗: %s\n拦截最多: %s\n本地库: 展示池%s条, 内容库%s条。" % (
+                       st["received"], st["filtered"], st["ai_calls"],
+                       st["cost"] if st["cost"] >= 0.01 else "%.4f" % st["cost"],
+                       "、".join("%s=%s" % (_FUNNEL_LABELS.get(k, k), v) for k, v in fn.items()) or "(空)",
+                       "、".join("%s×%s" % (_FUNNEL_LABELS.get(k, k), v) for k, v in top) or "(空)",
+                       shown_n, items_n))
+            return {"ok": True, "msg": msg}
+
+        if name == "daily_report":
+            data, n_seen, n_like, n_dis = daily_report_data()
+            return {"ok": True, "msg": data, "seen": n_seen, "likes": n_like, "dislikes": n_dis}
+
+        if name == "act_on_current":
+            it = _agent_current_item(ctx)
+            if not it or not it.get("key"):
+                return {"ok": False, "msg": "还没有记住你最近点开的条目, 先在左侧点开一条再来。"}
+            key, title, author = it.get("key"), it.get("title") or "(那条)", it.get("author") or ""
+            action = str(args.get("action") or "")
+            if action in ("like", "dislike"):
+                exists = db().execute("SELECT 1 FROM feedback WHERE key=? AND action=?",
+                                      (key, action)).fetchone()
+                if not exists:
+                    db().execute("INSERT INTO feedback(key,author,action,ts) VALUES(?,?,?,?)",
+                                 (key, author, action, int(time.time())))
+                    db().commit()
+                sset("feedback_sig", str(int(time.time())))
+                clear_score_cache()
+                force_rebuild()
+                _agent_set_trigger(ctx, "settings")
+                return {"ok": True,
+                        "label": ("喜欢" if action == "like" else "不喜欢") + "「%s」" % title[:20],
+                        "msg": ("已标记喜欢《%s》, 之后会多推同类。" if action == "like"
+                                else "已标记不喜欢《%s》, 之后同类内容少推。") % title[:30]}
+            if action == "save":
+                db().execute("INSERT OR REPLACE INTO saved(key,kind,ts) VALUES(?,'later',?)",
+                             (key, int(time.time())))
+                db().commit()
+                return {"ok": True, "label": "稍后看「%s」" % title[:20],
+                        "msg": "已把《%s》加入稍后看。" % title[:30]}
+            if action == "block_author":
+                if not author:
+                    return {"ok": False, "msg": "这条没有作者信息, 没法屏蔽作者。"}
+                db().execute("INSERT OR IGNORE INTO blacklist(kind,value) VALUES('author',?)", (author,))
+                db().commit()
+                sset("feedback_sig", str(int(time.time())))
+                force_rebuild()
+                _agent_set_trigger(ctx, "settings")
+                return {"ok": True, "label": "屏蔽作者「%s」" % author[:16],
+                        "msg": "已屏蔽作者「%s」, 他的内容不再出现。" % author}
+            if action == "block_keyword":
+                kw = _clean_kw(args.get("keyword")) or _clean_kw(
+                    (it.get("topic") or (it.get("tag") or "").split(",")[0] or it.get("tname") or ""))
+                if not kw:
+                    return {"ok": False, "msg": "没找到适合屏蔽的关键词, 请用 keyword 指定。"}
+                db().execute("INSERT OR IGNORE INTO blacklist(kind,value) VALUES('keyword',?)", (kw,))
+                db().commit()
+                sset("feedback_sig", str(int(time.time())))
+                force_rebuild()
+                _agent_set_trigger(ctx, "settings")
+                return {"ok": True, "label": "屏蔽关键词「%s」" % kw,
+                        "msg": "已按关键词「%s」屏蔽相关内容。" % kw}
+            return {"ok": False, "msg": "action 只能是 like/dislike/save/block_author/block_keyword。"}
+
+        if name == "set_ai":
+            labels = []
+            if "enabled" in args:
+                on = _agent_coerce("ai_full_scan", args.get("enabled"))  # 借 bool 解析
+                if on is None:
+                    return {"ok": False, "msg": "enabled 需要 true/false。"}
+                sset("ai_enabled", on)
+                labels.append("AI → " + ("开启" if on == "1" else "关闭"))
+            if args.get("model"):
+                m = str(args.get("model")).strip()[:60]
+                if len(m) < 2:
+                    return {"ok": False, "msg": "模型名太短。"}
+                sset("ai_model", m)
+                labels.append("模型 → " + m)
+            if not labels:
+                return {"ok": False, "msg": "没有要改的 AI 设置。"}
+            force_rebuild()
+            _agent_set_trigger(ctx, "settings")
+            return {"ok": True, "label": "、".join(labels), "msg": "已更新: " + "；".join(labels)}
+
+        if name == "floatball":
+            on = _agent_coerce("ai_full_scan", args.get("enabled"))
+            if on is None:
+                return {"ok": False, "msg": "enabled 需要 true/false。"}
+            sset("float_ball", on)
+            if on == "1":
+                float_ball_spawn(_server_port())
+            else:
+                float_ball_stop()
+            _agent_set_trigger(ctx, "settings")
+            return {"ok": True, "label": "悬浮球 → " + ("开" if on == "1" else "关"),
+                    "msg": "已" + ("开启" if on == "1" else "关闭") + "桌面 AI 悬浮球。"}
+
+        if name == "new_conversation":
+            ctx["new_conv"] = True
+            _agent_set_trigger(ctx, "conv")
+            return {"ok": True, "label": "新开了一个对话",
+                    "msg": "已为用户开新对话, 这条回复会放进新对话里。"}
+
+        return {"ok": False, "msg": "没有这个工具: " + name}
+    except Exception as e:
+        return {"ok": False, "msg": "工具执行失败(%s): %s" % (name, str(e)[:160])}
+
+
+def _browser_page_brief():
+    """把"用户现在看的是哪个网页"塞进提示词, 否则模型只能靠用户描述。"""
+    hook = panel_hook()
+    if hook is None:
+        return "【当前网页】桌面壳未就绪。"
+    try:
+        st = hook.state() or {}
+    except Exception:
+        return ""
+    u = str(st.get("url") or "").strip()
+    t = str(st.get("title") or "").strip()
+    if not u:
+        return "【当前网页】还没有打开任何网页(当前标签是信息流)。"
+    return "【当前网页】%s ｜ 标题: %s" % (u, t or "(无)")
+
+
+def agent_turn(cid, msg, effort="mid", emit=None, ui_state=None, browser=False):
+    """一轮用户消息的智能体循环: 模型决定调工具 → 执行 → 把结果喂回 → 直到给出最终回答。
+
+    返回 (reply, ctx, usage, think_secs)。ctx 里带 ui_actions / browser / feed_query /
+    feed_reload / trigger / actions, 交给前端落地界面与信息流动作。
+    """
+    rows = db().execute("SELECT role,content FROM chat WHERE cid=? ORDER BY id DESC LIMIT 17",
+                        (cid,)).fetchall()
+    history = [{"role": r, "content": c} for r, c in reversed(rows) if (c or "").strip()]
+    if not history or history[-1].get("role") != "user" or history[-1].get("content") != msg:
+        history.append({"role": "user", "content": msg})
+    history = history[-17:]
+
+    extra = chat_item_context(cid)
+    if REF_NOUN.search(msg or ""):
+        extra = "\n".join(x for x in (extra, chat_last_context(msg)) if x)
+    lf = last_feed_item()
+    if isinstance(lf, dict) and lf.get("title"):
+        extra = "\n".join(x for x in (extra, "【用户最近点开的条目】%s《%s》作者:%s 简介:%s" % (
+            lf.get("platform", ""), (lf.get("title") or "")[:50], lf.get("author", ""),
+            (lf.get("desc") or "")[:200])) if x)
+
+    page_ctx = ""
+    if browser:
+        page_ctx = _browser_page_brief()
+    sys_text = agent_system_prompt(agent_state_text(ui_state, full=False), extra,
+                                   browser=browser, page_ctx=page_ctx)
+    messages = [{"role": "system", "content": sys_text}] + history
+    ctx = {"cid": cid, "ui_state": ui_state if isinstance(ui_state, dict) else {},
+           "ui_actions": [], "browser": None, "feed_query": None, "feed_reload": False,
+           "trigger": None, "actions": [], "browser_mode": bool(browser)}
+    t0 = time.time()
+    reply_parts = []
+    reason_all = []
+    usage = {}
+    first_at = [None]
+    pending_calls = False
+    tool_total = 0
+
+    def _run_round(tools):
+        nonlocal pending_calls
+        calls = []
+        reasoning = []
+        round_parts = []
+
+        def on_reason(t):
+            reasoning.append(t)
+            reason_all.append(t)
+            if emit:
+                emit("reason", {"t": t})
+
+        def on_usage(u):
+            usage.update(u or {})
+
+        def on_calls(c, _r):
+            calls.extend(c)
+
+        for d in llm_stream(messages, max_tokens=16384, on_reasoning=on_reason,
+                            effort=effort, on_usage=on_usage, tools=tools,
+                            on_tool_calls=on_calls):
+            if first_at[0] is None:
+                first_at[0] = time.time()
+            round_parts.append(d)
+            reply_parts.append(d)
+            if emit:
+                emit("delta", {"t": d})
+        if not calls:
+            pending_calls = False
+            return
+        pending_calls = True
+        assistant = {"role": "assistant", "content": "".join(round_parts),
+                     "tool_calls": calls}
+        if reasoning:
+            assistant["reasoning_content"] = "".join(reasoning)
+        messages.append(assistant)
+        for tc in calls:
+            nonlocal tool_total
+            if tool_total >= AGENT_MAX_CALLS:
+                break
+            tool_total += 1
+            fn = tc.get("function") or {}
+            name = fn.get("name") or ""
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except Exception:
+                args = {}
+            if not isinstance(args, dict):
+                args = {}
+            if emit:
+                emit("phase", {"label": _AGENT_PHASE.get(name, "正在执行操作…")})
+            res = _agent_tool(name, args, ctx)
+            if emit and res.get("label"):
+                emit("act", {"label": res["label"], "ok": bool(res.get("ok", True)),
+                             "tool": name})
+            if res.get("label"):
+                ctx["actions"].append({"label": res["label"], "ok": bool(res.get("ok", True)),
+                                       "tool": name})
+            _lim = 9000 if name.startswith("browser_") else 4000
+            messages.append({"role": "tool",
+                             "tool_call_id": tc.get("id") or "",
+                             "content": json.dumps(res, ensure_ascii=False)[:_lim]})
+
+    tools_all = _AGENT_TOOLS + (_AGENT_BROWSER_TOOLS if browser else [])
+    try:
+        for _rnd in range(AGENT_MAX_ROUNDS):
+            _run_round(tools_all)
+            if not pending_calls or tool_total >= AGENT_MAX_CALLS:
+                break
+        if pending_calls:
+            # 轮次用尽: 摘掉工具, 让模型基于已有结果直接收尾(否则最后一轮只有工具调用, 用户看不到话)
+            messages.append({"role": "user", "content":
+                             "（系统提示）本轮操作次数已达上限。请基于上面的工具结果，"
+                             "用自然中文直接给用户最终答复，不要再调用工具。"})
+            _run_round(None)
+    except Exception as e:
+        if reply_parts:
+            reply_parts.append("\n\n（后续处理中断：%s）" % str(e)[:100])
+        else:
+            raise
+    text = "".join(reply_parts).strip()
+    if not text and ctx["actions"]:
+        ok_labels = [a["label"] for a in ctx["actions"] if a.get("ok") and a.get("label")]
+        bad_labels = [a["label"] for a in ctx["actions"] if not a.get("ok")]
+        text = "已经处理好了：" + "；".join(ok_labels) + "。" if ok_labels else ""
+        if bad_labels:
+            text += ("\n没能完成：" + "；".join(bad_labels)) if text else ("没能完成：" + "；".join(bad_labels))
+    if not text:
+        # 思考过长被截断(只有 reasoning 没有 content)时, 用思考尾段兜底
+        tail = "".join(reason_all)[-160:].strip()
+        if tail:
+            text = "模型思考过长了：%s（以上为模型思考过程，供参考）" % tail
+    think_secs = round((first_at[0] or time.time()) - t0, 1)
+    return text, ctx, usage, think_secs
 
 
 # 每日简报: 聚合今日数据(观看/喜欢/不喜欢/漏斗/成本/画像) → LLM 评价与偏好建议
@@ -8759,8 +10132,10 @@ def extract_intent(msg):
                 {"role": "system", "content":
                     "用户在洞鉴虚明(内容筛选器)的聊天框说话, 判断他想让系统做什么, 只输出JSON(不要多余文字):\n"
                     "1) 想刷/推/看/找某类内容 → {\"action\":\"search\",\"keywords\":[\"1-2个搜索词\"]}\n"
-                    "2) 想把某些词/内容加进厌恶备注(不想看/不喜欢/屏蔽/别再推) → "
-                    "{\"action\":\"add_dislike\",\"keywords\":[\"词1\",\"词2\",...]}\n"
+                    "2) 想把某些词/内容加进厌恶备注(不想看/不喜欢/屏蔽/别再推), "
+                    "或让你帮忙想一批屏蔽词/提示词 → "
+                    "{\"action\":\"add_dislike\",\"keywords\":[\"词1\",\"词2\",...],"
+                    "\"say\":\"自然的中文回应: 逐行列出这些词, 说明以后会避开(不超过120字)\"}\n"
                     "   关键词要具体(如:性别对立、两性对立、彩礼纠纷), 可补充相关词, 2-15个, 每个2-16字\n"
                     "3) 想多看某类内容/喜欢某类(多推/以后常推/写进偏好) → "
                     "{\"action\":\"add_pref\",\"keywords\":[\"词1\",\"词2\",...]}, 关键词要求同上\n"
@@ -8784,7 +10159,7 @@ def extract_intent(msg):
                     "打开某网址) → {\"action\":\"browse\",\"query\":\"搜索词\"} 或 "
                     "{\"action\":\"browse\",\"url\":\"https://...\"}; 普通刷视频的「搜/刷」不算\n"
                     "11) 其他闲聊/提问 → {\"action\":\"reply\",\"keywords\":[]}"},
-                {"role": "user", "content": msg[:300]}], max_tokens=1500)
+                {"role": "user", "content": msg[:300]}], max_tokens=2500, think=False)
             d = json.loads(content)
             if isinstance(d, dict):
                 act = d.get("action")
@@ -8794,10 +10169,11 @@ def extract_intent(msg):
                         return {"action": "search", "keywords": kws[:2]}
                     return {"action": "reply", "keywords": []}
                 if act == "add_dislike":
-                    kws = [k.strip() for k in d.get("keywords", [])
-                           if k.strip() and 2 <= len(k.strip()) <= 16]
+                    kws = [_clean_kw(k) for k in d.get("keywords", [])]
+                    kws = [k for k in kws if k]
                     if kws:
-                        return {"action": "add_dislike", "keywords": kws[:15]}
+                        return {"action": "add_dislike", "keywords": kws[:15],
+                                "say": str(d.get("say") or "").strip()[:800]}
                     return {"action": "reply", "keywords": []}
                 if act == "add_pref":
                     kws = [k.strip() for k in d.get("keywords", [])
@@ -13779,6 +15155,13 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_file("qrcode.js", "application/javascript")
         if path == "/style.css":
             return self.send_file("style.css", "text/css")
+        # 内置浏览器右侧 AI 面板(独立小页面, 与主界面同源: 直接走 /api/chat 的 SSE)
+        if path in ("/panel", "/panel.html"):
+            return self.send_file("panel.html", "text/html")
+        if path == "/panel.js":
+            return self.send_file("panel.js", "application/javascript")
+        if path == "/panel.css":
+            return self.send_file("panel.css", "text/css")
         if _ICON_PATH_RE.match(path):
             return self.send_file(path[1:], "image/svg+xml" if path.endswith(".svg") else "image/png")
         if path == "/api/update/check":
@@ -14240,6 +15623,8 @@ class Handler(BaseHTTPRequestHandler):
             if not tid.isdigit():
                 return self.send_json({"ok": False, "error": "tid无效"}, 400)
             return self.send_json(tieba_thread_content(tid))
+        if path == "/api/panel/state":
+            return self.send_json(panel_state())
         if path == "/api/ui_settings":
             # 内置浏览器标签页里的超分/画质脚本(bilibili-sr.user.js 等)轮询此端点做热更新。
             # 只回 UI 开关键(绝不含 ai_key 等敏感项); CORS 仅对 B 站源回显, 其余网站一律不给。
@@ -14979,7 +16364,9 @@ class Handler(BaseHTTPRequestHandler):
             payload = body.get("payload") if isinstance(body.get("payload"), dict) else None
             has_payload = bool(payload and payload.get("op"))
             # 命令引擎优先(纯规则, 不烧token): 指代/分区/统计/新对话等
-            cmd = None if has_payload else handle_command(msg)
+            # AI 开启时不再用本地正则截胡: 让模型读懂整句话再决定做什么
+            cmd = None if (has_payload or (ai_on() and msg not in AGENT_FAST_CMDS)) \
+                else handle_command(msg)
             cid = conv_cur(body.get("cid") or (cmd.get("cid") if cmd else None))
             conv_touch(cid, msg)   # 首句自动命名
             db().execute("INSERT INTO chat(role,content,ts,cid) VALUES('user',?,?,?)",
@@ -14991,14 +16378,17 @@ class Handler(BaseHTTPRequestHandler):
                     event, json.dumps(data, ensure_ascii=False))).encode("utf-8"))
                 self.wfile.flush()
 
-            def finish(reply, ok=True, err="", trigger=None, browser=None):
+            def finish(reply, ok=True, err="", trigger=None, browser=None, extra=None):
                 db().execute("INSERT INTO chat(role,content,ts,cid) VALUES('assistant',?,?,?)",
                              (reply, int(time.time()), cid))
                 db().commit()
-                return self.send_json({"ok": ok, "reply": reply, "intent": intent,
-                                       "chips": chips, "cid": cid, "error": err,
-                                       "trigger": trigger, "browser": browser,
-                                       "ctx": chat_ctx_get(cid)})
+                out = {"ok": ok, "reply": reply, "intent": intent,
+                       "chips": chips, "cid": cid, "error": err,
+                       "trigger": trigger, "browser": browser,
+                       "ctx": chat_ctx_get(cid)}
+                if extra:
+                    out.update(extra)
+                return self.send_json(out)
 
             def sse_reply(reply, intent, trigger=None, browser=None):
                 """一次性回复的 SSE 事件流(无增量): meta → done。"""
@@ -15035,7 +16425,107 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 return finish(reply, trigger=trig, browser=brg)
 
-            intent = extract_intent(msg)
+            agent_err = None
+            if bool(body.get("browser")) and not ai_on():
+                intent = {"action": "reply", "keywords": []}
+                reply = ("网页助手需要先配置 AI：设置 → AI 配置 里填好接口地址、Key 和模型，"
+                         "回来就能让我读页面、点按钮、翻页、控制播放。")
+                if stream:
+                    sse_reply(reply, intent)
+                    return
+                return finish(reply)
+            if ai_on():
+                # --- 智能体主链路(v0.4.41): 实时状态 + 原生 tools + 多轮执行 ---
+                # 工具协议不被接受/首轮就失败时, 一个字都还没发给前端 ⇒ 落回下面的纯聊天链路。
+                intent = {"action": "reply", "keywords": []}
+                eff = str(body.get("effort") or "mid")
+                ui_state = body.get("ui") if isinstance(body.get("ui"), dict) else {}
+                want_browser = bool(body.get("browser"))
+                sse_started = [False]
+
+                def _agent_start():
+                    if not stream or sse_started[0]:
+                        return
+                    sse_started[0] = True
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+                    self.send_header("Cache-Control", "no-cache")
+                    self.end_headers()
+                    sse_send("meta", {"intent": intent, "chips": chips, "cid": cid,
+                                      "effort": eff})
+
+                def agent_emit(ev, data):
+                    if not stream:
+                        return
+                    # 不吞写失败: 用户点「停止」/关页面后写 socket 会抛,
+                    # 让它冒到 agent_turn 里中止后续工具执行(否则会继续改设置)。
+                    _agent_start()
+                    sse_send(ev, data)
+
+                agent_err = None
+                actx = {}
+                usage = {}
+                think_secs = 0.0
+                try:
+                    reply, actx, usage, think_secs = agent_turn(
+                        cid, msg, effort=eff, emit=agent_emit, ui_state=ui_state,
+                        browser=want_browser)
+                except Exception as _ae:
+                    agent_err = _ae
+                    reply = ""
+
+                if agent_err is not None and not sse_started[0] and not (reply or "").strip():
+                    pass   # 首轮即失败: 交给下面的纯聊天兜底(同一个 API 仍可能正常回话)
+                else:
+                    actions = actx.get("actions") or []
+                    if agent_err is not None and not (reply or "").strip():
+                        labels = [a["label"] for a in actions if a.get("ok") and a.get("label")]
+                        reply = (("已经处理好了：" + "；".join(labels) + "。\n")
+                                 if labels else "") + _chat_err_text(agent_err)
+                    if not (reply or "").strip():
+                        reply = ("已经处理好了：" + "；".join(
+                            a["label"] for a in actions if a.get("ok") and a.get("label")) + "。") \
+                            if any(a.get("ok") for a in actions) else \
+                            "模型这次没有给出文字回答，再问一次或换个说法试试～"
+                    if actx.get("new_conv"):
+                        old_cid = cid
+                        cid = conv_create()
+                        # 把这条用户消息也搬进新对话(和旧命令引擎一致: 新对话里能看到自己刚说的话)
+                        with _db_lock:
+                            row = db().execute(
+                                "SELECT id,ts FROM chat WHERE cid=? AND role='user' ORDER BY id DESC LIMIT 1",
+                                (old_cid,)).fetchone()
+                            if row and row[1]:
+                                db().execute("DELETE FROM chat WHERE id=?", (row[0],))
+                                db().execute("INSERT INTO chat(role,content,ts,cid) "
+                                             "VALUES('user',?,?,?)", (msg, row[1], cid))
+                            db().commit()
+                    extra = {"actions": actions,
+                             "ui_actions": actx.get("ui_actions") or [],
+                             "feed_query": actx.get("feed_query"),
+                             "feed_reload": bool(actx.get("feed_reload")),
+                             "browser": actx.get("browser")}
+                    db().execute("INSERT INTO chat(role,content,ts,cid) VALUES('assistant',?,?,?)",
+                                 (reply, int(time.time()), cid))
+                    db().commit()
+                    if stream:
+                        _agent_start()
+                        done = {"reply": reply, "chips": chips, "ok": agent_err is None,
+                                "think_secs": think_secs, "usage": usage or {},
+                                "cid": cid, "trigger": actx.get("trigger"),
+                                "ctx": chat_ctx_get(cid)}
+                        done.update(extra)
+                        try:
+                            sse_send("done", done)
+                        except Exception:
+                            pass
+                        return
+                    return finish(reply, trigger=actx.get("trigger"),
+                                  browser=actx.get("browser"), extra=extra)
+
+            # 智能体首轮就失败(比如接口不接受工具): 直接纯聊天, 别再让正则猜意图
+            intent = ({"action": "chat", "keywords": []} if agent_err is not None
+                      else extract_intent(msg))
             # 内置浏览器: 模型判定「打开/搜索网页」→ 页面经壳在标签页里打开
             if intent["action"] == "browse":
                 q = str(intent.get("query") or "").strip()
@@ -15057,21 +16547,19 @@ class Handler(BaseHTTPRequestHandler):
                 return finish(reply, trigger="browser", browser=br)
             # 意图搜索: 固定短回复(不调用LLM, 省token又快), 前端切搜索流
             if intent["action"] == "add_dislike":
-                # 真正执行: 把关键词(含AI补的相关词)追加到厌恶备注
-                kws = intent.get("keywords") or []
+                # 真正执行: 把关键词(含AI补的相关词)追加到厌恶备注; _note_add 会顺带
+                # 归一化历史脏词(去掉「任何/关于」前缀、过长的「和/还有」堆叠)。
+                kws = [_clean_kw(k) for k in (intent.get("keywords") or [])]
+                kws = [k for k in kws if k]
                 cur = sget("dislike_note")
-                new, added = cur, []
-                for k in kws:
-                    k = k.strip()
-                    if not k:
-                        continue
-                    if k not in new:
-                        new = (new + "，" + k).strip("，") if new else k
-                        added.append(k)
-                sset("dislike_note", new)
-                clear_score_cache()   # 厌恶画像变化 → 旧语义分数过时, 强制重评
-                reply = "已把「%s」写进厌恶备注，之后会避开这些内容。" % (
-                    "、".join(added) if added else "、".join(kws))
+                new, added = _note_add(cur, kws)
+                if new != cur:
+                    sset("dislike_note", new)
+                    clear_score_cache()   # 厌恶画像变化 → 旧语义分数过时, 强制重评
+                    force_rebuild()       # 非全扫模式必须重建池子才立即生效
+                reply = (str(intent.get("say") or "").strip() if added else "") or \
+                    "已把「%s」写进厌恶备注，之后会避开这些内容。" % (
+                        "、".join(added) if added else "、".join(kws))
                 intent = {"action": "reply", "keywords": []}
                 if stream:
                     sse_reply(reply, intent, "settings")
@@ -15194,47 +16682,54 @@ class Handler(BaseHTTPRequestHandler):
                                 (cid,)).fetchall()
             history = [{"role": r, "content": c} for r, c in reversed(rows) if (c or "").strip()]  # 过滤空消息, 防API拒绝
             extra_ctx = "\n".join(x for x in (chat_item_context(cid), chat_last_context(msg)) if x)
-            messages = ([{"role": "system", "content":
-                          "你是「洞鉴虚明」的偏好助手。帮用户定义想看什么内容，"
-                          "回复要简短友好。"
-                          # v0.3.1.67: 这句原来写的是"你只能口头回答，无法真正切换" ——
-                          # 那是 AI 改设置(v62)之前的话。模型当真了，用户说"换回去"它就答
-                          # "我确实动不了你的页面布局，得你自己去点"。能力边界必须写准。
-                          "你能真正改动界面与筛选设置：主题、信息流布局（单栏/双栏/大图）、"
-                          "封面大小、字号、推荐理由显示、来源标识、强调色、过滤档位、"
-                          "各平台占比、直播筛选。用户直接说「换成双栏」「字号大一点」时，"
-                          "系统会在你回答之前就把它执行掉。"
-                          "所以绝不要说「我改不了」「动不了你的页面布局」或让他自己去设置页点；"
-                          "你不确定他想改哪一项时，就问一句「是想换成单栏吗」。"
-                          "你确实做不到的是推送/切换信息流里的视频(浏览器搜索见下)，也看不到页面上的执行结果，"
-                          "因此不要声称「已推送」「已切换到左侧」「已改好」。"
-                          "用户想刷视频时会直接说「给我刷/推/看XX」，系统会自动执行并另行确认。"
-                          "你也可以让内置浏览器打开网页或搜索：用户说「打开某网站」「用浏览器搜某词」"
-                          "时系统会立刻执行；但你看不到网页正文，不要假装读过页面内容，也不要编造链接。"
-                          "如果上下文里有【用户当前正在聊的条目】或【用户指代的最近条目】，"
-                          "围绕它可以做总结、点评、回答追问；没有依据的部分不要编造。"
-                          "可参考的用户画像:\n" + (user_context() or "(空)")
-                          + (("\n\n" + extra_ctx) if extra_ctx else "")}]
-                        + history)
+            sys_chat = (
+                "你是「洞鉴虚明」里的 AI 助手（底层是 DeepSeek）。把用户当朋友聊天："
+                "先直接给出结论或答案，再按需要展开理由、步骤和例子。"
+                "问题复杂就讲透，不要为了短而漏掉关键信息；不要重复用户的问题，也不要堆客套话。"
+                "需要多步解决的请求，给出可执行的做法；缺关键信息时先问一句，但别用反问代替回答。"
+                "用 Markdown 组织：小标题、列表、表格、代码块按需使用；日常闲聊保持口语、自然、生动。\n"
+                "关于这个软件，你知道这些事实：\n"
+                "· 用户想改界面或筛选设置时，系统会在你回答之前先执行（主题、单栏/双栏/大图、"
+                "封面大小、字号、推荐理由、来源标识、强调色、过滤档位、各平台占比、直播筛选）。"
+                "所以不要说「我改不了」「你去设置页点」；没听准是哪一项，就自然地问一句。\n"
+                "· 用户说「打开某网站」「用浏览器搜某词」时，系统会用内置浏览器执行；"
+                "但你看不到网页正文，不要假装读过页面，也不要编造链接。\n"
+                "· 你不能直接推送或切换信息流里的视频，也看不到执行后的页面，"
+                "所以不要声称「已推送」「已切换到左侧」「我已经帮你点了」。\n"
+                "· 上下文里出现【用户当前正在聊的条目】或【用户指代的最近条目】时，"
+                "可以围绕它总结、点评、回答追问；没有依据的部分不要编造。\n"
+                "用户画像（仅供参考，别生硬复述）：\n" + (user_context() or "(空)")
+                + (("\n\n" + extra_ctx) if extra_ctx else "")
+            )
+            messages = [{"role": "system", "content": sys_chat}] + history
             if stream:
+                eff = str(body.get("effort") or "mid")
                 self.send_response(200)
                 self.send_header("Content-Type", "text/event-stream; charset=utf-8")
                 self.send_header("Cache-Control", "no-cache")
                 self.end_headers()
-                sse_send("meta", {"intent": intent, "chips": chips, "cid": cid})
+                sse_send("meta", {"intent": intent, "chips": chips, "cid": cid,
+                                  "effort": eff})
                 reply = ""
                 thinking_txt = []
-                aborted = False
+                usage_box = {}
+                aborted = failed = False
+                first_delta_at = None
+                t0 = time.time()
 
                 def on_reasoning(t):
                     try:
-                        if not thinking_txt:   # 推理模型: 思考阶段前端显示"思考中…"
-                            sse_send("think", {})
                         thinking_txt.append(t)
+                        sse_send("reason", {"t": t})
                     except Exception:
                         pass
+
                 try:
-                    for delta in llm_stream(messages, max_tokens=4096, on_reasoning=on_reasoning):
+                    for delta in llm_stream(messages, max_tokens=16384,
+                                            on_reasoning=on_reasoning, effort=eff,
+                                            on_usage=usage_box.update):
+                        if first_delta_at is None:
+                            first_delta_at = time.time()
                         reply += delta
                         try:
                             sse_send("delta", {"t": delta})
@@ -15243,36 +16738,42 @@ class Handler(BaseHTTPRequestHandler):
                             break
                 except Exception as e:
                     if not reply:
-                        reply = "AI 调用失败（%s）。请检查左侧设置里的 API 地址 / Key / 模型。" % str(e)[:120]
+                        reply = _chat_err_text(e)
+                        failed = True
+                think_secs = round((first_delta_at or time.time()) - t0, 1)
                 if aborted and not reply:
                     reply = "（已停止生成）"
-                if not reply and not aborted:
+                if not reply and not aborted and not failed:
                     # 思考过长被截断时, 用思考尾段兜底(结论通常在后半段)
                     tail = "".join(thinking_txt)[-160:].strip()
                     reply = ("模型思考过长了：%s（以上为模型思考过程，供参考）" % tail) if tail else \
                             "模型思考后没有给出文字回答，再问一次或换个说法试试～"
-                if not aborted and reply and "AI 调用失败" not in reply:
-                    # v4-flash 流式不返回 usage → 按字数估算记账(意图判断已是真实值)
-                    record_usage({"prompt_tokens": int(sum(
+                if not aborted and not failed and reply and not usage_box:
+                    # 流式没回 usage 时按字数估算(有 usage 就记真实值)
+                    usage_box = {"prompt_tokens": int(sum(
                                      len((m.get("content") or "")) for m in messages) * 0.8) + 8,
-                                  "completion_tokens": int(len(reply) * 0.8) + 8})
+                                 "completion_tokens": int(len(reply) * 0.8) + 8}
+                    record_usage(usage_box)
                 db().execute("INSERT INTO chat(role,content,ts,cid) VALUES('assistant',?,?,?)",
                              (reply, int(time.time()), cid))
                 db().commit()
                 try:
-                    sse_send("done", {"reply": reply, "chips": chips, "ok": True})
+                    sse_send("done", {"reply": reply, "chips": chips, "ok": not failed,
+                                      "think_secs": think_secs, "usage": usage_box})
                 except Exception:
                     pass
                 return
             try:
-                content, _ = call_llm(messages, max_tokens=4096)
+                content, _ = call_llm(messages, max_tokens=16384)
                 reply = content.strip()
             except Exception as e:
-                reply = "AI 调用失败（%s）。请检查左侧设置里的 API 地址 / Key / 模型。" % str(e)[:120]
+                reply = _chat_err_text(e)
             if not reply:
                 reply = "模型思考后没有给出文字回答，再问一次或换个说法试试～"
             return finish(reply)
 
+        if path == "/api/panel/set":
+            return self.send_json(panel_set(body))
         if path == "/api/chat/ctx":
             # "问AI"上下文: 卡片长按菜单写入, 前端✕或换会话清除(key为空=清除)
             cid = conv_cur(body.get("cid"))

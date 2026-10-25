@@ -1861,7 +1861,7 @@
   };
   // 模型预置（旧版有个 ▾ 下拉；新版用原生 datalist，输入框本身仍是自由输入）
   const MODEL_PRESETS = [
-    ["DeepSeek", ["deepseek-v4-flash", "deepseek-v4-pro", "deepseek-v4-flash-vision-exp", "deepseek-chat", "deepseek-reasoner"]],
+    ["DeepSeek", ["deepseek-flash", "deepseek-v4-pro"]],
     ["智谱 GLM", ["glm-4-plus", "glm-4-flash"]],
     ["通义千问", ["qwen-turbo", "qwen-plus", "qwen-max"]],
     ["OpenAI 兼容", ["gpt-4o-mini", "gpt-4o"]],
@@ -3094,17 +3094,133 @@
     $("#convList").classList.remove("show");
     await loadConvs(); await loadChatHistory();
   });
-  function addMsg(who, text, chips) {
+  function scrollMsgs(force) {
+    const m = $("#msgs");
+    if (!m) return;
+    if (force || m.scrollHeight - m.scrollTop - m.clientHeight < 90) m.scrollTop = m.scrollHeight;
+  }
+  /* 轻量 Markdown: 先转义 HTML 再识别结构, 只放行 http(s) 链接。
+     模型给的标题/列表/表格/代码块不渲染的话, 聊天里全是星号和竖线。 */
+  function mdToHtml(src) {
+    const e2 = (s) => String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+    const codes = [];
+    let s = String(src || "").replace(/\r\n?/g, "\n");
+    if ((s.match(/^```/gm) || []).length % 2 === 1) s += "\n```";   // 流式未写完的围栏先补上
+    s = s.replace(/```([^\n`]*)\n([\s\S]*?)```/g, (m, lang, code) => {
+      codes.push('<pre class="mdCode"><code>' + e2(code.replace(/\n$/, "")) + "</code></pre>");
+      return "\u0000C" + (codes.length - 1) + "\u0000";
+    });
+    const il = (t) => {
+      t = e2(t);
+      t = t.replace(/`([^`\n]+)`/g, "<code>$1</code>");
+      t = t.replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>");
+      t = t.replace(/__([^_\n]+)__/g, "<b>$1</b>");
+      t = t.replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<i>$2</i>");
+      t = t.replace(/~~([^~\n]+)~~/g, "<del>$1</del>");
+      t = t.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g,
+        '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+      return t;
+    };
+    const lines = s.split("\n"), out = [];
+    let list = null, para = [];
+    const flush = () => { if (para.length) { out.push("<p>" + para.map(il).join("<br>") + "</p>"); para = []; } };
+    const closeList = () => { if (list) { out.push("</" + list + ">"); list = null; } };
+    const cells = (row) => row.replace(/^\s*\|/, "").replace(/\|\s*$/, "")
+      .split("|").map((c) => c.trim());
+    for (let i = 0; i < lines.length; i++) {
+      const ln = lines[i], tr = ln.trim();
+      if (/^\u0000C\d+\u0000$/.test(tr)) { flush(); closeList(); out.push(tr); continue; }
+      if (!tr) { flush(); closeList(); continue; }
+      const h = ln.match(/^(#{1,6})\s+(.*)$/);
+      if (h) { flush(); closeList();
+        out.push("<h" + h[1].length + ">" + il(h[2]) + "</h" + h[1].length + ">"); continue; }
+      if (/^\s*(---+|\*\*\*+|___+)\s*$/.test(ln)) { flush(); closeList(); out.push("<hr>"); continue; }
+      if (/^\s*>/.test(ln)) { flush(); closeList();
+        out.push("<blockquote>" + il(ln.replace(/^\s*>\s?/, "")) + "</blockquote>"); continue; }
+      if (ln.indexOf("|") >= 0 && lines[i + 1] &&
+          /^\s*\|?[\s:|-]+\|[\s:|-]*$/.test(lines[i + 1])) {
+        flush(); closeList();
+        const head = cells(ln); i++;
+        let tb = "<table><thead><tr>" + head.map((c) => "<th>" + il(c) + "</th>").join("") +
+          "</tr></thead><tbody>";
+        while (i + 1 < lines.length && lines[i + 1].indexOf("|") >= 0 && lines[i + 1].trim()) {
+          i++;
+          tb += "<tr>" + cells(lines[i]).map((c) => "<td>" + il(c) + "</td>").join("") + "</tr>";
+        }
+        out.push(tb + "</tbody></table>"); continue;
+      }
+      const ul = ln.match(/^\s*[-*+]\s+(.*)$/), ol = ln.match(/^\s*\d+[.)]\s+(.*)$/);
+      if (ul || ol) {
+        flush();
+        const want = ul ? "ul" : "ol";
+        if (list !== want) { closeList(); list = want; out.push("<" + want + ">"); }
+        out.push("<li>" + il((ul || ol)[1]) + "</li>"); continue;
+      }
+      closeList(); para.push(ln);
+    }
+    flush(); closeList();
+    return out.join("").replace(/\u0000C(\d+)\u0000/g, (m, n) => codes[+n] || "");
+  }
+
+  /* 思维链: 思考时展开流动, 正文开始时自动收起(DeepSeek 网页式), 点标题可再看。 */
+  function addThinkBox(aiEl) {
+    const box = document.createElement("div");
+    box.className = "thinkBox show";
+    box.innerHTML = '<button type="button" class="thinkHead">' +
+      '<span class="thinkDot"></span><span class="thinkTitle">正在深度思考…</span>' +
+      '<svg class="ic thinkChev"><use href="#i-chevron-right"/></svg></button>' +
+      '<div class="thinkBody"></div>';
+    aiEl.insertBefore(box, aiEl.firstChild);
+    box.querySelector(".thinkHead").onclick = () => box.classList.toggle("open");
+    return {
+      _t: "", _last: 0, _done: false, _start: performance.now(),
+      box, body: box.querySelector(".thinkBody"), title: box.querySelector(".thinkTitle"),
+      add(t) {
+        this._t += t || "";
+        const now = performance.now();
+        if (now - this._last < 100) return;
+        this._last = now;
+        this.body.textContent = this._t;
+        this.body.scrollTop = this.body.scrollHeight;
+        scrollMsgs();
+      },
+      finish() {
+        if (this._done) return;
+        this._done = true;
+        this.body.textContent = this._t;
+        const secs = Math.max(1, Math.round((performance.now() - this._start) / 1000));
+        this.title.textContent = "已深度思考（" + secs + " 秒）";
+        box.classList.remove("show", "open");
+      },
+    };
+  }
+
+  function addMsg(who, text, chips, raw) {
     const d = document.createElement("div");
     d.className = "msg " + (who === "me" ? "me" : "ai");
     const t = document.createElement("div");
     t.className = "msg-text";
-    t.textContent = text == null ? "" : String(text);
+    if (who === "me" || raw) t.textContent = text == null ? "" : String(text);
+    else { t.classList.add("md"); t.innerHTML = mdToHtml(text); }
     d.appendChild(t);
     if (chips && chips.length) d.appendChild(chipsRow(chips));
     $("#msgs").appendChild(d);
-    $("#msgs").scrollTop = $("#msgs").scrollHeight;
+    scrollMsgs(true);
     return d;
+  }
+  // 智能体这次真正做过的操作(可折叠成一行小标签), 让人一眼看到"它确实动了手"
+  function actsRow(acts) {
+    const row = document.createElement("div");
+    row.className = "acts-row";
+    acts.forEach((a) => {
+      const sp = document.createElement("span");
+      sp.className = "actTag" + (a.ok === false ? " bad" : "");
+      sp.textContent = (a.ok === false ? "✕ " : "✓ ") + (a.label || "");
+      if (a.tool) sp.title = a.tool;
+      row.appendChild(sp);
+    });
+    return row;
   }
   // 后端每条回复都会带一组快捷指令（chips），旧版就渲染在气泡下方；点了等于把 cmd 当新消息发出去
   function chipsRow(chips) {
@@ -3296,49 +3412,23 @@
     }
     return done;
   }
-  async function aiPlanSettings(t) {
-    if (!S.aiOn) return null;
-    const eff = prefs.effort || "mid";
-    let d = null;
-    try {
-      d = await api("/api/chat/plan", {
-        method: "POST",
-        body: JSON.stringify({
-          text: t, effort: eff, cid: S.cid,   // cid: 让后端把最近对话一起交给模型 ——
-                                              // 「换回去」「再大一点」离开上下文没法解
-          prefs: { theme: prefs.theme, layout: prefs.layout, cover: prefs.cover,
-                   font: prefs.font, reason: prefs.reason, srcacc: prefs.srcacc,
-                   accent: prefs.accent },
-          weights: platWs,
-          live: { min_viewers: parseInt(($("#mLiveMin") || {}).value, 10) || 0,
-                  only_followed: !!($("#mLiveFollowOnly") || {}).checked },
-        }),
-      });
-    } catch (e) { return null; }
-    if (!d || !d.ok) return null;
-    if (!(d.actions || []).length) {
-      // 模型判断"这是在说设置，但没说清改成什么"(如只说了句"换回去"而它找不到上下文)：
-      // 直接用它的追问。再交给闲聊模型只会让它自己编一套"你去设置里点"的说辞。
-      if (d.setting && d.say) return { reply: d.say };
-      return null;
-    }
-    const done = await applyPlan(d.actions);
-    if (!done.length) return null;
-    return { reply: "已改好：" + done.join("；") + "。想改回来直接说一声就行。" };
+  // 普通聊天别为了识别"改设置"白等一轮模型：只有命中设置名词/相对调整说法才走 plan，
+  // 长句多半是在问问题，也直接进流式回答（原来每句话都要多等 1~3 秒）。
+  const SETTING_HINT = /(设置|主题|黑夜|夜间|深色|暗色|白天|日间|浅色|布局|单栏|双栏|两栏|两列|单列|大图|封面|字号|字体|推荐理由|来源标识|强调色|主色|主题色|配色|占比|百分比|%|换回去|改回来|恢复原样|退回去|调大|调小|变大|变小|大一点|小一点|高一点|低一点|暗一点|亮一点)|(?:直播|关注|人气|观众|占比)[^，。]{0,8}(?:直播|关注|人气|观众|占比|筛选|门槛)/;
+  function looksLikeSetting(t) {
+    const s = String(t || "").trim();
+    return s.length <= 80 && SETTING_HINT.test(s);
   }
 
-  // 流式输出：增量渲染 + 可停止（旧版有，新版补上）
+  // 流式输出：思维链单独折叠、正文按 Markdown 增量渲染、可停止。
   async function sendChatStream(text, payload) {
     const t = (text == null ? $("#chatInput").value : text).trim();
     if (!t) return;
     if (text == null) $("#chatInput").value = "";
-    // 设置指令先走本地规则(见 nlApplySettings): 不烧 token、立刻生效, 历史也照常落库
-    if (!payload) {
-      // 先请模型想一想(临时气泡提示, 无论成败都收掉), 没读懂再退回本地规则
-      const ph = S.aiOn ? addMsg("ai", "思考中…") : null;
-      const plan = await aiPlanSettings(t);
-      if (ph && ph.parentNode) ph.remove();
-      const act = plan || (await nlApplySettings(t));
+    // v0.4.41: AI 开启时不再本地预判"改设置" —— 整句话连界面状态一起交给智能体,
+    // 由它读状态、调工具、自己总结; 只有 AI 关闭时才用本机规则兜底。
+    if (!payload && !S.aiOn) {
+      const act = looksLikeSetting(t) ? await nlApplySettings(t) : null;
       if (act) {
         addMsg("me", t);
         addMsg("ai", act.reply);
@@ -3354,22 +3444,35 @@
     addMsg("me", t);
     const aiEl = addMsg("ai", "");
     const tEl = aiEl.querySelector(".msg-text");
+    tEl.innerHTML = '<span class="typing"><i></i><i></i><i></i></span>';
     let chips = [], trigger = null, browser = null, cid = S.cid,
-        ctx = undefined, replied = "";
+        ctx = undefined, replied = "", think = null, gotContent = false, lastPaint = 0,
+        acts = [], uiActs = [], feedQuery, feedReload = false, phaseEl = null;
     $("#chatStop").hidden = false;
     chatCtrl = new AbortController();
-    const scroll = () => { $("#msgs").scrollTop = $("#msgs").scrollHeight; };
+    const paint = (force) => { tEl.innerHTML = mdToHtml(replied); scrollMsgs(force); };
     try {
       const r = await fetch("/api/chat", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ message: t, cid: S.cid, stream: true, payload: payload || undefined }),
+        body: JSON.stringify({ message: t, cid: S.cid, stream: true,
+                               effort: prefs.effort || "mid",
+                               // 智能体要"看见"用户现在的界面与搜索状态, 否则只能瞎猜
+                               ui: { theme: prefs.theme, layout: prefs.layout,
+                                     cover: prefs.cover, font: prefs.font,
+                                     reason: prefs.reason, srcacc: prefs.srcacc,
+                                     accent: prefs.accent, q: S.q || "",
+                                     view: S.view || "" },
+                               payload: payload || undefined }),
         signal: chatCtrl.signal,
       });
       if ((r.headers.get("Content-Type") || "").indexOf("application/json") >= 0) {
         const d = await r.json();                       // 未配置 AI / 总开关关闭时后端回普通 JSON
+        tEl.classList.remove("md");
         tEl.textContent = d.reply || d.error || "（没有返回内容）";
         chips = d.chips || []; cid = d.cid || cid; ctx = d.ctx; trigger = d.trigger || null;
         browser = d.browser || null;
+        acts = d.actions || []; uiActs = d.ui_actions || [];
+        feedQuery = d.feed_query; feedReload = !!d.feed_reload;
       } else {
         const reader = r.body.getReader(), dec = new TextDecoder();
         let buf = "";
@@ -3386,16 +3489,60 @@
               else if (line.indexOf("data:") === 0) { try { data = JSON.parse(line.slice(5).trim()); } catch (e) {} }
             });
             if (ev === "meta") { chips = data.chips || []; cid = data.cid || cid; if (data.ctx !== undefined) ctx = data.ctx; }
-            else if (ev === "think") { if (!tEl.textContent) tEl.textContent = "思考中…"; }
-            else if (ev === "delta") { replied += data.t || ""; tEl.textContent = replied; scroll(); }
-            else if (ev === "done") { replied = data.reply || replied; chips = data.chips || chips; trigger = data.trigger || null; if (data.ctx !== undefined) ctx = data.ctx; if (data.browser) browser = data.browser; }
+            else if (ev === "think" || ev === "reason") {
+              if (!think) think = addThinkBox(aiEl);   // think: 兼容旧后端的空事件
+              if (ev === "reason") think.add(data.t || "");
+            }
+            else if (ev === "phase") {
+              // 正在调工具: 在正文上方显示一行"正在…"（正文开始后清掉）
+              if (!phaseEl) {
+                phaseEl = document.createElement("div");
+                phaseEl.className = "agentPhase";
+                aiEl.insertBefore(phaseEl, tEl);
+              }
+              phaseEl.textContent = data.label || "正在执行操作…";
+              scrollMsgs();
+            }
+            else if (ev === "act") {
+              acts.push(data);
+              if (phaseEl) phaseEl.textContent = (data.ok === false ? "✕ " : "✓ ") + (data.label || "");
+            }
+            else if (ev === "delta") {
+              if (!gotContent) {
+                gotContent = true; if (think) think.finish();
+                if (phaseEl) { phaseEl.remove(); phaseEl = null; }
+              }
+              replied += data.t || "";
+              const now = performance.now();
+              if (now - lastPaint > 90) { lastPaint = now; paint(); }
+            }
+            else if (ev === "done") {
+              replied = data.reply || replied;
+              if (think) think.finish();
+              chips = data.chips || chips; trigger = data.trigger || null;
+              if (data.ctx !== undefined) ctx = data.ctx;
+              if (data.browser) browser = data.browser;
+              if (data.actions) acts = data.actions;
+              if (data.cid) cid = data.cid;      // 智能体可能开了新对话
+              uiActs = data.ui_actions || uiActs;
+              if (data.feed_query !== undefined) feedQuery = data.feed_query;
+              feedReload = !!data.feed_reload || feedReload;
+            }
           }
         }
-        tEl.textContent = replied || tEl.textContent || "（没有返回内容）";
+        if (think) think.finish();
+        if (replied) paint();
+        else if (!tEl.textContent || tEl.querySelector(".typing")) tEl.textContent = "（没有返回内容）";
       }
     } catch (e) {
-      if (e && e.name === "AbortError") tEl.textContent = (tEl.textContent || "") + "（已停止生成）";
-      else { tEl.textContent = "发送失败：" + e; toast("AI 请求失败：" + e, true); }
+      if (e && e.name === "AbortError") {
+        if (replied) { paint(); tEl.insertAdjacentHTML("beforeend", '<span class="msgHint">（已停止生成）</span>'); }
+        else tEl.textContent = "（已停止生成）";
+      } else {
+        tEl.classList.remove("md");
+        tEl.textContent = "发送失败：" + e;
+        toast("AI 请求失败：" + e, true);
+      }
     }
     $("#chatStop").hidden = true; chatCtrl = null;
     if (cid) S.cid = cid;
@@ -3404,16 +3551,40 @@
       $("#ctxBar").classList.toggle("show", !!S.ctx);
       if (S.ctx) $("#ctxTitle").textContent = "正在针对：《" + S.ctx.title + "》";
     }
+    if (phaseEl) { phaseEl.remove(); phaseEl = null; }
+    if (acts && acts.length) aiEl.appendChild(actsRow(acts));
     if (chips && chips.length) aiEl.appendChild(chipsRow(chips));
+    // 智能体在服务端已改完设置; 这里的界面动作(主题/布局/封面/字号/强调色)要由前端落地
+    if (uiActs && uiActs.length) {
+      try { await applyPlan(uiActs); } catch (e) {}
+    }
+    let feedTouched = false;
+    if (feedQuery !== undefined) {
+      feedTouched = true;
+      if (feedQuery) {
+        if (S.view !== "feed") setView("feed");
+        $("#searchInput").value = feedQuery;
+        S.q = feedQuery; S.emptyMsg = "";
+        saveState();
+        $$(".nav[data-nav]").forEach((b) => b.classList.toggle("on", b.dataset.nav === "feed"));
+        restartFeed();
+      } else if (S.q) {
+        exitSearch();
+      }
+    }
+    if (feedReload && !feedTouched) { feedTouched = true; restartFeed(); }
     if (browser && browser.url) openBrowserTab(browser.url, browser.title || "");
-    scroll();
+    scrollMsgs(true);
     loadConvs();                                   // 首句会自动命名，列表要跟着更新
-    if (trigger === "settings") { loadSettings(); loadMachine(); loadStatus(); loadFeed(false); }
-    else if (trigger === "random") loadFeed(false);
+    if (trigger === "settings") {
+      loadSettings(); loadMachine(); loadStatus();
+      if (!feedTouched) loadFeed(false);
+    }
+    else if (trigger === "random") { if (!feedTouched) loadFeed(false); }
     else if (trigger === "conv") { loadConvs(); loadChatHistory(); }
   }
   $("#chatSend").onclick = () => sendChatStream();
-  // 思考强度档位（常驻输入框左边）：只影响"聊天里改设置"那一步的思考量
+  // 思考强度档位（常驻输入框左边）：同时管聊天作答和"聊天里改设置"的思考量
   (function initEffort() {
     const sel = $("#chatEffort");
     if (!sel) return;
@@ -3445,6 +3616,24 @@
   };
 
   /* ================= 分栏拖动 / 开关 ================= */
+  // 拖动时**只改两根宽度变量**。旧实现每帧调 applyPrefs(), 而它里面做的事跟拖拽毫无关系:
+  //   · applyBg() 往 documentElement 上重写 6 个颜色变量 → 全文档样式失效(几百张卡片一起重算);
+  //   · applyListCols() 读 clientWidth → 每帧一次强制同步重排;
+  //   · renderBgRow()/paintRanges()/applyStatCard() 各自碰 DOM。
+  // 体感就是"拖 AI 对话框特别卡"。现在: 每帧一次 rAF, 只写 2 个 CSS 变量 + 2 个 class;
+  // 松手才跑一次 applyPrefs() 把其余样式补齐。拖动期间还关掉中间栏的 pointer-events,
+  // 免得鼠标扫过卡片时一路触发 hover 状态。
+  let splitRaf = 0;
+  function applySplitOnly() {
+    const html = document.documentElement, shell = $("#shell");
+    shell.classList.toggle("le", !!prefs.le);
+    shell.classList.toggle("re", !!prefs.re);
+    html.style.setProperty("--leftW", (prefs.le ? 0 : prefs.leftW) + "px");
+    html.style.setProperty("--rightW", (prefs.re ? 0 : prefs.rightW) + "px");
+    const tl = $("#toggleLeft"), tr = $("#toggleRight");
+    if (tl) tl.classList.toggle("collapsed", !!prefs.le);
+    if (tr) tr.classList.toggle("collapsed", !!prefs.re);
+  }
   document.addEventListener("pointerdown", (e) => {
     const sp = e.target.closest(".splitter");
     if (!sp) return;
@@ -3456,6 +3645,7 @@
     //   往左拖(dx<0) → 右栏变宽；往右拖(dx>0) → 右栏变窄。
     //   之前两栏共用 w0 + dx，右栏就是反的（往左拉反而缩、往右拉反而展）。
     const sign = which === "left" ? 1 : -1;
+    document.body.classList.add("splitting");
     const move = (ev) => {
       const raw = w0 + sign * (ev.clientX - x0);
       if (which === "left") {
@@ -3465,11 +3655,14 @@
         if (raw < 90) { prefs.re = true; }
         else { prefs.re = false; prefs.rightW = Math.max(170, Math.min(460, raw)); }
       }
-      applyPrefs();
+      if (!splitRaf) splitRaf = requestAnimationFrame(() => { splitRaf = 0; applySplitOnly(); });
     };
     const up = () => {
       document.removeEventListener("pointermove", move);
       document.removeEventListener("pointerup", up);
+      if (splitRaf) { cancelAnimationFrame(splitRaf); splitRaf = 0; }
+      document.body.classList.remove("splitting");
+      applyPrefs();     // 收尾: 一次性补齐底色变量/色卡/列数/按钮文案
       savePrefs();
     };
     document.addEventListener("pointermove", move);

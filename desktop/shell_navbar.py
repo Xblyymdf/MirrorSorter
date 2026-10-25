@@ -44,6 +44,7 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
     h = nav_h(scale)
     st = {
         "url": "", "back": False, "fwd": False, "loading": False,
+        "ai_on": False,       # 右侧 AI 助手面板是否展开(按钮高亮用)
         "hover": None,        # "back" / "fwd" / "reload"
         "edit": False,        # 地址栏正在编辑(聚焦) —— 期间不覆盖显示值
         "tb_hover": False,    # 指针在地址栏文字上(未悬停时文字降为 70% 不透明度)
@@ -55,6 +56,7 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
         "tb_bg": Color.FromArgb(22, 25, 32),
         "tb_fg": Color.FromArgb(226, 230, 238),
         "tb_border": Color.FromArgb(52, 57, 68),
+        "accent": Color.FromArgb(76, 141, 255),
     }
 
     # 图标字体: 优先 Segoe MDL2 Assets(Win10+ 自带), 缺则退回雅黑符号
@@ -91,6 +93,12 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
         return {"back": st["back"], "fwd": st["fwd"], "reload": True,
                 "star": bool(st["url"])}[name]
 
+    # ---- 右端 AI 助手开关(常驻: 面板开合的唯一入口) ----
+    AI_W = int(42 * scale)
+
+    def _ai_rect():
+        return (bar.Width - MARGIN - AI_W, int(3 * scale), AI_W, h - int(6 * scale))
+
     def _btn_rects():
         x, bw, gap = MARGIN, BTN_W, BTN_GAP
         return {n: (x + i * (bw + gap), 0, bw, h)
@@ -101,8 +109,9 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
         last = _names()[-1]
         end = rects[last][0] + rects[last][2]
         tx = end + (int(22 * scale) if glyphs.get("lock") else int(8 * scale))
-        return (tx, int(5 * scale),
-                bar.Width - tx - int(8 * scale), h - int(10 * scale))
+        # 右端要给 AI 按钮让位, 否则地址栏会被压在它下面
+        right = bar.Width - MARGIN - AI_W - int(8 * scale)
+        return (tx, int(5 * scale), max(40, right - tx), h - int(10 * scale))
 
     # ---- 地址栏(原生 TextBox: 输入法/光标/全选白送) ----
     tb = WinForms.TextBox()
@@ -182,6 +191,18 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
             g.DrawString(glyph, icon_font,
                          SolidBrush(st["fg"] if enabled else st["fg_dim"]),
                          RectangleF(float(bx), float(by), float(bw), float(bh)), sf)
+        # 右端 AI 助手按钮: 开着 = 实底高亮, 关着 = 描边(和地址栏同一套配色)
+        ar = _ai_rect()
+        ai_on = bool(st.get("ai_on"))
+        arad = int(6 * scale)
+        if ai_on:
+            g.FillPath(SolidBrush(st["tb_bg"]),
+                       _rounded_path(ar[0], ar[1], ar[2], ar[3], arad))
+        g.DrawPath(Pen(st["accent"] if ai_on else st["tb_border"], 1.0),
+                   _rounded_path(ar[0] - 1, ar[1] - 1, ar[2] + 2, ar[3] + 2, arad))
+        g.DrawString("AI", tb_font,
+                     SolidBrush(st["fg"] if ai_on or st["hover"] == "ai" else st["fg_dim"]),
+                     RectangleF(float(ar[0]), float(ar[1]), float(ar[2]), float(ar[3])), sf)
         # 地址栏: 圆角描边 + 左端锁形装饰(有的话)
         r = _tb_rect()
         rad = int(6 * scale)
@@ -203,6 +224,10 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
         name = _btn_at(args.X, args.Y)
         if name and not _enabled(name):
             name = None   # 禁用按钮不给悬停高亮
+        if name is None:
+            ar = _ai_rect()
+            if ar[0] <= args.X <= ar[0] + ar[2] and ar[1] <= args.Y <= ar[1] + ar[3]:
+                name = "ai"
         if name != st["hover"]:
             st["hover"] = name
             bar.Invalidate()
@@ -219,6 +244,16 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
 
     def on_click(_sender, args):
         name = _btn_at(args.X, args.Y)
+        if name is None:
+            ar = _ai_rect()
+            if ar[0] <= args.X <= ar[0] + ar[2] and ar[1] <= args.Y <= ar[1] + ar[3]:
+                name = "ai"
+        if name == "ai":
+            try:
+                api.toggle_ai_panel()
+            except Exception:
+                pass
+            return
         if name == "back" and st["back"]:
             api.nav_back()
         elif name == "fwd" and st["fwd"]:
@@ -431,6 +466,25 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
             bookmarks.subscribe(_refresh_star)
         except Exception:
             pass
+
+    def set_ai(on):
+        """右侧 AI 面板开合状态 → 按钮高亮(可从任意线程调)。"""
+        on = bool(on)
+        if on == st.get("ai_on"):
+            return
+        st["ai_on"] = on
+
+        def _apply():
+            try:
+                bar.Invalidate()
+            except Exception:
+                pass
+        if bar.InvokeRequired:
+            bar.BeginInvoke(WinForms.MethodInvoker(_apply))
+        else:
+            _apply()
+
+    update.set_ai = set_ai
 
     update.bar = bar      # bug6: 网页全屏时窗口壳要整条隐藏导航栏(按钮+地址栏)
     update.set_fullscreen = set_fullscreen   # bug6: 窗口壳按网页全屏状态显隐导航栏

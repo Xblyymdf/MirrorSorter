@@ -1409,7 +1409,10 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
     """
     import System.Windows.Forms as WinForms  # noqa: F401  提前加载 CLR(pythonnet)
     box = {"form": None, "theme": None, "stopping": False, "port": port,
-           "on_nav": on_nav, "on_fs": on_fs, "on_drop": on_drop}
+           "on_nav": on_nav, "on_fs": on_fs, "on_drop": on_drop,
+           # v0.4.42: 右侧 AI 面板占位。inset_right = 内容区右边让出的像素(0=面板收起),
+           # content_top = 窗口 chrome(标签栏+导航栏+收藏栏)的总高度, 面板与标签页共用这两个值。
+           "inset_right": 0, "content_top": 0, "on_geom": None}
 
     def _tab_geo(form, home, key):
         """标签控件的常规几何(锚在信息流主控件 home 上)。创建与全屏退出都走这里。
@@ -1419,11 +1422,13 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
         顶栏左侧就空出一块底色。现按用户要求**取消窗口级左留白**(控件与窗口等宽, 顶栏从左缘
         开始, 视觉连续); 「播放页左侧宽一点」改为在页面内部留(见 extensions\\bilibili-ownui.user.js)。"""
         from System.Drawing import Point, Size
+        inset = max(0, int(box.get("inset_right") or 0))
         if home is None:
             return (Point(0, 0),
-                    Size(max(1, form.ClientSize.Width), max(1, form.ClientSize.Height)))
+                    Size(max(1, form.ClientSize.Width - inset),
+                         max(1, form.ClientSize.Height)))
         return (Point(home.Location.X, home.Location.Y),
-                Size(max(1, home.Size.Width), max(1, home.Size.Height)))
+                Size(max(1, home.Size.Width - inset), max(1, home.Size.Height)))
 
     def _ui(fn):
         """marshal 到 UI 线程(窗体未绑定时直接执行, 供测试注入)。"""
@@ -2078,6 +2083,8 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
                     return
                 from System.Drawing import Point, Size
                 top_ = max(0, int(top))
+                box["content_top"] = top_
+                inset = max(0, int(box.get("inset_right") or 0))
                 for c in list(_Pool.ctrls.values()):
                     if c is None:
                         continue
@@ -2088,11 +2095,139 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
                         continue
                     try:
                         c.Location = Point(0, top_)
-                        c.Size = Size(max(1, form.ClientSize.Width),
+                        c.Size = Size(max(1, form.ClientSize.Width - inset),
                                       max(1, form.ClientSize.Height - top_))
                     except Exception:
                         pass
+                cb = box.get("on_geom")
+                if cb is not None:
+                    try:
+                        cb()
+                    except Exception:
+                        pass
             _ui(go)
+
+        def set_right_inset(self, px):
+            """右侧给 AI 面板让出 px 像素(0 = 面板收起)。所有标签控件一起缩, 面板自己
+            不归这里管。拖动过程中调用方只改可见控件(便宜), 松手后调这里一次性对齐全部。"""
+            def go():
+                form = box.get("form")
+                if form is None:
+                    return
+                box["inset_right"] = max(0, int(px))
+                if _Pool.fs.get("on"):
+                    return   # 全屏时铺满整窗; 退出全屏后面板会重新下发一次
+                from System.Drawing import Point, Size
+                top_ = max(0, int(box.get("content_top") or 0))
+                w = max(1, form.ClientSize.Width - box["inset_right"])
+                h = max(1, form.ClientSize.Height - top_)
+                for c in list(_Pool.ctrls.values()):
+                    if c is None:
+                        continue
+                    try:
+                        if not self._same_form(c.FindForm(), form):
+                            continue
+                    except Exception:
+                        continue
+                    try:
+                        c.Location = Point(0, top_)
+                        c.Size = Size(w, h)
+                    except Exception:
+                        pass
+                cb = box.get("on_geom")
+                if cb is not None:
+                    try:
+                        cb()
+                    except Exception:
+                        pass
+            _ui(go)
+
+        def geometry(self):
+            """内容区当前几何(面板布局用): top=chrome 高度, inset=右侧让位, w/h=窗体客户区。"""
+            form = box.get("form")
+            if form is None:
+                return {"top": 0, "inset": 0, "w": 0, "h": 0}
+            try:
+                return {"top": max(0, int(box.get("content_top") or 0)),
+                        "inset": max(0, int(box.get("inset_right") or 0)),
+                        "w": int(form.ClientSize.Width), "h": int(form.ClientSize.Height)}
+            except Exception:
+                return {"top": 0, "inset": 0, "w": 0, "h": 0}
+
+        def home_ctrl(self):
+            """信息流主控件(pywebview 建的那个)。新建 WebView2 要复制它的 CreationProperties。"""
+            return self._ctrl(0)
+
+        def ctrl(self, key):
+            """按标签取控件(没有就 None)。面板拖动时要单独缩"当前可见的那个"。"""
+            try:
+                return self._ctrl(key)
+            except Exception:
+                return None
+
+        def set_on_geom(self, fn):
+            """几何变化(内容区高度/右侧让位)后回调 —— 面板据此重新摆自己。"""
+            box["on_geom"] = fn
+
+        def exec_js(self, key, code, timeout=6.0):
+            """在标签 key 的页面里执行 JS 并等结果(任意线程可调, 阻塞但不占 UI 线程)。
+
+            为什么这么绕: WebView2 只能在 UI 线程调, 而 ExecuteScriptAsync 返回的是
+            Task —— 若在 UI 线程上等它, 完成回调永远排不上队(死锁)。所以只把"发起"
+            投到 UI 线程, 等待留在调用线程。
+            返回 {"value": <解析后的结果>} 或 {"error": "..."}。
+            """
+            c = _Pool.ctrls.get(key)
+            if c is None:
+                return {"error": "标签页还没有打开"}
+            holder = {}
+            ev = threading.Event()
+
+            def start():
+                try:
+                    core = c.CoreWebView2
+                    if core is None:
+                        holder["error"] = "页面还没准备好"
+                    else:
+                        holder["task"] = core.ExecuteScriptAsync(code)
+                except Exception as e:
+                    holder["error"] = repr(e)[:160]
+                finally:
+                    ev.set()
+
+            try:
+                _ui(start)
+            except Exception as e:
+                return {"error": "UI 线程不可用: %s" % str(e)[:80]}
+            if not ev.wait(5.0):
+                return {"error": "页面没有响应(执行排队超时)"}
+            if holder.get("error"):
+                return {"error": holder["error"]}
+            task = holder.get("task")
+            if task is None:
+                return {"error": "执行失败"}
+            deadline = time.time() + max(0.5, float(timeout))
+            while time.time() < deadline:
+                try:
+                    if task.IsCompleted:
+                        break
+                except Exception:
+                    break
+                time.sleep(0.02)
+            try:
+                if not task.IsCompleted:
+                    return {"error": "网页响应超时(脚本可能卡住了)"}
+                raw = task.Result
+            except Exception as e:
+                return {"error": "脚本执行失败: %s" % str(e)[:160]}
+            if raw is None:
+                return {"value": None}
+            try:
+                return {"value": json.loads(raw)}
+            except Exception:
+                return {"value": str(raw)[:2000]}
+            finally:
+                pass
 
         def hide(self, key):
             def go():
