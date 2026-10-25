@@ -845,6 +845,11 @@ class ShellApi:
                     tab = next((x for x in self._tabs if x["id"] == tid), None)
             browser_tab = bool(tab) and not tab.get("pinned") and not tab.get("float")
             p.sync_for_tab(browser_tab)
+            # 顶栏 AI 入口跟着标签能力走: 信息流/悬浮窗禁用, 不给"点了会亮但没反应"的假状态
+            fn = self._navbar_update
+            setter = getattr(fn, "set_ai_ok", None) if fn is not None else None
+            if setter is not None:
+                setter(browser_tab)
         except Exception:
             _log_exc("ai/sync")
 
@@ -866,6 +871,8 @@ class ShellApi:
         if p is None:
             return "no-panel"
         try:
+            if not p.is_open() and not bool(p.st.get("tab_ok")):
+                return "blocked"   # 信息流/悬浮窗: 面板本来就不该出现, 别让 chip 假装打开
             on = p.toggle()
         except Exception:
             _log_exc("ai/toggle")
@@ -2174,6 +2181,7 @@ def shell_main(e2e_url=None, e2e_float_url=None, e2e_float_resize_url=None,
             nav_update = install_navbar(
                 win, api, top=getattr(strip_update, "bar_h", 32) if strip_update else 32,
                 bg_getter=lambda: app.sget("ui_bg_scheme"),
+                accent_getter=lambda: app.sget("float_ball_accent"),
                 bookmarks=bm_store,
                 title_getter=lambda: (api.active_page() or {}).get("title") or "")
             api.bind_navbar(nav_update)

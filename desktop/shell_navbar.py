@@ -18,13 +18,32 @@ import threading
 
 NAV_H = 40   # 逻辑高度(px); DPI 换算经 nav_h(scale) —— 对标 Chrome/Edge 的 40 上下
 
+# 图标字号(点)。★ 不要乘 scale: Font 的尺寸是**点**, GDI+ 会按控件 DPI 再换算一次,
+# 再乘 scale 就是双重放大 —— 150% 下 11pt 变 33px, 图标顶到工具栏上下沿、和邻居互相压。
+# 去掉 *scale 之后: 100% DPI 外观与旧版一致, 高 DPI 自动保持"字号 / 栏高"的固定比例。
+ICON_PT = 11.0
+
 
 def nav_h(scale=1.0):
     return max(32, int(NAV_H * scale))
 
 
+def set_cue(tb, text):
+    """空地址栏的占位文案(EM_SETCUEBANNER)。
+
+    没有它, 地址栏为空时就是一大条空白胶囊 —— 最直接的"廉价"信号
+    (见 docs/TOPBAR.md §2.3)。占位由系统按 COLOR_GRAYTEXT 画, 天然比网址暗一档。
+    """
+    try:
+        import ctypes
+        hwnd = int(tb.Handle.ToInt64())
+        ctypes.windll.user32.SendMessageW(hwnd, 0x1501, 1, ctypes.c_wchar_p(text))
+    except Exception:
+        pass
+
+
 def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
-                   title_getter=None):
+                   title_getter=None, accent_getter=None):
     """在窗口 y=top 处安装导航工具栏(须在标签栏 install_strip 之后调用)。
 
     bookmarks: shell_bookmarks.BookmarkStore —— 给出时在刷新右侧多一个 ☆/★ 按钮
@@ -45,7 +64,9 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
     h = nav_h(scale)
     st = {
         "url": "", "back": False, "fwd": False, "loading": False,
-        "ai_on": False,       # 右侧 AI 助手面板是否展开(按钮高亮用)
+        "ai_on": False,       # 右侧 AI 助手面板是否展开(chip 的展开态)
+        "ai_ok": True,        # 当前标签能不能用 AI(信息流/悬浮窗=不能)
+        "chip_hover": False,  # 指针落在 AI chip 上
         "hover": None,        # "back" / "fwd" / "reload"
         "edit": False,        # 地址栏正在编辑(聚焦) —— 期间不覆盖显示值
         "tb_hover": False,    # 指针在地址栏文字上(未悬停时文字降为 70% 不透明度)
@@ -68,19 +89,18 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
     try:
         from System.Drawing import FontFamily
         FontFamily("Segoe MDL2 Assets")
-        icon_font = Font("Segoe MDL2 Assets", 11.0 * scale)
+        icon_font = Font("Segoe MDL2 Assets", ICON_PT)
         glyphs = {"back": "\uE72B", "fwd": "\uE72A", "reload": "\uE72C",
                   "lock": "\uE72E", "globe": "\uE774", "search": "\uE721",
                   "star": "\uE734", "star_on": "\uE735"}
     except Exception:
-        icon_font = Font("Microsoft YaHei", 10.5 * scale)
+        icon_font = Font("Microsoft YaHei", ICON_PT - 0.5)
         glyphs = {"back": "\u2190", "fwd": "\u2192", "reload": "\u21BB",
                   "lock": "", "globe": "\u25CB", "search": "\u2315",
                   "star": "\u2606", "star_on": "\u2605"}
     # ★ 地址栏用 Segoe UI(缺中文时 GDI+ 自动 font-linking 到雅黑): 雅黑的拉丁字母
     #   又宽又钝, 一行网址里英文/数字占大头, 用雅黑一眼就廉价。
     tb_font = Font("Segoe UI", 9.0 * scale)
-    ai_font = Font("Segoe UI", 8.0 * scale, FontStyle.Bold)   # AI 圆钮里的 "AI"
 
     # 按钮贴紧成一"组"(Chrome 的后退/前进/刷新之间没有间隙), 圆形悬停底才连得起来
     BTN_W, BTN_GAP, MARGIN = int(32 * scale), 0, int(8 * scale)
@@ -105,11 +125,16 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
         return {"back": st["back"], "fwd": st["fwd"], "reload": True,
                 "star": bool(st["url"])}[name]
 
-    # ---- 右端 AI 助手开关(常驻: 面板开合的唯一入口) ----
-    AI_W = int(40 * scale)
+    # ---- AI 入口: 收进胶囊右端, 不再在栏尾挂一颗孤立圆钮 ----
+    # 位置本身就是提示("在这里提问"), 也顺带把顶栏还原成"导航组 + 胶囊"两段,
+    # 栏尾不再有需要靠描边自证身份的孤岛按钮(见 docs/TOPBAR.md §4.1)。
+    CHIP_W, CHIP_H = int(28 * scale), int(24 * scale)
+    CHIP_PAD = int(4 * scale)        # chip 右边缘距胶囊右端: 与圆角同心, 不贴边
 
-    def _ai_rect():
-        return (bar.Width - MARGIN - AI_W, 0, AI_W, h)
+    def _chip_rect():
+        px, py, pw, ph = _pill_rect()
+        return (px + pw - CHIP_PAD - CHIP_W, py + (ph - CHIP_H) // 2,
+                CHIP_W, CHIP_H)
 
     def _btn_rects():
         x, bw, gap = MARGIN, BTN_W, BTN_GAP
@@ -122,7 +147,7 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
         last = _names()[-1]
         end = rects[last][0] + rects[last][2]
         tx = end + int(10 * scale)
-        right = bar.Width - MARGIN - AI_W - int(8 * scale)
+        right = bar.Width - MARGIN
         ph = h - PILL_INSET * 2
         return (tx, (h - ph) // 2, max(int(60 * scale), right - tx), ph)
 
@@ -135,7 +160,7 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
         px, py, pw, ph = _pill_rect()
         rad = ph // 2
         tx = px + int(9 * scale) + _site_icon_w() + int(6 * scale)
-        right = px + pw - rad - int(2 * scale)
+        right = px + pw - CHIP_PAD - CHIP_W - int(6 * scale)
         hh = _tb_height()
         return (tx, py + (ph - hh) // 2, max(int(40 * scale), right - tx), hh)
 
@@ -153,6 +178,7 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
     tb.BackColor = st["tb_bg"]
     tb.ForeColor = st["tb_fg"]
     tb.TabStop = True
+    set_cue(tb, "搜索或输入网址")
 
     def _place_tb():
         r = _tb_rect()
@@ -210,6 +236,14 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
     sf.LineAlignment = StringAlignment.Center
     sf.FormatFlags = StringFormatFlags.NoWrap
     sf.Trimming = StringTrimming.EllipsisCharacter
+    # 站点图标单独一份格式: 关掉裁剪。MDL2 的搜索/锁字形带负 bearing(墨迹比 advance
+    # 更靠左), 布局矩形只给 16*scale 时 GDI+ 会沿矩形左边界把左半边圆弧切掉 ——
+    # 100% DPI 下刚好躲过去, 125%/150% 必现(用户截图: 放大镜只剩右半圈 + 手柄)。
+    sf_icon = StringFormat()
+    sf_icon.Alignment = StringAlignment.Center
+    sf_icon.LineAlignment = StringAlignment.Center
+    sf_icon.FormatFlags = StringFormatFlags.NoClip
+    sf_icon.Trimming = getattr(StringTrimming, "None")   # None 是 Python 关键字, 不能写点号
 
     def _rounded_path(x, y, w, h_, rad):
         p = GraphicsPath()
@@ -218,6 +252,20 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
         p.AddArc(x + w - d, y, d, d, 270, 90)
         p.AddArc(x + w - d, y + h_ - d, d, d, 0, 90)
         p.AddArc(x, y + h_ - d, d, d, 90, 90)
+        p.CloseFigure()
+        return p
+
+    def _sparkle_path(cx, cy, r):
+        """四角星(AI 火花): 四条边各是一条控制点压向中心的贝塞尔 —— 凹边, 不是五角星。"""
+        p = GraphicsPath()
+        pts = ((cx, cy - r), (cx + r, cy), (cx, cy + r), (cx - r, cy))
+        k = r * 0.22
+        ctrl = ((cx + k, cy - k), (cx + k, cy + k),
+                (cx - k, cy + k), (cx - k, cy - k))
+        for i in range(4):
+            a, b, c = pts[i], pts[(i + 1) % 4], ctrl[i]
+            p.AddBezier(float(a[0]), float(a[1]), float(c[0]), float(c[1]),
+                        float(c[0]), float(c[1]), float(b[0]), float(b[1]))
         p.CloseFigure()
         return p
 
@@ -276,28 +324,37 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
             sic = glyphs.get("globe")
         if sic:
             iw = _site_icon_w()
+            # 左右各留 4 逻辑像素余量(中心不变): 配合 sf_icon 的 NoClip, 字形不会再被裁。
+            pad = int(4 * scale)
             g.DrawString(sic, icon_font, SolidBrush(st["fg_dim"]),
-                         RectangleF(float(px + int(9 * scale)),
-                                    float(py), float(iw), float(ph)), sf)
-        # ---- 右端 AI 助手按钮: 圆形, 开着 = 强调色实心底 + 强调色文字 ----
-        ar = _ai_rect()
-        acx, acy, ad = _circle(ar[0], ar[1], ar[2], ar[3])
-        ai_on = bool(st.get("ai_on"))
+                         RectangleF(float(px + int(9 * scale) - pad),
+                                    float(py), float(iw + pad * 2), float(ph)),
+                         sf_icon)
+        # ---- AI 入口 chip: 在胶囊右端, 只变底与色, 元素不位移 ----
+        # 平时**不描边**(描边在这套设计里只表达状态); 展开用 accent 轻底 + accent 图标,
+        # 不用实心块 —— 深色顶栏上实心强调色太重, 会把视线从地址栏抢走。
+        cr = _chip_rect()
+        ai_ok = bool(st.get("ai_ok"))
+        ai_on = bool(st.get("ai_on")) and ai_ok
+        chip_hi = bool(st.get("chip_hover")) and ai_ok
+        crad = int(7 * scale)
         if ai_on:
-            # 开着 = 强调色实心圆 + 白字: 一眼看出"面板现在开着"(淡底+同色字太虚)
-            g.FillEllipse(SolidBrush(st["accent"]),
-                          float(acx), float(acy), float(ad), float(ad))
-        elif st["hover"] == "ai":
-            g.FillEllipse(SolidBrush(st["hover_bg"]),
-                          float(acx), float(acy), float(ad), float(ad))
+            g.FillPath(SolidBrush(_blend(st["accent"], st["tb_bg"], 0.16)),
+                       _rounded_path(cr[0], cr[1], cr[2], cr[3], crad))
+        elif chip_hi:
+            g.FillPath(SolidBrush(st["hover_bg"]),
+                       _rounded_path(cr[0], cr[1], cr[2], cr[3], crad))
+        if not ai_ok:
+            icon_c = _blend(st["fg_dim"], st["tb_bg"], 0.40)   # 禁用: 降到 0.4, 不隐藏
+        elif ai_on:
+            icon_c = st["accent"]
+        elif chip_hi:
+            icon_c = st["fg"]
         else:
-            # 关着时给一圈细描边: 不然 "AI" 两个字母像个静态标签, 看不出是按钮
-            g.DrawEllipse(Pen(st["tb_border"], 1.0),
-                          float(acx), float(acy), float(ad), float(ad))
-        g.DrawString("AI", ai_font,
-                     SolidBrush(Color.White if ai_on
-                                else (st["fg"] if st["hover"] == "ai" else st["fg_dim"])),
-                     RectangleF(float(ar[0]), float(ar[1]), float(ar[2]), float(ar[3])), sf)
+            icon_c = st["fg_dim"]
+        g.FillPath(SolidBrush(icon_c),
+                   _sparkle_path(cr[0] + cr[2] / 2.0, cr[1] + cr[3] / 2.0,
+                                 6.4 * scale))
 
     # ---- 交互: 按钮悬停/点击(禁用态不响应) ----
     def _btn_at(x, y):
@@ -306,23 +363,36 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
                 return name
         return None
 
+    def _in_chip(x, y, r=None):
+        r = r or _chip_rect()
+        return r[0] <= x <= r[0] + r[2] and r[1] <= y <= r[1] + r[3]
+
     def on_mouse_move(_sender, args):
         name = _btn_at(args.X, args.Y)
         if name and not _enabled(name):
             name = None   # 禁用按钮不给悬停高亮
-        if name is None:
-            ar = _ai_rect()
-            if ar[0] <= args.X <= ar[0] + ar[2] and ar[1] <= args.Y <= ar[1] + ar[3]:
-                name = "ai"
         if name != st["hover"]:
             st["hover"] = name
+            bar.Invalidate()
+        # AI chip 在胶囊内部, 独立命中(不属于左侧按钮组)
+        cr = _chip_rect()
+        on_chip = _in_chip(args.X, args.Y, cr)
+        if on_chip != st.get("chip_hover"):
+            st["chip_hover"] = on_chip
+            try:
+                bar.Cursor = (WinForms.Cursors.Hand
+                              if (on_chip and st.get("ai_ok"))
+                              else WinForms.Cursors.Default)
+            except Exception:
+                pass
             bar.Invalidate()
         # 地址栏的悬停态按**整个胶囊**算(不是按文字框): 指针落在胶囊边缘也算悬停。
         # 注意指针落到子控件 TextBox 上时本 Panel 会收到 MouseLeave, 所以这里不据
         # MouseLeave 收尾, 只看坐标(以及 tb 自己的进出)。
+        # chip 那块不算胶囊悬停 —— 否则悬停 chip 会让整条胶囊一起描边。
         pr = _pill_rect()
-        _set_tb_hover(pr[0] <= args.X <= pr[0] + pr[2] and
-                      pr[1] <= args.Y <= pr[1] + pr[3])
+        _set_tb_hover((pr[0] <= args.X <= pr[0] + pr[2] and
+                       pr[1] <= args.Y <= pr[1] + pr[3]) and not on_chip)
 
     def on_mouse_leave(_sender, _args):
         if st["hover"] is not None:
@@ -330,17 +400,15 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
             bar.Invalidate()
 
     def on_click(_sender, args):
-        name = _btn_at(args.X, args.Y)
-        if name is None:
-            ar = _ai_rect()
-            if ar[0] <= args.X <= ar[0] + ar[2] and ar[1] <= args.Y <= ar[1] + ar[3]:
-                name = "ai"
-        if name == "ai":
+        if _in_chip(args.X, args.Y):
+            if not st.get("ai_ok"):
+                return      # 禁用态: 不给任何反馈, 由窗口壳在切标签时说明原因
             try:
                 api.toggle_ai_panel()
             except Exception:
                 pass
             return
+        name = _btn_at(args.X, args.Y)
         if name == "back" and st["back"]:
             api.nav_back()
         elif name == "fwd" and st["fwd"]:
@@ -514,9 +582,32 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
         except Exception:
             pass
 
+    def set_accent(raw):
+        """强调色(与标签栏/悬浮球/面板同源: float_ball_accent)。
+
+        以前这里写死 #4C8DFF, 而面板用的是 float_ball_accent(默认粉) —— 同一屏两个
+        强调色, 是"廉价感"最典型的来源之一。
+        """
+        try:
+            v = str(raw or "").strip()
+            if not re.match(r"^#?[0-9a-fA-F]{6}$", v):
+                return
+            v = v.lstrip("#")
+            c = Color.FromArgb(int(v[0:2], 16), int(v[2:4], 16), int(v[4:6], 16))
+            if c.ToArgb() == st["accent"].ToArgb():
+                return
+            st["accent"] = c
+            if bar.InvokeRequired:
+                bar.BeginInvoke(WinForms.MethodInvoker(bar.Invalidate))
+            else:
+                bar.Invalidate()
+        except Exception:
+            pass
+
     def scheme_watch():
         import time as _t
         last = None
+        last_ac = None
         while True:
             try:
                 if bg_getter:
@@ -524,11 +615,16 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
                     if cur != last:
                         last = cur
                         set_scheme(cur)
+                if accent_getter:
+                    ac = accent_getter()
+                    if ac != last_ac:
+                        last_ac = ac
+                        set_accent(ac)
             except Exception:
                 pass
             _t.sleep(2)
 
-    if bg_getter:
+    if bg_getter or accent_getter:
         threading.Thread(target=scheme_watch, daemon=True, name="msx-navbar-scheme").start()
 
     def set_fullscreen(on):
@@ -581,7 +677,33 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
         else:
             _apply()
 
+    def set_ai_ok(v):
+        """当前标签能否用 AI(信息流/悬浮窗 = False): chip 进禁用态。
+
+        以前这里没有开关, 于是在信息流标签上点那颗圆钮会"变亮但什么都不打开" ——
+        说谎的控件比没有按钮更糟(见 docs/TOPBAR.md §4.6)。
+        """
+        v = bool(v)
+        if v == st.get("ai_ok"):
+            return
+        st["ai_ok"] = v
+        if not v:
+            st["chip_hover"] = False
+
+        def _apply():
+            try:
+                bar.Cursor = WinForms.Cursors.Default
+                bar.Invalidate()
+            except Exception:
+                pass
+        if bar.InvokeRequired:
+            bar.BeginInvoke(WinForms.MethodInvoker(_apply))
+        else:
+            _apply()
+
     update.set_ai = set_ai
+    update.set_ai_ok = set_ai_ok
+    update.set_accent = set_accent
 
     update.bar = bar      # bug6: 网页全屏时窗口壳要整条隐藏导航栏(按钮+地址栏)
     update.set_fullscreen = set_fullscreen   # bug6: 窗口壳按网页全屏状态显隐导航栏

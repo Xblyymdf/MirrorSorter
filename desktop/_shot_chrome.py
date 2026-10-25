@@ -105,7 +105,11 @@ def _render(scheme, path, states=None, width=1200, url=URL):
     u_nav(url, True, False)
     for k, v in (states or {}).items():
         # 直接改内部状态: 悬停态在无真鼠标的环境下没法靠事件触发, 但绘制分支必须覆盖到
-        if k.startswith("nav:"):
+        if k == "nav:accent":
+            u_nav.set_accent(v)
+        elif k == "nav:ai_ok":
+            u_nav.set_ai_ok(v)
+        elif k.startswith("nav:"):
             u_nav.st[k[4:]] = v
         else:
             u_strip.st[k] = v
@@ -150,6 +154,14 @@ def main(argv):
     # 窄窗: 标签会被挤窄(旧版这里会把最右标签的 ✕ 顶出栏外, 用户截过图)
     _render(DARK, os.path.join(OUT, "chrome_narrow.png"), width=760,
             states={"hover_tab": 3})
+    # AI 入口 chip: 悬停 / 展开(展开色 = 设置里的强调色, 默认粉)
+    _render(DARK, os.path.join(OUT, "chrome_ai.png"),
+            states={"nav:chip_hover": True})
+    _render(DARK, os.path.join(OUT, "chrome_ai_on.png"),
+            states={"nav:ai_on": True, "nav:accent": "#fb7299"})
+    # 信息流/悬浮窗: 没有可问的网页 → chip 禁用(走 set_ai_ok, 不是直接改 st)
+    _render(DARK, os.path.join(OUT, "chrome_ai_off.png"), url="",
+            states={"nav:ai_ok": False})
     _render(DARK, os.path.join(OUT, "chrome_hover.png"), states={
         "hover_tab": 3, "hover_close": 3, "hover_add": True, "hover_btn": "close",
         "nav:hover": "back", "nav:tb_hover": True, "nav:ai_on": True,

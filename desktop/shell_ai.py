@@ -594,6 +594,9 @@ class AIPanel:
             except Exception:
                 pass
         self._ui(self.layout)
+        if v and self.st.get("tab_ok"):
+            # 打开就接管焦点: 用户点 AI 是为了马上说话, 不该再点一次输入框
+            self._ui(self.focus_input)
         cb = self.on_change
         if cb is not None:
             try:
@@ -604,6 +607,25 @@ class AIPanel:
     def toggle(self):
         self.set_open(not self.st["open"])
         return self.st["open"]
+
+    def focus_input(self):
+        """把键盘焦点送进面板的输入框(UI 线程调用; 失败不影响开合)。"""
+        c = self.st.get("ctrl")
+        if c is None:
+            return
+        try:
+            core = c.CoreWebView2
+            if core is None:
+                return
+            try:
+                c.Focus()
+            except Exception:
+                pass
+            core.ExecuteScriptAsync(
+                "(function(){var e=document.getElementById('input');"
+                "if(e){e.focus();}})()")
+        except Exception:
+            pass
 
     def sync_for_tab(self, browser_tab):
         """激活标签变化: 信息流标签不显示面板(它自己右栏就有 AI 聊天)。"""

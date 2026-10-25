@@ -546,10 +546,13 @@
   }
   // 深度 1（白天最亮）～ 10（黑夜最暗）。0 = 跟随界面模式（白天 1 / 黑夜 10）。
   const bgDepthNow = () => {
-    const d = parseInt(prefs.bgDepth, 10);
+    const d = parseFloat(prefs.bgDepth);   // 0.5 一档 → 必须 parseFloat, parseInt 会把 3.5 截成 3
     if (d >= 1 && d <= 10) return d;
     return prefs.theme === "light" ? 1 : 10;
   };
+  // 深度显示: 整数不带小数点(3), 半档保留一位(3.5)
+  const fmtDepth = (d) => (Math.abs(d - Math.round(d)) < 1e-6
+    ? String(Math.round(d)) : d.toFixed(1));
   const bgHslAt = (depth) => {
     const t = (depth - 1) / 9;
     const c = hexToHsl(prefs.bgHex);
@@ -643,9 +646,9 @@
     renderBgRow();
     const sl = $("#bgDepth");
     if (sl) {
-      const d = parseInt(prefs.bgDepth, 10);
+      const d = parseFloat(prefs.bgDepth);
       sl.value = (d >= 1 && d <= 10) ? d : (prefs.theme === "light" ? 1 : 10);
-      $("#bgDepthVal").textContent = (d >= 1 && d <= 10) ? String(d)
+      $("#bgDepthVal").textContent = (d >= 1 && d <= 10) ? fmtDepth(d)
         : ("跟随模式 · " + (prefs.theme === "light" ? 1 : 10));
       paintRanges();   // 滑条填充段跟着值走
     }
@@ -1979,9 +1982,9 @@
     savePrefs(); applyPrefs();
   };
   $("#bgDepth").addEventListener("input", (e) => {
-    const d = parseInt(e.target.value, 10);
+    const d = parseFloat(e.target.value);
     prefs.bgDepth = d;
-    $("#bgDepthVal").textContent = String(d);
+    $("#bgDepthVal").textContent = fmtDepth(d);
     savePrefs(); applyBg(); renderBgRow(); pushTheme();
   });
   $("#bgDepth").addEventListener("change", savePrefs);

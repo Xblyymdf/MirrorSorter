@@ -473,6 +473,11 @@ check("设置页: 背景预设/自定义/深度滑条在强调色设置下方",
       0 < html.find("customAccentRow") < html.find("bgRow")
       < html.find("bgCustomRow") < html.find("bgDepthRow") < html.find("fontRow"))
 _appjs = io.open(os.path.join(PROJECT, "web", "app.js"), encoding="utf-8").read()
+
+check("背景: 颜色深度滑条 0.5 一档(值必须按小数存, parseInt 会把 3.5 截成 3)",
+      'id="bgDepth"' in html and 'step="0.5"' in html
+      and "parseFloat(prefs.bgDepth)" in _appjs
+      and "parseInt(prefs.bgDepth" not in _appjs)
 check("背景系统: 自定义色+1..10深度派生全套表面色",
       "hexToHsl" in _appjs and 'set("--panel"' in _appjs
       and 'set("--input"' in _appjs and "bgDepth" in _appjs and "bgHex" in _appjs)
@@ -623,8 +628,9 @@ check("顶栏结构5 地址栏是胶囊(两端全圆) + 站点图标在胶囊内
       and "prad = ph // 2" in _nb_src
       and "_rounded_path(px, py, pw, ph, prad)" in _nb_src
       and "st[\"accent\"], max(1.0, 1.4 * scale)" in _nb_src
-      # 原生 TextBox 必须内缩在胶囊里, 否则它会把圆角切方
-      and "right = px + pw - rad - int(2 * scale)" in _nb_src)
+      # 原生 TextBox 必须内缩在胶囊里(否则会把圆角切方), 且要给胶囊右端的 AI chip 让位
+      and "right = px + pw - CHIP_PAD - CHIP_W - int(6 * scale)" in _nb_src
+      and "def _chip_rect()" in _nb_src)
 check("顶栏结构6 悬停底色取 active↔bar 中点(层次: 栏底 < 悬停 < 激活)",
       "def _mix(c, base, k)" in _st_src
       and 'st["tab_hover"] = _mix(st["tab_active"], st["bar"], 0.5)' in _st_src

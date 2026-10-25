@@ -395,12 +395,25 @@ check("57 shell_pages: exec_js 只把发起投到 UI 线程(在 UI 线程等 Tas
       and "if task.IsCompleted:" in sp)
 
 nb = src("shell_navbar.py")
-check("58 导航栏: AI 开关按钮 + set_ai 接口",
-      'AI_W = int(' in nb and "def set_ai(on)" in nb
-      and "update.set_ai = set_ai" in nb and 'api.toggle_ai_panel()' in nb
-      and "def _ai_rect()" in nb)
-check("59 导航栏: 地址栏给 AI 按钮让位(不被压住)",
-      "right = bar.Width - MARGIN - AI_W - int(8 * scale)" in nb)
+check("58 导航栏: AI 入口是胶囊内的 chip + set_ai/set_ai_ok 接口",
+      "CHIP_W, CHIP_H = int(" in nb and "def set_ai(on)" in nb
+      and "update.set_ai = set_ai" in nb and "update.set_ai_ok = set_ai_ok" in nb
+      and 'api.toggle_ai_panel()' in nb and "def _chip_rect()" in nb
+      and "def _sparkle_path(" in nb)
+check("59 导航栏: 原生地址栏给 chip 让位(不被不透明矩形压住)",
+      "right = px + pw - CHIP_PAD - CHIP_W - int(6 * scale)" in nb)
+check("59b 导航栏: 强调色与设置同源(不再写死 #4C8DFF)",
+      "def set_accent(raw)" in nb and "update.set_accent = set_accent" in nb
+      and 'accent_getter=lambda: app.sget("float_ball_accent")' in aw)
+check("59c 导航栏: 信息流/悬浮窗上 chip 进禁用态(不留假高亮)",
+      '"ai_ok"' in nb and "set_ai_ok" in aw
+      and 'return "blocked"' in aw)
+check("59d 导航栏: 站点图标不被布局矩形裁掉(NoClip + 左右余量, 高 DPI 必现)",
+      "sf_icon" in nb and "StringFormatFlags.NoClip" in nb
+      and "iw + pad * 2" in nb)
+check("59e 导航栏: 图标字号不乘 scale(点是 DPI 无关单位, 乘了就是双重放大)",
+      "ICON_PT" in nb and '"Segoe MDL2 Assets", ICON_PT' in nb
+      and "11.0 * scale" not in nb)
 
 for f, need in (("web/panel.html", 'id="msgs"'), ("web/panel.css", "--accent"),
                 ("web/panel.js", "browser: true"), ("web/panel.js", "/api/panel/set")):

@@ -255,6 +255,35 @@ python app_window.py --e2e-chrome
 - 断言"导航栏首行 == 导航栏底色"是**同义反复**（接缝再大也 PASS），必须写成
   "标签条末行 == 导航栏首行 == 工具栏底色"。
 
+### 本版专项（v0.4.45dsk 顶栏 AI 入口收进胶囊）
+
+```bat
+python _shot_chrome.py        :: 新增 chrome_ai.png(悬停) / chrome_ai_on.png(展开, 强调色)
+python test_ai_panel.py       :: 58 / 59 / 59b / 59c 是这次的结构性约定
+python test_shell.py          :: 顶栏结构5 改成"TextBox 还得给 chip 让位"
+```
+
+- 栏尾那颗"描边圆环 + `AI` 文字"的孤岛圆钮删了：入口改成地址栏胶囊右端 28×24 的 chip
+  （四角星矢量、平时**不描边**）。展开态 = accent 16% 轻底 + accent 图标，不用实心块 ——
+  深色顶栏上实心强调色太重，会把视线从地址栏抢走。
+- accent 不再写死 `#4C8DFF`：`install_navbar(..., accent_getter=)` 吃 `float_ball_accent`，
+  与标签栏/悬浮球/AI 面板同源。以前同屏两个强调色，是最典型的廉价感来源。
+- 空地址栏用 `EM_SETCUEBANNER` 打占位「搜索或输入网址」，不再是一大条空白胶囊。
+- `set_ai_ok(tab_ok)`：信息流/悬浮窗上 chip 进禁用态，`toggle_ai_panel` 返回 `"blocked"`；
+  以前那里点下去会高亮但面板永不出现（说谎的控件比没有按钮更糟）。
+- `AIPanel.focus_input()`：打开面板后立刻把焦点送进输入框（以前还得再点一次输入框）。
+- 完整设计规范与未做的 P1/P2（Alt+A、tooltip、`?` 前缀直问、胶囊限宽居中）见
+  [TOPBAR.md](TOPBAR.md)。
+
+**v0.4.46dsk 补丁（站点图标被裁）**：150% DPI 下地址栏左端的放大镜只剩右半圈 + 手柄 ——
+裁切线就是 `DrawString` 的布局矩形边界。MDL2 的搜索/锁字形带**负 bearing**（墨迹比 advance
+更靠左），而布局矩形只给了 `16*scale`，GDI+ 就沿矩形左边把墨迹切掉。修法：站点图标单独用一份
+`sf_icon`（`StringFormatFlags.NoClip` + `Trimming=None`），矩形左右各留 `4*scale` 余量（中心不变）。
+
+★ 这个 bug 在 `_shot_chrome.py` 里**永远看不出来**：它固定 `form._scale=1.0` 且进程 DPI-unaware。
+复现必须走 `_probe_icon445dpi.py`（先 `SetProcessDpiAwareness(2)`，再按 1.25/1.5 渲染）。
+改任何导航栏字形（站点图标 / 锁 / 地球 / 放大镜）都要用它过一遍。
+
 ### 本版专项（v0.4.42dsk 右侧 AI 面板）
 
 ```bat
