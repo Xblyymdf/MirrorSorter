@@ -178,7 +178,12 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
     tb.BackColor = st["tb_bg"]
     tb.ForeColor = st["tb_fg"]
     tb.TabStop = True
-    set_cue(tb, "搜索或输入网址")
+    # ★ set_cue 不在这里调(v0.4.50 修): 它要读 tb.Handle, 而取 Handle 会当场创建句柄。
+    #   本函数是在 gui_ready 的**后台线程**上跑的, 在这里创建出来的句柄再让 UI 线程的 bar
+    #   收养, WinForms 会抛「在某个线程上创建的控件不能成为在另一个线程上创建的控件的父级」,
+    #   结果是 bar.Controls.Add(tb) 失败 —— **整个地址栏输入框都没装上**(看得见胶囊和图标,
+    #   但既没有占位文案也打不了字)。exe 没有 stdout, 这个异常从 v0.4.45 起一直是隐形的。
+    #   正确时机: 等 tb 真的成了 bar 的子控件, 在 _install 里(UI 线程)再设。
 
     def _place_tb():
         r = _tb_rect()
@@ -515,6 +520,9 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
             # tb 必须是 bar 的子控件(坐标相对工具栏) —— 挂到 form 上会落到标签栏那行
             bar.Controls.Add(tb)
             tb.BringToFront()
+            # 占位文案必须在这之后设(原因见 tb.TabStop 上面的注释): 先让 tb 成为 bar 的
+            # 子控件(句柄由 UI 线程创建), 再取 Handle 就安全了。
+            set_cue(tb, "搜索或输入网址")
         except Exception:
             import traceback
             traceback.print_exc()

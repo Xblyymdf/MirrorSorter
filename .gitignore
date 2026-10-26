@@ -116,6 +116,11 @@ desktop/_vis/fasttext_demo/*.json
 !desktop/_test_update_ui_v041.js
 !desktop/_verify_exe_v041.py
 
+# v0.4.48dsk: 分栏拖动预览线的缩放回归。
+# 线上 bug 是「字体调大后那条绿线跑到右栏里」—— 静态断言看不出问题, 必须把 app.js
+# 里真实的指针拖动代码抽出来、配上按 zoom 语义算几何的假 DOM 跑才算数。
+!desktop/_test_splitghost_zoom.js
+
 # v0.4.2dsk: search/fetch/anti-clustering regression assets
 !desktop/_test_v042.py
 !desktop/_verify_exe_v042.py
@@ -149,3 +154,9 @@ desktop/_vis/fasttext_demo/*.json
 # v0.4.43dsk: 顶栏(标签条+导航栏)视觉验收。原生自绘的 UI 改一个半径/间距, 靠读代码
 # 判断不了好不好看, 也判断不了弧线方向反了没有(不报错, 只会变丑) —— 真渲染成 PNG 比对。
 !desktop/_shot_chrome.py
+
+# v0.4.50dsk: 托盘/开机自启运行层验收(真写注册表后原样还原 + 非法值不落库)。
+!desktop/_test_tray450.py
+# v0.4.51dsk: 单实例验收(单元 + 真两进程: 第二个必须自己退出并把第一个的窗口叫出来)。
+# 加 --exe 可跑打包态 —— onefile 是父子两个进程, 查窗口要按进程树。
+!desktop/_test_single451.py

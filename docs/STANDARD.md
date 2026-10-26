@@ -170,6 +170,7 @@ python test_chat.py        :: AI 聊天
 python test_ai_panel.py    :: 右侧 AI 面板（状态/桥/工具分派/宽度夹取/分栏修复）
 python _shot_chrome.py     :: 顶栏（标签条+导航栏）真渲染成 PNG：深/浅/悬停/窄窗四张
 node  _test_ai_page_js.js  :: 注入网页的助手脚本（vm + 假 DOM，断言真的发了哪些调用）
+node  _test_splitghost_zoom.js :: 分栏拖动预览线（抽真实代码 + 按 zoom 语义的假 DOM）
 ```
 
 `_shot_chrome.py` 是**原生自绘 UI 的验收工具**：顶栏是 WinForms GDI+ 画的，改一个半径/
@@ -283,6 +284,117 @@ python test_shell.py          :: 顶栏结构5 改成"TextBox 还得给 chip 让
 ★ 这个 bug 在 `_shot_chrome.py` 里**永远看不出来**：它固定 `form._scale=1.0` 且进程 DPI-unaware。
 复现必须走 `_probe_icon445dpi.py`（先 `SetProcessDpiAwareness(2)`，再按 1.25/1.5 渲染）。
 改任何导航栏字形（站点图标 / 锁 / 地球 / 放大镜）都要用它过一遍。
+
+### 本版专项（v0.4.48dsk 分栏预览线跟着缩放走）
+
+```bat
+node _test_splitghost_zoom.js           :: 33 项：把手/跟手/落宽/夹取/折叠/无 NaN
+python test_shell.py                    :: 「分栏预览线」三条静态守门
+python _verify_exe_panel.py             :: 归档 app.js 里必须是新写法
+```
+
+- **症状**：字体大小调到「中/大」后，拖分隔条的那条绿线跑到右栏里面去，鼠标明明还在分隔条上，
+  而且越往右错得越多。
+- **根因**：界面缩放是 `document.body.style.zoom`（见 `applyPrefs`）。`#splitGhost` 原来挂在
+  `<body>` 下，于是它自己的 `translate3d(Xpx)` 又被 zoom 乘了一次 ——
+  `getBoundingClientRect()` 返回的 `rect0.left` **已经是缩放后的可视坐标**，写进被 zoom 的
+  子树里就成了 `X × z`。z=1.15 时一条本该在 674 的线画到 775。
+- **修法**：预览线改挂 `<html>`（不在 zoom 子树里，1px 就是 1 个可视像素）；同时把
+  `clientX` 的可视位移**除 z** 换算成本地宽度、把 `(target-w0)` 的本地宽度**乘 z** 换算回可视位移。
+  只修一半不行：线跟手了栏宽还是错的，反之亦然。
+- ★ **一般规律（以后写任何浮层都要记住）**：本项目 `body{zoom}` 参与界面缩放，所以
+  - `getBoundingClientRect()` / `clientX` = **可视像素**（含缩放）；
+  - `prefs.*W` / `--leftW` / `--rightW` = **本地像素**（不含缩放）；
+  - 挂 `body` 下的 `position:fixed` 元素，定位值会被再放大 z 倍，`width` 也会。
+  跨这两套坐标系时必须显式乘除 z（`uiZoom()` 读 `--ui-zoom`，缺省 1）。
+- ★ 这类 bug **静态断言抓不住**（写进去的数看着是对的，错在渲染时被放大一次），所以
+  `_test_splitghost_zoom.js` 把 `app.js` 里真实的 `pointerdown` 代码段抽出来、配一套按
+  zoom 语义算几何的假 DOM 真跑；它有敏感性自检（旧实现必挂 15 项）。
+- `_verify_exe_panel.py` 现在对 `web/index.html` / `app.js` / `style.css` 做**逐字节比对**，
+  堵「改完 web/ 没重新打包」这个老坑。
+
+### 本版专项（v0.4.51dsk 单实例：再点图标只叫回已有窗口）
+
+```bat
+python _test_single451.py    :: 单元 9 项 + 真两进程 10 项(第二个必须自己退出)
+python test_shell.py         :: 「单实例1~5」
+python _verify_exe_panel.py  :: 归档层: PYZ 必须有 shell_single
+```
+
+- 用户报修：后台（托盘）还跑着的时候又点了一次图标，结果**又开了一个进程**。原因是没有
+  判重 —— `run_server` 虽然端口占用时会复用服务，但窗口是新建的，于是两套窗口 + 第二套
+  WebView2 用户数据目录（第二套还会报目录占用），关掉其中一个还可能把共用的服务一起收掉。
+- `shell_single.py`：命名互斥量 `Local\MirrorSorter-<hash>-run` 判重，`...-show` 事件唤醒，
+  `...-ack` 回执。scope = **数据目录**（`normcase(abspath(DATA_DIR))`）：同一个存档就是一个
+  实例；`MIRRORSORTER_DATA_DIR` 指到隔离目录的自动化测试各自独立，不会被正跑的正式实例挡回去。
+- 三个必须记住的点：
+  1. `ERROR_ALREADY_EXISTS` 只能通过 `ctypes.get_last_error()` 读 → 必须
+     `WinDLL(..., use_last_error=True)`，否则 ctypes 自己会重置错误码、永远读到 0（判重彻底失效）。
+  2. `AllowSetForegroundWindow` 在 **user32**，不在 kernel32。写错过一次：整条 `wake()` 抛
+     AttributeError，被兜底成"当唯一实例"，反而变回多开 —— 而且静默，不看日志发现不了。
+  3. 前台权限不跨进程：新进程必须先把前台权借给旧进程（`ASFW_ANY`），否则旧窗口只在
+     任务栏闪一下，用户以为点了没反应。
+- 唤醒复用托盘「打开洞鉴虚明」那条路（`ShellApi.raise_window` → `Tray.show_window`），
+  所以从图标叫回来和从托盘叫回来行为一致（本来藏着就顺带换一屏新内容）。
+- 监听要在 `acquire` 成功那一刻就开（`single.start(_single_raise)`），不能等窗口 —— 冷启动
+  几十秒，用户完全可能在这期间再点一次。壳没就绪时只记 `_RAISE_TARGET["pending"]`，装好
+  之后补一次；**回执照样立刻发**，让第二个进程安静退出（实测 0.4 秒）。
+- 叫不醒（旧进程卡死）时给 MessageBox 指路（托盘右键 / 任务管理器），**绝不再起一个**去抢
+  同一个 WebView2 目录 —— 两个进程一起坏比"没反应"更糟。
+- 拿不到互斥量一律当唯一实例继续启动：宁可多开一个窗口，也不能"点了图标什么都不发生"。
+
+### 本版专项（v0.4.50dsk 后台常驻：托盘 / 开机自启 / 关窗换一批）
+
+```bat
+python app_window.py --e2e-tray   :: 真窗口托盘自测 9 项, 自己退出(约 25 秒)
+python test_shell.py              :: 「常驻1~7」+「顶栏结构9」
+python _test_tray450.py           :: 运行层 13 项(含真写注册表后原样还原)
+python _verify_exe_panel.py       :: 归档层: PYZ 必须有 shell_tray
+```
+
+- 用户诉求：每次打开都要十几秒到半分钟才凑够第一屏。做法是让它在后台先把内容抓好 ——
+  ① 开机自启（`--tray`，直接缩托盘不弹窗）② 关窗只缩托盘 ③ 关窗/缩托盘时换一批。
+  两个设置键 `ui_autostart` / `ui_close_to_tray` **默认都关**，且只在 `shell_info().tray`
+  为真的桌面壳里显示（安卓/浏览器打开时这两行不显示，否则点了没反应）。
+- **换一批 = `app.feed_rotate(wait)`，绝不清池**。池子清了而新内容还没抓到，下次打开就是
+  空白 + 干等，正好是要避免的那件事。缩托盘 `wait=0`（进程活着，构建跑完自己落冷缓存）；
+  真退出 `wait=2.5`（窗口没了看不到等待，但留太久会挡住"关掉马上又打开"）。
+- 托盘态启动用 `create_window(..., hidden=True)` + 后台 `_tray_warm()` 主动抓一轮：
+  **隐藏窗口里的 WebView2 定时器会被系统节流**，只靠页面轮询补池可能半天不动。
+- 真退出顺序：托盘图标 `dispose()` → `feed_rotate` → `app.shutdown`。`_ui()` 在
+  `form.IsDisposed` 时直接 return，所以"窗口已关还想摘图标"必须绕过它直接执行。
+- ★ `--e2e-tray` 的五项断言里有两条是"看不见就出事"的：**启动即隐藏**（开机不该弹窗）、
+  **点关闭被拦成隐藏但窗口没被销毁**（真关了 = 用户以为程序还在，实际后台抓取全白费）。
+
+### 本版专项（v0.4.49dsk 悬浮窗全屏黑屏）
+
+```bat
+python test_shell.py        :: 「悬浮窗全屏」「全屏轻补」「全屏可见性(行为级)×6」
+python _verify_exe_panel.py :: 归档 shell_pages 必须含 _fs_ensure_visible / _same_ctrl
+```
+
+- **症状**：在悬浮窗里播视频，点全屏后画面整块黑，**要过好几秒才出画面**。
+- **取证**（用户机 `shell_debug.log`，2026-10-25 23:09，两次复现 2/2）：
+  ```
+  fs enter key=1 float=True  ... vis=True  bounds={0,45,1680,1095}   ← 进去之前是可见的
+  fs enter done key=1        ... vis=False bounds={0,0,1680,1140}    ← 几何改完就不可见了
+  rep tap key=1 gentle=True  ... vis=False                           ← 两拍轻补都不碰 Visible
+  rep tap key=1 gentle=False ... vis=True                            ← 只有别的硬补才救回来
+  ```
+  **控件被自己藏了**：主窗口那条路（`float=False`）历次都是 `vis=True`，只有悬浮窗这条必黑。
+- **根因**：悬浮窗分支为了藏掉迷你标题栏/贴边热区，遍历 `host.Controls` 并 `if s is not c` 跳过
+  全屏控件本身。但 `Controls` 里取出的包装对象未必是同一个 Python 对象（`_same_form` 已经为
+  这个坑写过注释），于是"跳过自己"落空，**把正在全屏的控件也 `Visible=False` 了**。
+  而全屏那两拍兜底是**轻补**——按设计绝不碰 `Visible`（隐藏会把浏览器踢出 HTML 全屏，
+  见 `_fs_soft` 的取证），所以黑屏不会自愈；用户点一下窗口触发了别的硬补，画面才回来。
+- **修法三层**（缺一层都还会有洞）：
+  1. `_same_ctrl(a, b)`：按 HWND 比身份，藏兄弟时用它跳过全屏控件；
+  2. `set_fullscreen` 几何改完立刻 `_fs_ensure_visible(c, key, "fs-enter")` —— 兜住"任何原因
+     导致的隐藏"，不依赖第 1 层判断对；
+  3. `_rep_tap` 轻补分支：**只在"已进入全屏 且 控件确实不可见"时**把它显示出来（可见时零操作，
+     不打断合成器；非全屏时绝不翻出隐藏的后台标签）。
+- ★ 教训：轻补"不碰 Visible"是对的，但它有个隐含前提——**控件本来就是可见的**。一旦哪个
+  分支把它藏了，这条路上就再没有任何人能救回来。所以"救回可见"必须显式写在链路里。
 
 ### 本版专项（v0.4.42dsk 右侧 AI 面板）
 

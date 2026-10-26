@@ -304,6 +304,8 @@ class ShellApi:
         self._navbar_update = None  # 导航工具栏重绘回调, bind_navbar() 注入
         self._floats = None       # 独立悬浮窗管理器(shell_float), bind_floats() 注入
         self._ai = None           # 内置浏览器右侧 AI 面板(shell_ai), bind_ai_panel() 注入
+        self._tray = None         # 系统托盘(shell_tray), bind_tray() 注入
+        self._raise_pending = False   # 单实例: 窗口就绪前收到过"再点一次图标"
         self._lock = threading.Lock()
         self._update_started = False
         # float=True 的标签不在主窗口标签栏显示, 而由独立悬浮窗承载(见 shell_float.py)
@@ -326,6 +328,8 @@ class ShellApi:
         return {"name": "desktop-shell", "version": APP_VER.lstrip("v"),
                 "embedded_browser": True, "tabs": True,
                 "windows": True, "new_window": self._new_window_enabled(),
+                # 系统托盘 / 开机自启只有 Windows 桌面壳有(前端据此决定显不显示那两行设置)
+                "tray": (os.name == "nt"),
                 # 只有 Windows 上打包出来的 exe 才能自我替换；源码运行/安卓不显示更新入口
                 "self_update": (os.name == "nt" and bool(getattr(sys, "frozen", False)))}
 
@@ -378,6 +382,13 @@ class ShellApi:
         return "ok"
 
     def _close_for_update(self):
+        # 更新要真的关窗: 不先解除「关闭到托盘」, form.Close() 会被拦成 Hide,
+        # 旧进程一直活着、exe 也就一直换不掉。
+        try:
+            if self._tray is not None:
+                self._tray.allow_close()
+        except Exception:
+            pass
         try:
             if self._floats is not None:
                 self._floats.close_all()
@@ -833,6 +844,44 @@ class ShellApi:
                 pass
         self._sync_ai()
 
+    def bind_tray(self, tray):
+        """注入系统托盘控制器(shell_tray.install_tray 的返回值)。"""
+        self._tray = tray
+
+    def raise_window(self):
+        """把窗口叫到前台。托盘"打开"与**单实例唤醒**共用这一个入口。
+
+        返回 False 表示壳还没就绪(窗口/托盘都没装好), 调用方记住 _raise_pending,
+        等装好之后补一次 —— 开机自启冷启动要几十秒, 用户完全可能在这期间点图标。
+        """
+        tray = self._tray
+        if tray is not None:
+            try:
+                tray.show_window()
+                return True
+            except Exception:
+                _log_exc("raise/tray")
+        win = self._win
+        if win is None:
+            self._raise_pending = True
+            return False
+        try:
+            try:
+                win.restore()      # 最小化到任务栏时 show() 不一定还原窗口状态
+            except Exception:
+                pass
+            win.show()
+            try:
+                win.on_top = True
+                win.on_top = False     # 顶一下再取消: 抢前台, 但不留下置顶
+            except Exception:
+                pass
+            return True
+        except Exception:
+            _log_exc("raise/win")
+            self._raise_pending = True
+            return False
+
     def _sync_ai(self, tab=None):
         """按当前标签决定面板显不显示: 只有网页标签显示(信息流自带右栏 AI 聊天)。"""
         p = self._ai
@@ -973,6 +1022,7 @@ def main(argv=None):
             e2e_ai_url = None
     e2e_split = "--e2e-split" in argv   # 测试钩子: 量化拖动分栏时的布局/重绘次数
     e2e_chrome = "--e2e-chrome" in argv  # 测试钩子: 真窗口渲染顶栏成 PNG + 结构断言
+    e2e_tray = "--e2e-tray" in argv      # 测试钩子: 托盘(隐藏启动/关窗拦截/托盘退出)
     e2e_float_resize_url = None
     if "--e2e-float-resize" in argv:  # 测试钩子: 真鼠标消息驱动悬浮窗八向缩放
         try:
@@ -996,6 +1046,9 @@ def main(argv=None):
             except Exception:
                 pass
         return 0
+    # v0.4.50: 托盘态启动(开机自启走这条)。窗口建好立刻收起, 不弹到用户面前,
+    # 但服务与抓取照常跑 —— 内容在后台先抓好, 点托盘图标进来就能直接用。
+    tray_start = "--tray" in argv
     if "--server" in argv:   # 纯服务模式(不建窗口)
         sys.argv = [sys.argv[0]] + [a for a in argv if a != "--server"]
         server, port = app.run_server(
@@ -1004,10 +1057,59 @@ def main(argv=None):
             return 0 if port is not None else 1
         _serve_forever_cli(server)
         return 0
+    # v0.4.51 单实例: 后台已经有一个窗口壳在跑(关闭到托盘 / 开机自启)时, 再点一次
+    # 图标只把那个窗口叫回来, 绝不再起第二个进程 —— 那会有两套窗口、两套 WebView2
+    # 用户数据目录(第二套还会报占用), 退出其中一个还可能把共用的服务一起收掉。
+    # 抢不到互斥量(系统不给句柄)就照常启动: 宁可多开一个窗口, 也不能"点了没反应"。
+    single = None
+    if os.name == "nt":
+        try:
+            import shell_single
+            scope = shell_single.scope_of(app.DATA_DIR)
+            single = shell_single.acquire(scope)
+            if single is not None:
+                single.start(_single_raise)
+            if single is None:
+                if shell_single.wake(scope):
+                    _log_line("single:wake-ok")     # exe 是 --noconsole, print 会丢
+                else:
+                    # 没回执 = 旧进程卡住/半死。提示怎么处理, 而不是再起一个去抢
+                    # 同一个数据目录(两个进程一起坏比"没反应"更糟)。
+                    _log_line("single:wake-timeout")
+                    _msg_box("洞鉴虚明已经在后台运行，但这次没能把它的窗口叫出来。\n\n"
+                             "请右键任务栏托盘区的洞鉴虚明图标 → 「打开洞鉴虚明」；\n"
+                             "若托盘里也没有图标，请先在任务管理器里结束\n"
+                             "「洞鉴虚明」进程，再重新打开。")
+                return 0
+        except Exception:
+            _log_exc("single/acquire")
+            single = None
     return shell_main(e2e_url=e2e_url, e2e_float_url=e2e_float_url,
                       e2e_float_resize_url=e2e_float_resize_url,
                       e2e_ai_url=e2e_ai_url, e2e_split=e2e_split,
-                      e2e_chrome=e2e_chrome)
+                      e2e_chrome=e2e_chrome, tray_start=tray_start,
+                      e2e_tray=e2e_tray, single=single)
+
+
+# ---- 单实例唤醒的落点(v0.4.51) ----
+# 事件监听在 main() 抢到互斥量时就开, 但那时窗口壳一行都还没跑 —— 冷启动要几十秒,
+# 用户完全可能在这期间点图标。所以回调只认这里的目标: 壳没就绪就记个 pending,
+# 装好了补一次; 回执照样立刻发, 让新进程安静退出, 不要让它干等。
+_RAISE_TARGET = {"api": None, "pending": False}
+
+
+def _single_raise():
+    """收到"又点了一次图标" → 把窗口叫到前台(可能还得先等壳就绪)。"""
+    api = _RAISE_TARGET.get("api")
+    if api is None:
+        _RAISE_TARGET["pending"] = True
+        _log_line("single:raise-early")
+        return
+    try:
+        api.raise_window()
+        _log_line("single:raise")
+    except Exception:
+        _log_exc("single/raise")
 
 
 def _install_mouse_side_buttons(api, win):
@@ -2030,18 +2132,131 @@ def _e2e_drag_to_tabbar(api, tid, say):
         return False
 
 
+def _tray_e2e(api):
+    """托盘自测(v0.4.50): 隐藏启动 → 托盘图标在 → 点关闭被拦成隐藏 → 托盘「打开」能回来
+    → 托盘「退出」真的关掉窗口。
+
+    为什么不靠人眼: 托盘是"看不见的控件", 图标建不上、点关闭真把程序退了, 都得等用户
+    发现。全程 hidden=True 起来(不弹到用户面前), 跑完自己退出。
+    产物: build/probe/tray_e2e.log —— exe 没有 stdout, 结论只能看文件。
+    """
+    import System.Windows.Forms as WinForms
+    out = os.path.join(_probe_dir(), "tray_e2e.log")
+    lines, fails = [], [0]
+
+    def say(s):
+        lines.append(str(s))
+        try:
+            print("[e2e-tray] " + str(s), flush=True)
+        except Exception:
+            pass
+
+    def ok(name, cond, extra=""):
+        if not cond:
+            fails[0] += 1
+        say("%s  %s  %s" % ("PASS" if cond else "FAIL", name, extra))
+        return bool(cond)
+
+    def dump():
+        try:
+            os.makedirs(os.path.dirname(out), exist_ok=True)
+            with open(out, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+        except Exception:
+            pass
+
+    try:
+        time.sleep(6.0)     # 等页面/控件池/托盘都就位
+        tr = getattr(api, "_tray", None)
+        form = getattr(tr, "_form", None) if tr is not None else None
+        say("tray=%r form=%r" % (tr is not None, form is not None))
+        ok("托盘控制器已装上", tr is not None)
+        ok("NotifyIcon 已创建且可见",
+           tr is not None and tr._icon is not None and bool(tr._icon.Visible))
+        ok("托盘用的是软件自己的图标(不是系统默认那个)",
+           tr is not None and tr._hicon is not None)
+        ok("托盘态启动: 窗口一开始就是隐藏的(开机自启不该弹窗)",
+           form is not None and not bool(form.Visible))
+        ok("托盘菜单 = 打开 / 换一批 / 退出(含 1 条分隔线)",
+           tr is not None and tr._menu is not None and int(tr._menu.Items.Count) == 4,
+           getattr(getattr(tr, "_menu", None), "Items", None) and tr._menu.Items.Count)
+        if tr is None or form is None:
+            dump()
+            os._exit(1)
+
+        # ① 关闭到托盘: form.Close() 必须被拦成 Hide, 而且窗口不能被销毁
+        app.sset("ui_close_to_tray", "1")
+        form.BeginInvoke(WinForms.MethodInvoker(lambda: form.Close()))
+        time.sleep(1.5)
+        ok("点关闭被拦成隐藏: 窗口没被销毁", not bool(form.IsDisposed))
+        ok("点关闭被拦成隐藏: 窗口不可见", not bool(form.Visible))
+
+        # ② 托盘「打开」能把窗口叫回来(隐藏久了 WebView2 会停呈现, 这条是必测项)
+        tr.show_window(refresh=False)
+        time.sleep(1.5)
+        ok("点托盘图标: 窗口回到可见", bool(form.Visible))
+
+        # ③ 托盘「退出」必须真退(否则用户再也退不掉, 自动更新也换不掉 exe)
+        def _closed(*_a):
+            ok("托盘「退出」真的关掉了窗口(没再被拦成隐藏)", True)
+            dump()
+            time.sleep(0.3)
+            os._exit(0 if not fails[0] else 1)
+        try:
+            form.FormClosed += _closed
+        except Exception:
+            pass
+        tr.quit()
+        time.sleep(8.0)
+        ok("托盘「退出」8 秒内关掉了窗口", False)
+        dump()
+        os._exit(1)
+    except Exception:
+        import traceback
+        say(traceback.format_exc())
+        dump()
+        os._exit(1)
+
+
+def _tray_warm():
+    """托盘态启动: 等页面/服务就绪后主动在后台抓一轮, 把第一批内容抓好。
+
+    为什么不能只靠页面: 窗口是隐藏的, WebView2 里的定时器会被系统节流(最长一分钟一次),
+    靠页面轮询补池可能拖很久。服务端这一轮是"我们自己的", 不受节流影响。
+    失败就算了 —— 用户点开窗口时页面自己还会再踢一次, 不会卡死。
+    """
+    time.sleep(3.0)
+    for _ in range(3):
+        try:
+            if app.kick_build(quick=True):
+                return True
+        except Exception:
+            pass
+        time.sleep(8.0)
+    return False
+
+
 def shell_main(e2e_url=None, e2e_float_url=None, e2e_float_resize_url=None,
-               e2e_ai_url=None, e2e_split=False, e2e_chrome=False):
+               e2e_ai_url=None, e2e_split=False, e2e_chrome=False, tray_start=False,
+               e2e_tray=False, single=None):
     """窗口壳主流程: 起/复用服务 → WebView2 检测 → 主窗口(含标签页) → 全关后收尾。
 
     e2e_url 仅测试用(_e2e_shell.py): 主窗口就绪后自动走一次 open_in_app 桥调用,
     与用户点击卡片进入内置浏览器标签页的代码路径完全一致, 不碰真实鼠标。
     """
+    if e2e_tray:
+        tray_start = True     # 自测也走"隐藏启动", 全程不弹到用户面前
     server, port = _start_server_thread()
     if port is None:
         _msg_box("端口 8000/8010/8020 均被占用，无法启动。")
         return 1
     url = "http://127.0.0.1:%d" % port
+    # 开机自启对齐(仅 Windows): 设置说开着就确保注册表指向**当前** exe —— 换过版本
+    # (文件名带版本号)或挪过目录时, 不对齐的话开机拉起的是那个已经被替换掉的旧文件。
+    try:
+        app.autostart_sync()
+    except Exception:
+        _log_exc("autostart/sync")
     py_ok = have_pywebview()
     if py_ok and not webview2_available():
         # 缺运行时: 优先借用已装的 Edge 浏览器内核(免安装, 零系统改动);
@@ -2075,7 +2290,8 @@ def shell_main(e2e_url=None, e2e_float_url=None, e2e_float_resize_url=None,
     win = webview.create_window("%s %s" % (APP_NAME, APP_VER), url,
                                 width=MAIN_W, height=MAIN_H, min_size=MAIN_MIN,
                                 background_color=BG_PAGE, js_api=api,
-                                frameless=True, easy_drag=False)   # easy_drag=False: 只允许标签栏拖动, 网页区域拖拽不再移动窗口
+                                frameless=True, easy_drag=False,   # easy_drag=False: 只允许标签栏拖动, 网页区域拖拽不再移动窗口
+                                hidden=bool(tray_start))   # 托盘态启动: 建好就收起(不闪一下再消失)
     api.attach(win, url)
 
     def gui_ready():
@@ -2221,11 +2437,42 @@ def shell_main(e2e_url=None, e2e_float_url=None, e2e_float_resize_url=None,
             _install_mouse_side_buttons(api, win)
         except Exception:
             _log_exc("mouse-side-buttons")
+        # 系统托盘(v0.4.50): 「关闭到托盘」与开机自启的落点。装不上只是没有托盘图标、
+        # 关窗回到"直接退出", 其余功能不受影响。
+        try:
+            from shell_tray import install_tray
+            api.bind_tray(install_tray(win, api, start_hidden=tray_start))
+        except Exception:
+            _log_exc("shell_tray/install")
+        if single is not None:
+            # 壳就绪: 挂上唤醒目标。启动期间点过图标(pending)的话, 现在补一次 ——
+            # 走的就是托盘「打开洞鉴虚明」那条路(会顺带换一屏新内容)。
+            try:
+                _RAISE_TARGET["api"] = api
+                if _RAISE_TARGET.get("pending"):
+                    _RAISE_TARGET["pending"] = False
+                    api.raise_window()
+                    _log_line("single:late-raise")
+            except Exception:
+                _log_exc("single/wire")
+        if tray_start:
+            # 开机自启: 窗口不弹, 但内容要先抓好。这里不依赖页面 —— 隐藏的 WebView2
+            # 定时器会被系统节流, 靠它轮询可能半天不动; 直接在服务端起一轮构建最稳。
+            threading.Thread(target=_tray_warm, daemon=True, name="msx-tray-warm").start()
         # 设置「启动时打开浏览器」: 等标签栏/导航栏装好再开, 新标签立刻有 chrome;
         # 稍等一拍是让首页控件完成初始化(新标签要复制它的 WebView2 配置)。
         _stb = threading.Timer(0.8, api.open_startup_browser)
         _stb.daemon = True
         _stb.start()
+        if e2e_tray:
+            # 托盘自测: 结果落 build/probe/tray_e2e.log, 自己退出(约 20 秒)
+            try:
+                _tray_e2e(api)
+            except Exception:
+                import traceback
+                traceback.print_exc()
+            finally:
+                os._exit(0)
         if e2e_url:
             time.sleep(8)   # 等主窗口与服务就绪
             api.open_in_app(e2e_url, "E2E 视频标签页", mode="tab")
@@ -2362,6 +2609,19 @@ def shell_main(e2e_url=None, e2e_float_url=None, e2e_float_resize_url=None,
             api._floats.close_all()
     except Exception:
         pass
+    # 关窗即换一批(v0.4.50): 下次打开不该又是刚才那一屏。
+    # ① 先把托盘图标摘掉 —— 窗口已经没了, 图标还挂着会让用户以为程序没退;
+    # ② 再踢一轮抓取, 最多等 2.5 秒: 窗口没了用户看不到等待, 但进程多留太久会挡住
+    #    "关掉马上又打开"(新实例会复用这个还没退的服务, 2.5s 后旧进程再收走它就出错)。
+    try:
+        if api._tray is not None:
+            api._tray.dispose()
+    except Exception:
+        _log_exc("tray/dispose-on-exit")
+    try:
+        app.feed_rotate(wait=2.5)
+    except Exception:
+        _log_exc("feed-rotate/exit")
     app.shutdown(server)
     return 0
 

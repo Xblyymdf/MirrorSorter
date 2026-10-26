@@ -176,7 +176,7 @@
         <button class="svItem" data-sec="data"><svg class="ic"><use href="#i-trash"/></svg>数据</button>
         <button class="svItem" data-sec="disclaimer"><svg class="ic"><use href="#i-inbox"/></svg>免责声明</button>
       </div>
-      <div class="svVer">洞鉴虚明 v0.4.47dsk</div>
+      <div class="svVer">洞鉴虚明 v0.4.51dsk</div>
     </nav>
   </aside>
 
@@ -213,6 +213,21 @@
               <button class="seg" data-v="0">关闭</button>
             </div>
             <p class="tip">默认关闭。开启后，下次启动软件会直接用上面的搜索引擎首页开一个标签页。</p></div>
+          <!-- v0.4.50: 后台常驻(仅 Windows 桌面版; 壳没起来时这两行不显示)。
+               目的只有一个 —— 打开就能用: 自启动让它在托盘里先把内容抓好,
+               关窗不退出让它一直在后台待着, 下次点开不用再等半分钟启动。 -->
+          <div class="fld" id="autostartFld" hidden><span class="lbl">后台自启动（登录系统后自动启动，缩在系统托盘里先把内容抓好）</span>
+            <div class="row" id="autostartRow">
+              <button class="seg" data-v="1">开启</button>
+              <button class="seg" data-v="0">关闭</button>
+            </div>
+            <p class="tip">默认关闭。开启后开机会悄悄在托盘里跑起来（不弹窗口），等你点开时第一批信息已经抓好，不用再等启动。</p></div>
+          <div class="fld" id="closeToTrayFld" hidden><span class="lbl">关闭窗口后隐藏到系统托盘（程序留在后台继续准备内容）</span>
+            <div class="row" id="closeToTrayRow">
+              <button class="seg" data-v="1">开启</button>
+              <button class="seg" data-v="0">关闭</button>
+            </div>
+            <p class="tip">默认关闭。开启后点窗口的关闭只会缩到任务栏右下角的托盘，不退出程序；要真正退出请右键托盘图标 → 退出。</p></div>
         </section>
 
         <section class="svPanel" data-sec="look">
@@ -595,7 +610,7 @@
           <h3>免责声明</h3>
           <div id="disclaimerBody" class="disc"></div>
           <button id="btnDisclaimer">我已阅读并同意</button>
-          <p class="tip" style="margin-top:14px">洞鉴虚明 v0.4.47dsk · 数据只存本机</p>
+          <p class="tip" style="margin-top:14px">洞鉴虚明 v0.4.51dsk · 数据只存本机</p>
         </section>
       </div>
     </div>

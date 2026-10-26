@@ -132,8 +132,13 @@ input[type=range]:hover::-webkit-slider-thumb,input[type=range]:focus-visible::-
 body.splitting{cursor:col-resize;user-select:none}
 body.splitting #center,body.splitting .side{pointer-events:none}
 /* 拖动中的预览线: 只改 transform(合成层), 不触发布局/重绘。
-   真实宽度要等松手才落地, 所以中间栏的卡片/canvas 在整个拖动过程里一次都不重排。 */
-#splitGhost{position:fixed;top:0;bottom:0;left:0;width:2px;z-index:9999;
+   真实宽度要等松手才落地, 所以中间栏的卡片/canvas 在整个拖动过程里一次都不重排。
+   ★ 这个节点由 app.js 插到 <html> 下（不是 <body>）：字体缩放是 body{zoom}，
+     挂在 body 里的 translate 位移会被 zoom 再乘一次 → 字体调大后线会飘到右栏里去。
+     既然它不参与缩放，粗细就得自己跟 --ui-zoom 走，否则一按下拖动线会比
+     .splitter::after 细一截（2px vs 2×z px）。 */
+#splitGhost{position:fixed;top:0;bottom:0;left:0;
+  width:calc(2px * var(--ui-zoom, 1));z-index:9999;
   background:var(--accent-ink);pointer-events:none;opacity:0;
   will-change:transform;transition:opacity .08s linear}
 #splitGhost.on{opacity:.95}
@@ -213,6 +218,8 @@ body.in-settings #railLeft > #btnCheckUpdate{display:none}
 /* 顶栏三平台头像（和旧版一样挂在搜索框右侧；未登录的那一枚不显示） */
 #topAvatars{display:flex;align-items:center;gap:4px;flex:none;margin-right:2px}
 #topAvatars[hidden],#topAvatars .tava[hidden]{display:none}   /* 未登录的不要显示(display:flex 会盖掉 hidden) */
+/* 后台自启 / 关闭到托盘: 只有 Windows 桌面壳显示(壳没起来时留着 hidden)。.fld 是 flex, 光靠 hidden 属性藏不住 */
+#autostartFld[hidden],#closeToTrayFld[hidden]{display:none}
 #topAvatars .tava{width:28px;height:28px;padding:0;display:flex;align-items:center;justify-content:center;
   background:transparent;border-color:transparent;border-radius:50%}
 #topAvatars .tava:hover{background:var(--hover);border-color:transparent}

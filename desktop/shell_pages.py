@@ -812,6 +812,33 @@ def _rep_cancel(cc):
         pass
 
 
+def _fs_ensure_visible(cc, key=None, why=""):
+    """控件（WebView2）如果已经不可见，就把它显示出来。返回是否真的动过。
+
+    为什么需要它：全屏那两拍兜底是**轻补**，按设计不碰 Visible —— 因为"隐藏→显示"
+    会把浏览器踢出 HTML 全屏（见 `_fs_soft` 的取证）。但"控件本来就不可见"是另一回事：
+    那不是刻意隐藏，而是黑的根源，此时唯一的出路就是把它显示出来。
+    全屏路径的兜底：(1) 悬浮窗藏兄弟们时误藏了自己；(2) 宿主编排变化把控件留在了
+    隐藏态。用户实测 2026-10-25 23:09：悬浮窗进全屏后 vis=False，黑屏约 5 秒，
+    直到他点了一下窗口、触发一次别的硬补才出画面。
+
+    只在**确实不可见**时动一下，可见时零操作（不会打断合成器）。
+    """
+    try:
+        if cc is None or cc.IsDisposed:
+            return False
+        if cc.Visible:
+            return False
+        cc.Visible = True
+        try:
+            _dbg_log("re-show key=%s why=%s" % (key, why))
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
 def _rep_tap(ui, ctrls, cc, key, hwnd_box, level, gentle=False):
     """补呈现(在 UI 线程执行)。level 越高手段越重, 全程**不重载页面**:
       1 隐藏→显示→置顶(与旧实现一致)
@@ -828,6 +855,14 @@ def _rep_tap(ui, ctrls, cc, key, hwnd_box, level, gentle=False):
                 return          # 控件已被换掉
             if cc.IsDisposed:
                 return
+            # 先读全屏状态: 下面"要不要把控件显示出来"要用它做门控
+            # (补呈现有没有把浏览器**踢出全屏**也靠它复核 / 日志留证)
+            try:
+                core = cc.CoreWebView2
+                hwnd_box["fs"] = (None if core is None
+                                  else bool(core.ContainsFullScreenElement))
+            except Exception:
+                hwnd_box["fs"] = None
             if not gentle:
                 try:
                     hwnd_box["h"] = int(cc.Handle.ToInt32())
@@ -835,14 +870,10 @@ def _rep_tap(ui, ctrls, cc, key, hwnd_box, level, gentle=False):
                     pass
                 cc.Visible = False
                 cc.Visible = True
-            # 补呈现有没有把浏览器**踢出全屏**? 在 UI 线程读一次放进 hwnd_box
-            # (工作线程别碰 .NET), 供看门狗复核 / 日志留证。
-            try:
-                core = cc.CoreWebView2
-                hwnd_box["fs"] = (None if core is None
-                                  else bool(core.ContainsFullScreenElement))
-            except Exception:
-                hwnd_box["fs"] = None
+            elif hwnd_box.get("fs"):
+                # 轻补不切 Visible（切了会把浏览器踢出全屏），但"已经不可见"必须救回来 ——
+                # 不可见时画面就是黑的，而轻补是这条路上仅有的两拍，不救就永远黑着。
+                _fs_ensure_visible(cc, key, "rep-gentle")
             cc.BringToFront()
             try:
                 _dbg_log("rep tap key=%s gentle=%s vis=%s bounds=%s dock=%s fs=%s"
@@ -1951,6 +1982,30 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
                 except Exception:
                     return False
 
+        def _same_ctrl(self, a, b):
+            """两个控件引用是不是同一个控件。
+
+            和 `_same_form` 同一个理由, 而且更致命: `host.Controls` 里取出来的包装对象
+            未必是同一个 Python 对象, 所以 `s is not c` 判不出"这就是我自己"。
+            悬浮窗进全屏时那个循环本意是藏掉迷你标题栏/贴边热区, 一旦把全屏控件自己
+            也藏了, 画面就是整块黑 —— 而全屏那两拍兜底是**轻补**(按设计不碰 Visible,
+            因为隐藏会把浏览器踢出 HTML 全屏), 于是黑屏不会自愈。
+            按 HWND 比较: 句柄取不到时退回 Equals, 再不行就当"不是同一个"(宁可多藏一个
+            兄弟, 也不能把全屏控件藏掉 —— 后面还有 `_fs_ensure_visible` 兜底)。
+            """
+            if a is b:
+                return True
+            if a is None or b is None:
+                return False
+            try:
+                return int(a.Handle.ToInt64()) == int(b.Handle.ToInt64())
+            except Exception:
+                pass
+            try:
+                return bool(a.Equals(b))
+            except Exception:
+                return False
+
         def _fs_desc(self, c):
             """一行描述控件关键状态(全屏诊断用; 必须在 UI 线程调)。"""
             try:
@@ -2001,11 +2056,25 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
                             if is_float:   # 悬浮窗: 迷你标题栏+贴边热区
                                 for s in list(host.Controls):
                                     try:
-                                        if s is not c and s.Visible:
+                                        # ★ 必须按控件身份比较, 不能用 `s is not c`:
+                                        #   Controls 里取出的包装对象未必是同一个 Python 对象
+                                        #   (同一个坑 `_same_form` 已经踩过一次), 用 is 就有可能
+                                        #   把**正在全屏的这个控件自己**当兄弟一起藏掉。
+                                        #   用户实测(2026-10-25 23:09 的 shell_debug.log):
+                                        #   `fs enter` 前 vis=True, 几何改完 vis=False;
+                                        #   这个循环是那段同步代码里唯一的 Visible 写入点。
+                                        #   藏了之后画面整块黑, 而全屏两拍兜底是轻补(不碰
+                                        #   Visible), 所以不会自愈 —— 这就是"黑屏一阵才出画面"。
+                                        #   日志里的 self_hidden 用于事后确认是不是这里干的。
+                                        if s is c or self._same_ctrl(s, c):
+                                            continue
+                                        if s.Visible:
                                             hid.append(s)
                                             s.Visible = False
                                     except Exception:
                                         pass
+                                _dbg_log("fs hid siblings key=%s hid=%d self_hidden=%s"
+                                         % (key, len(hid), not c.Visible))
                         except Exception:
                             pass
                         # 9 项, 与 _fs_restore 的解包一一对应(几何在改 Dock 之前取快照)
@@ -2025,6 +2094,10 @@ def create_pool(win, on_title, on_newtab, theme_getter=None, port=8000, on_nav=N
                             host.WindowState = WF.FormWindowState.Maximized
                             c.Dock = WF.DockStyle.Fill
                         c.BringToFront()
+                        # ★ 兜底: 几何改完如果控件落进了隐藏态, 立刻显示出来。
+                        #   全屏后的两拍兜底是轻补(按设计不碰 Visible), 藏了就不会自己回来 ——
+                        #   用户实测悬浮窗全屏黑屏约 5 秒正是这条。只在真不可见时动一下。
+                        _fs_ensure_visible(c, key, "fs-enter")
                         # ---- 全屏黑屏修复(用户报修 m02002) ----
                         # 实测(探针 _black_probe.py + 桌面 DC 抓屏): 网页一进入全屏, WebView2 的合成层
                         # 就被打断 —— 画面整块停在上一次呈现(全黑 #0f1115, 连渲染器出图都卡住: CDP

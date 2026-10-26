@@ -464,6 +464,14 @@
           btn.hidden = false;
           btn.onclick = updCheck;
         }
+        // 后台自启 / 关闭到托盘只有 Windows 桌面壳做得到: 浏览器打开或安卓上不显示这两行,
+        // 否则用户点了没反应(比没有这个开关更让人困惑)。
+        if (info && info.tray) {
+          ["#autostartFld", "#closeToTrayFld"].forEach(function (s) {
+            const el = document.querySelector(s);
+            if (el) el.hidden = false;
+          });
+        }
       }).catch(function () {});
     } catch (e) { /* 桥还没就绪：等 pywebviewready 再来一次 */ }
   }
@@ -1441,6 +1449,12 @@
     }
   }
   $("#btnRefresh").onclick = refreshFeed;
+  // 桌面壳从托盘回来时调这个(壳里执行 JS): 走与顶栏刷新完全同一条路 —— 立刻换一屏,
+  // 后台那批新内容落地后再插到最前面。只在信息流页生效, 用户在设置/收藏页时不打断他。
+  window.__msxRefreshFeed = function () {
+    try { if (S.view === "feed") refreshFeed(); } catch (e) {}
+    return true;
+  };
   // 状态卡收放（原来收放的是顶栏那条状态行，现在它成了左栏的卡片）
   $("#metaToggle").onclick = () => {
     prefs.statOpen = !(prefs.statOpen !== false);
@@ -1802,6 +1816,8 @@
       segPick("#openModeRow", s.ui_new_window === "0" ? "0" : "1");
       segPick("#browserRow", s.ui_search_engine || "bing");
       segPick("#browserStartRow", s.ui_browser_on_start === "1" ? "1" : "0");
+      segPick("#autostartRow", s.ui_autostart === "1" ? "1" : "0");
+      segPick("#closeToTrayRow", s.ui_close_to_tray === "1" ? "1" : "0");
     } catch (e) { toast("读取设置失败：" + e, true); }
   }
   // 分段选择器：读取时点亮当前档，点击即保存（旧版同做法，省一次"保存"点击）
@@ -1840,6 +1856,18 @@
   segBind("#openModeRow", "ui_new_window", "保存打开方式");
   segBind("#browserRow", "ui_search_engine", "保存搜索引擎");
   segBind("#browserStartRow", "ui_browser_on_start", "保存启动行为");
+  segBind("#closeToTrayRow", "ui_close_to_tray", "保存关闭行为");
+  // 开机自启要写注册表, 写失败时后端会回 {ok:false, error} —— segBind 只负责回滚高亮,
+  // 用户不知道"开了但系统没记住"。这里显式提示原因(成功静默, 与全站一致)。
+  $("#autostartRow").addEventListener("click", async (e) => {
+    const b = e.target.closest(".seg");
+    if (!b) return;
+    const old = ($("#autostartRow .seg.on") || {}).dataset?.v;
+    segPick("#autostartRow", b.dataset.v);
+    const r = await save("/api/settings", { ui_autostart: b.dataset.v }, "设置开机自启");
+    if (!r) { segPick("#autostartRow", old); return; }
+    loadSettings();
+  });
   // 超分 / 增强强度：界面上是一个「档位」，后端存的是「开关 + 档位」两个键。
   // 档位选「关」= 开关写 0（脚本据此整段不启用），选别的 = 开关写 1 + 档位名。
   const segBindPair = (sel, onKey, lvlKey, offVal, label) => {
@@ -3626,12 +3654,23 @@
   // 现在拖动只移动一条 fixed 定位的预览线: transform 走合成层, 不触发布局也不触发重绘;
   // 松手才把宽度一次性落地, 并且只跑一次 applyPrefs()。
   let splitGhost = null;
+  // ★ 预览线必须挂在 <html> 上，不能挂 <body>。
+  //   因为「字体大小」是靠 document.body.style.zoom 做的（见 applyPrefs），
+  //   挂在 body 里的任何定位值都会被 zoom 再乘一次：getBoundingClientRect() 拿到的
+  //   rect0.left 已经是缩放后的可视坐标，写进被 zoom 的子树里就变成 X × z 了 ——
+  //   字体「中」(1.15)/「大」(1.3) 时这条线会一路飘到右栏里面去，越靠右错得越多。
+  //   挂到 html 下就不在 zoom 子树里，1px 就是 1 个可视像素，宽度也不会被放大。
   function splitGhostEl() {
     if (splitGhost && splitGhost.isConnected) return splitGhost;
     splitGhost = document.createElement("div");
     splitGhost.id = "splitGhost";
-    document.body.appendChild(splitGhost);
+    document.documentElement.appendChild(splitGhost);
     return splitGhost;
+  }
+  // 当前界面缩放倍数（和 applyPrefs 写进 --ui-zoom 的是同一个值，没写过就是 1）
+  function uiZoom() {
+    const v = parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--ui-zoom"));
+    return v > 0 ? v : 1;
   }
   document.addEventListener("pointerdown", (e) => {
     const sp = e.target.closest(".splitter");
@@ -3640,6 +3679,9 @@
     const which = sp.dataset.split;
     const x0 = e.clientX;
     const rect0 = sp.getBoundingClientRect();
+    // z = 界面缩放。clientX / getBoundingClientRect 是「可视像素」，
+    // 而 prefs.leftW / --leftW 是 body 内部（缩放前）的本地像素，两者差一个 z，必须换算。
+    const z = uiZoom();
     const w0 = which === "left" ? (prefs.le ? 0 : prefs.leftW) : (prefs.re ? 0 : prefs.rightW);
     // ★ 右栏在屏幕右侧，它的「变宽」方向和鼠标位移是**相反**的：
     //   往左拖(dx<0) → 右栏变宽；往右拖(dx>0) → 右栏变窄。
@@ -3653,11 +3695,13 @@
     g.style.transform = "translate3d(" + Math.round(rect0.left) + "px,0,0)";
     document.body.classList.add("splitting");
     const move = (ev) => {
-      const raw = w0 + sign * (ev.clientX - x0);
+      // 鼠标位移是可视像素 → 除以 z 换算成本地宽度，否则字体调大后栏宽会按 1/z 比例跟不上手
+      const raw = w0 + sign * ((ev.clientX - x0) / z);
       collapse = raw < 90;
       target = collapse ? 0 : Math.max(LO, Math.min(HI, raw));
-      // 线的位置 = 分隔条初始位置 + (目标宽度 - 初始宽度) * 方向; 被 clamp 住不会飘出屏幕
-      g.style.transform = "translate3d(" + Math.round(rect0.left + (target - w0) * sign) + "px,0,0)";
+      // 线的位置 = 分隔条初始位置 + (目标宽度 - 初始宽度) * 方向 * z
+      // (target-w0 是本地像素，线的坐标系是可视像素，所以再乘回 z；被 clamp 住不会飘出屏幕)
+      g.style.transform = "translate3d(" + Math.round(rect0.left + (target - w0) * sign * z) + "px,0,0)";
       g.classList.toggle("collapsing", collapse);
     };
     const up = () => {

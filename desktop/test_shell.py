@@ -465,8 +465,23 @@ _split = js[js.find('const sp = e.target.closest(".splitter")'):
            js.find('$("#toggleLeft").onclick')]
 check("分栏拖动: 右栏位移取反(左拖变宽/右拖变窄)",
       'const sign = which === "left" ? 1 : -1;' in _split
-      and "w0 + sign * (ev.clientX - x0)" in _split
-      and "w0 + (ev.clientX - x0)" not in _split, "splitter drag")
+      and "sign * ((ev.clientX - x0) / z)" in _split
+      and "w0 + sign * (ev.clientX - x0)" not in _split
+      and "w0 + sign * (ev.clientX" not in _split.replace("sign * ((ev.clientX - x0) / z)", ""),
+      "splitter drag")
+# ★ v0.4.48dsk: 字体缩放是 document.body.style.zoom，预览线若挂在 body 里，
+#   translate 位移会被 zoom 再乘一次 → 字体「中/大」时线一路飘到右栏里面。
+#   getBoundingClientRect()/clientX 是可视像素，prefs.leftW/rightW 是缩放前的本地像素，
+#   两者差一个 z，必须显式换算。这三条断言就是那次 bug 的守门员。
+check("分栏预览线: 挂在 <html> 下(避开 body.zoom 二次缩放)",
+      "document.documentElement.appendChild(splitGhost)" in js
+      and "document.body.appendChild(splitGhost)" not in js, "splitGhost parent")
+check("分栏预览线: 位移按 zoom 换算(本地宽度 → 可视像素要乘 z)",
+      "function uiZoom()" in js
+      and 'getPropertyValue("--ui-zoom")' in js
+      and "(target - w0) * sign * z" in _split, "splitGhost zoom")
+check("分栏拖动: 鼠标位移按 zoom 换算(可视像素 → 本地宽度要除 z)",
+      "const z = uiZoom();" in _split and "/ z)" in _split, "splitter zoom delta")
 check("设置页: 字体大小三档(默认小)", 'id="fontRow"' in html and html.count("data-font=") == 3
       and 'data-font="small"' in html)
 check("设置页: 背景预设/自定义/深度滑条在强调色设置下方",
@@ -585,6 +600,91 @@ check("全屏事件按标签去重(同状态重复事件直接丢, 否则反复�
       and "if last is on:" in _sp_src
       and "_Pool._fs_last[tab_key] = on" in _sp_src)
 
+# v0.4.49dsk 悬浮窗全屏黑屏(用户报修 2026-10-25 23:09): 进全屏那一下控件自己变成不可见,
+# 而全屏两拍兜底是"轻补"(按设计不碰 Visible, 因为隐藏会把人踢出 HTML 全屏) →
+# 画面整块黑、不会自愈, 直到用户点一下窗口触发别的硬补才回来。三处守卫:
+check("悬浮窗全屏: 藏兄弟控件必须按身份比较(不能用 `s is not c`)",
+      "def _same_ctrl(self, a, b)" in _sp_src
+      and "if s is c or self._same_ctrl(s, c):" in _sp_src
+      and "if s is not c and s.Visible:" not in _sp_src, "fs sibling identity")
+check("悬浮窗全屏: 几何改完立刻把控件救回可见态",
+      "def _fs_ensure_visible(cc, key=None, why=\"\")" in _sp_src
+      and 'c.BringToFront()\n                        # ★ 兜底' in _sp_src
+      and '_fs_ensure_visible(c, key, "fs-enter")' in _sp_src, "fs ensure visible")
+check("全屏轻补: 控件已不可见时必须救回来(可见时零操作, 不打断合成器)",
+      'elif hwnd_box.get("fs"):' in _sp_src
+      and '_fs_ensure_visible(cc, key, "rep-gentle")' in _sp_src
+      and "if cc.Visible:\n            return False" in _sp_src, "rep gentle ensure")
+
+# ★ 行为级回归: 静态断言看不出"到底有没有把控件显示出来", 把真实源码抽出来配假控件跑。
+#   这条 bug 的本质是"代码合法、结论错了", 只有真跑一遍轻补才能守住。
+def _behavioral_fs_restore():
+    src = _sp_src[_sp_src.index("def _fs_ensure_visible("):]
+    src = src[:src.index("\ndef _rep_tap(")]
+    tap = _sp_src[_sp_src.index("def _rep_tap("):]
+    tap = tap[:tap.index("\ndef _represent(")]
+    logs = []
+    ns = {"_dbg_log": lambda m: logs.append(str(m))}
+    exec(compile(src + "\n" + tap, "<shell_pages-fs>", "exec"), ns)
+    ensure, rep_tap = ns["_fs_ensure_visible"], ns["_rep_tap"]
+
+    class _Core:
+        def __init__(self, fs):
+            self.ContainsFullScreenElement = fs
+    class _Ctrl:
+        def __init__(self, visible, fs):
+            self.Visible = visible
+            self.IsDisposed = False
+            self.CoreWebView2 = _Core(fs)
+            self.calls = []
+        def BringToFront(self):
+            self.calls.append("front")
+        def Invalidate(self, *a):
+            self.calls.append("inv")
+        def Update(self):
+            self.calls.append("upd")
+
+    out = []
+    # 1) 可见 → 一个字的操作都不做
+    a = _Ctrl(True, True)
+    out.append(("可见时不动", ensure(a, 7, "t") is False and a.calls == []))
+    # 2) 不可见 → 显示出来, 并落一行日志
+    b = _Ctrl(False, True)
+    out.append(("不可见时救回", ensure(b, 7, "t") is True and b.Visible is True
+                and any("re-show" in x for x in logs)))
+    # 3) 已销毁 → 不碰
+    c = _Ctrl(False, True)
+    c.IsDisposed = True
+    out.append(("已销毁不动", ensure(c, 7, "t") is False and c.Visible is False))
+
+    # 4) 轻补 + 全屏 + 控件被藏 → 必须显示回来(线上就是这个组合黑屏)
+    d = _Ctrl(False, True)
+    q = []
+    rep_tap(lambda fn: q.append(fn), {7: d}, d, 7, {}, 1, gentle=True)
+    for fn in q:
+        fn()
+    out.append(("轻补拯救被藏的全屏控件", d.Visible is True and "front" in d.calls))
+    # 5) 轻补但不在全屏(切标签的常态) → 绝不能把藏着的控件翻出来
+    e = _Ctrl(False, False)
+    q = []
+    rep_tap(lambda fn: q.append(fn), {7: e}, e, 7, {}, 1, gentle=True)
+    for fn in q:
+        fn()
+    out.append(("非全屏轻补不翻出隐藏标签", e.Visible is False))
+    # 6) 轻补 + 本来可见 → 不切 Visible(切了会把人踢出 HTML 全屏)
+    f = _Ctrl(True, True)
+    q = []
+    rep_tap(lambda fn: q.append(fn), {7: f}, f, 7, {}, 1, gentle=True)
+    for fn in q:
+        fn()
+    out.append(("轻补不重复切 Visible", f.Visible is True and "front" in f.calls))
+    return out
+
+
+_rows = _behavioral_fs_restore()
+for _n, _okv in _rows:
+    check("全屏可见性(行为级): " + _n, _okv, "fs visibility")
+
 # bug7 地址栏文字纯白/纯黑太刺眼 → 未悬停时 70% 不透明度
 check("bug7 地址栏文字未悬停时降低不透明度(悬停/编辑回满)",
       '"tb_hover": False' in _nb_src
@@ -659,6 +759,17 @@ check("顶栏结构8 地址栏空/非 http 时显示放大镜(此时它是搜索
       and 'if not u or not (u.startswith("http://") or u.startswith("https://")):' in _nb_src
       and 'sic = glyphs.get("search")' in _nb_src
       and 'sic = glyphs.get("lock")' in _nb_src)
+# v0.4.50: 地址栏输入框整整 5 个版本没装上 —— set_cue 要读 tb.Handle(会当场创建句柄),
+# 而它当时在 gui_ready 的**后台线程**上被调用; 这样创建出来的句柄再让 UI 线程的 bar 收养,
+# WinForms 抛「在某个线程上创建的控件不能成为在另一个线程上创建的控件的父级」,
+# bar.Controls.Add(tb) 失败 → 胶囊在、图标在, 但打不了字也没有占位文案。
+# exe 没有 stdout, 这个 traceback 一直是隐形的。所以把"设占位的时机"钉住。
+_nb_head, _nb_rest = _nb_src.split("def _install():", 1)
+_nb_body = _nb_rest.split("\n    if form.InvokeRequired", 1)[0]
+check("顶栏结构9 地址栏占位必须在 _install(UI 线程)里设, 不能提前取 Handle(否则整个输入框装不上)",
+      "\n    set_cue(tb," not in _nb_head           # 后台线程上不许设(注: def 那行是列 0, 不会误判)
+      and "bar.Controls.Add(tb)" in _nb_body    # 先成为 bar 的子控件
+      and "\n            set_cue(tb," in _nb_body)  # 再设占位文案
 check("bug8 主评论列表一条不删(只标记, 组件才会继续翻页) + 补泵翻页(屏蔽后仍能一路下滑)",
       "function isMainList(u)" in _cf_c and "/x/v2/reply/wbi/main" in _cf_c
       and "if (isMain) { markBlocked(r); out.push(r); continue; }" in _cf_c
@@ -1122,6 +1233,119 @@ check("安装包构建4 两条打包路径参数必须等价(不同步会产出�
       and "--upx-exclude ft_model.bin" in _bat_exe
       # 载荷形态必须各就各位: 安装包要目录载荷(NSIS File /r), 单文件包要 onefile
       and "--onedir" in _bat_pkg and "--onefile" in _bat_exe)
+
+# ---------- 后台常驻(v0.4.50dsk): 托盘 / 开机自启 / 关窗换一批 ----------
+# 动机: 每次打开都要十几秒到半分钟才凑够第一屏。让它开机就在托盘里待着、关窗只缩进托盘,
+# 用户真正打开时内容已经抓好。这一组钉住"关窗能拦住、也能放行""自启真的带 --tray"
+# "换一批绝不清池"这几个一旦写错就要用户拿命试的点。
+_tr_src = io.open(os.path.join(PROJECT, "shell_tray.py"), encoding="utf-8").read()
+check("常驻1 关闭到托盘: FormClosing 里 Cancel + 留 allow_close 放行(否则自动更新换不掉 exe)",
+      "form.FormClosing += self._on_closing" in _tr_src
+      and "e.Cancel = True" in _tr_src
+      and 'app.sget("ui_close_to_tray") != "1"' in _tr_src
+      and "def allow_close(self)" in _tr_src
+      and "def quit(self)" in _tr_src
+      # 接线: 自动更新关窗前必须先放行, 不然 form.Close() 被拦成 Hide, 进程一直活着
+      and "self._tray.allow_close()" in _aw_src
+      # 窗口壳真的把托盘装上并注入(不装 = 上面全是死代码)
+      and "from shell_tray import install_tray" in _aw_src
+      and "api.bind_tray(" in _aw_src)
+check("常驻2 托盘图标: NotifyIcon 建在 UI 线程 + 复用 load_app_logo(PNG 压缩 ico .NET 解不了)",
+      "form.BeginInvoke(WinForms.MethodInvoker(go))" in _tr_src
+      and "WinForms.NotifyIcon()" in _tr_src
+      and "load_app_logo(32)" in _tr_src
+      # 图标拿不到也要有托盘(没托盘 = 窗口一藏再也叫不回来)
+      and "SystemIcons.Application" in _tr_src
+      and "DestroyIcon" in _tr_src)
+check("常驻3 开机自启: 写 HKCU Run + 命令带 --tray + 启动即隐藏(hidden=)",
+      'HKEY_CURRENT_USER, _AUTOSTART_RUN' in _app_src
+      and "winreg.SetValueEx" in _app_src and "winreg.DeleteValue" in _app_src
+      and "--tray" in _app_src
+      and "def autostart_sync()" in _app_src
+      and "app.autostart_sync()" in _aw_src
+      # 壳侧: 认 --tray, 且窗口 hidden —— 开机不该在用户面前弹一个窗口
+      and 'tray_start = "--tray" in argv' in _aw_src
+      and "hidden=bool(tray_start)" in _aw_src
+      and "install_tray(win, api, start_hidden=tray_start)" in _aw_src
+      # 托盘态要主动预抓一轮(隐藏的 WebView2 定时器会被系统节流)
+      and "def _tray_warm()" in _aw_src and "msx-tray-warm" in _aw_src)
+check("常驻4 关窗即换一批: 走 feed_rotate, 只换顺序+踢构建, 绝不清空当前池",
+      "def feed_rotate(wait=0.0)" in _app_src
+      # 清池 = 新内容还没抓到就先把池子清了 -> 下次打开空白 + 干等, 正是要避免的事
+      and "DELETE FROM items" not in _app_src.split("def feed_rotate(")[1].split("\ndef ")[0]
+      and "app.feed_rotate(wait=2.5)" in _aw_src       # 真退出: 短等待后落冷启动缓存
+      and "app.feed_rotate(wait=0.0)" in _tr_src)      # 缩托盘: 进程还活着, 后台抓完自己存
+# 行为级: 换一批不许动池子里的东西
+_uni_saved = list(app._universe["items"])
+_bld_saved = app._universe["building"]
+_kick_saved = app.kick_build
+try:
+    app.kick_build = lambda quick=True, pending=False: True
+    app._universe["building"] = False
+    app._universe["items"] = [{"key": "keep-1"}, {"key": "keep-2"}]
+    _tk0 = app._uni_token
+    _rr = app.feed_rotate(wait=0.05)
+    check("常驻5 换一批行为: 池子原样保留 + 换代令牌 +1(重开时重新规划顺序)",
+          _rr.get("ok") is True and app._uni_token == _tk0 + 1
+          and [it["key"] for it in app._universe["items"]] == ["keep-1", "keep-2"],
+          _rr)
+finally:
+    app.kick_build = _kick_saved
+    app._universe["items"] = _uni_saved
+    app._universe["building"] = _bld_saved
+check("常驻6 设置页两行: 默认关 + 只在 shell_info.tray 的桌面壳里显示",
+      'id="autostartRow"' in _idx_src and 'id="closeToTrayRow"' in _idx_src
+      and 'id="autostartFld" hidden' in _idx_src and 'id="closeToTrayFld" hidden' in _idx_src
+      and "#autostartFld[hidden],#closeToTrayFld[hidden]{display:none}" in
+      io.open(os.path.join(PROJECT, "web", "style.css"), encoding="utf-8").read()
+      and '"ui_autostart": "0"' in _app_src and '"ui_close_to_tray": "0"' in _app_src
+      and '"tray": (os.name == "nt")' in _aw_src
+      and "if (info && info.tray)" in _ajs_src
+      and 'segPick("#autostartRow"' in _ajs_src and 'segPick("#closeToTrayRow"' in _ajs_src
+      and 'segBind("#closeToTrayRow", "ui_close_to_tray"' in _ajs_src
+      # 自启要写注册表 -> 失败必须能回滚高亮并把原因说出来, 不能静默
+      and 'save("/api/settings", { ui_autostart: b.dataset.v }' in _ajs_src
+      and 'return self.send_json(\n                            {"ok": False, "error": "开机自启没设上' in _app_src)
+check("常驻7 从托盘回来即换一屏(与顶栏刷新同一条路, 不重载页面)",
+      "window.__msxRefreshFeed = function" in _ajs_src
+      and "refreshFeed()" in _ajs_src
+      and "window.__msxRefreshFeed && window.__msxRefreshFeed()" in _tr_src
+      # 只对 0 号(信息流)标签动手: 网页标签上不能把用户正在看的页面刷掉
+      and "tid == 0" in _tr_src)
+
+# ---------- 单实例(v0.4.51dsk): 后台已有实例时再点图标只叫回窗口, 不许再开一个进程 ----------
+# 动机: 托盘常驻之后"程序其实还活着"对用户是不可见的。这时再双击图标会多出一个壳进程,
+# 连带第二套 WebView2 用户数据目录(第二套报占用), 关掉其中一个还可能把共用的服务收掉。
+_sg_src = io.open(os.path.join(PROJECT, "shell_single.py"), encoding="utf-8").read()
+check("单实例1 判重靠命名互斥量 + ERROR_ALREADY_EXISTS 必须走 get_last_error",
+      "CreateMutexW" in _sg_src
+      and "ERROR_ALREADY_EXISTS" in _sg_src
+      # 不开 use_last_error 的话 ctypes 自己会重置错误码, get_last_error() 恒为 0
+      and "use_last_error=True" in _sg_src
+      and "ctypes.get_last_error()" in _sg_src
+      and "Local\\\\MirrorSorter-" in _sg_src   # Local\\: 同用户会话内唯一
+      and "def scope_of(" in _sg_src)
+check("单实例2 作用域按数据目录派生(隔离测试目录不会被正跑的正式实例挡回去)",
+      "os.path.normcase(os.path.abspath(" in _sg_src
+      and "scope_of(app.DATA_DIR)" in _aw_src)
+check("单实例3 判定在建窗口之前: 已有实例就 wake 后 return 0, 绝不进 shell_main",
+      "single = shell_single.acquire(scope)" in _aw_src
+      and _aw_src.index("shell_single.acquire") < _aw_src.index("return shell_main(")
+      and "return 0" in _aw_src.split("single = shell_single.acquire(scope)")[1][:900]
+      # 叫不醒旧进程时给明确提示, 而不是再起一个去抢同一个 WebView2 目录
+      and "没能把它的窗口叫出来" in _aw_src)
+check("单实例4 唤醒复用托盘「打开」那条路(不另写一套显窗口逻辑)",
+      "def raise_window(self)" in _aw_src
+      and "tray.show_window()" in _aw_src
+      # 前台权限不跨进程: 新进程必须先把前台权借给旧进程, 否则窗口只闪一下
+      and "AllowSetForegroundWindow" in _sg_src and "ASFW_ANY" in _sg_src)
+check("单实例5 监听在抢到实例就开(冷启动几十秒, 用户随时可能再点一次)",
+      "single.start(_single_raise)" in _aw_src
+      and "def _single_raise()" in _aw_src
+      # 壳还没就绪就先记 pending, 装好之后补一次(不然这次点击就被吞了)
+      and '_RAISE_TARGET["pending"] = True' in _aw_src
+      and '_RAISE_TARGET["api"] = api' in _aw_src
+      and "single:late-raise" in _aw_src)
 
 import glob
 # v0.3.1.66dsk 起构建产物统一进 desktop/build/dist/(可整目录删除)。

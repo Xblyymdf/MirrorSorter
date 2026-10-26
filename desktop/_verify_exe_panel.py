@@ -63,10 +63,30 @@ for rel in ("web/panel.html", "web/panel.js", "web/panel.css"):
         ok("归档 " + rel + " 与源码字节一致", blob == src,
            "%d vs %d bytes" % (len(blob or b""), len(src)))
 
-# ---------- 2. 旧的静态资源仍在（没被 --clean 打漏） ----------
+# ---------- 2. 旧的静态资源仍在（没被 --clean 打漏），且必须与源码逐字节一致 ----------
+# 「改完 web/ 没重新打包」是这个项目最常见的坑，所以这里不只查存在，还查字节。
 for rel in ("web/index.html", "web/app.js", "web/style.css"):
     hit = [n for n in names if n.replace("\\", "/").endswith(rel)]
     ok("归档仍含 " + rel, len(hit) == 1, hit[:2])
+    if hit:
+        blob = car.extract(hit[0])
+        src = open(os.path.join(HERE, rel.replace("/", os.sep)), "rb").read()
+        ok("归档 " + rel + " 与源码字节一致", blob == src,
+           "%d vs %d bytes" % (len(blob or b""), len(src)))
+
+# ---------- 2b. 分栏预览线必须挂 <html> ----------
+# v0.4.48: 界面缩放走 document.body.style.zoom，预览线原来挂在 <body> 里，
+# translate 位移被 zoom 再乘一次 → 字体「中/大」时那条绿线飘进右栏。
+# 这里直接扫归档里的 app.js，确认打的不是旧版本。
+_js_hit = [n for n in names if n.replace("\\", "/").endswith("web/app.js")]
+if _js_hit:
+    _js = (car.extract(_js_hit[0]) or b"").decode("utf-8", "replace")
+    ok("归档 app.js: 预览线挂 <html>(不受 body{zoom} 二次缩放)",
+       "document.documentElement.appendChild(splitGhost)" in _js
+       and "document.body.appendChild(splitGhost)" not in _js)
+    ok("归档 app.js: 拖动位移按 zoom 换算(鼠标位移除 z / 线位移乘 z)",
+       "function uiZoom()" in _js and "sign * ((ev.clientX - x0) / z)" in _js
+       and "(target - w0) * sign * z" in _js)
 
 # ---------- 3. PYZ 里必须有 shell_ai（局部 import 最容易被漏掉） ----------
 pyz_name = [n for n in names if n.endswith(".pyz") or n.endswith("PYZ-00.pyz")]
@@ -83,7 +103,8 @@ if pyz_name:
     pyz_mods = set(pyz.toc)
     ok("PYZ 含 shell_ai（局部 import 的模块）", "shell_ai" in pyz_mods,
        "共 %d 个模块" % len(pyz_mods))
-    for m in ("shell_pages", "shell_navbar", "app_window"):
+    for m in ("shell_pages", "shell_navbar", "app_window", "shell_tray",
+              "shell_single"):
         ok("PYZ 含 " + m, m in pyz_mods)
 else:
     ok("找到 PYZ", False, pyz_name[:2])
@@ -131,7 +152,10 @@ if "shell_ai" in pyz_mods:
 if "app" in pyz_mods:
     c = pyz.extract("app")
     for kw in ("set_browser_bridge", "_AGENT_BROWSER_TOOLS", "api/panel/state",
-               "panel.html"):
+               "panel.html",
+               # v0.4.50dsk 后台常驻: 开机自启注册表 + 关窗换一批
+               "autostart_apply", "_AUTOSTART_NAME", "autostart_sync",
+               "feed_rotate", "ui_close_to_tray", "ui_autostart"):
         ok("app 字节码含 " + kw, has(c, kw))
 
 # ---------- 6. 顶栏视觉重做（v0.4.43dsk）真的进了包 ----------
@@ -145,7 +169,19 @@ for mod, kws in (("shell_tabstrip", ("install_strip", "_tab_path", "_fav", "_mix
                  ("shell_navbar", ("install_navbar", "_pill_rect", "_recalc_omni",
                                    "_circle", "NAV_H",
                                    # v0.4.44dsk: 空/非 http 的地址栏给放大镜
-                                   "search"))):
+                                   "search",
+                                   # v0.4.50dsk: 地址栏占位文案(顺带修了"输入框根本没装上")
+                                   "搜索或输入网址")),
+                 # v0.4.49dsk: 悬浮窗进全屏时把控件自己藏掉 → 黑屏不恢复。
+                 # 修法是把"藏兄弟"改成按身份比较 + 几何改完把控件救回可见态。
+                 ("shell_pages", ("_fs_ensure_visible", "_same_ctrl",
+                                  "fs hid siblings", "rep-gentle", "fs-enter")),
+                 # v0.4.50dsk: 系统托盘(关闭到托盘 / 托盘菜单 / 图标)
+                 ("shell_tray", ("install_tray", "NotifyIcon", "allow_close",
+                                 "_on_closing", "load_app_logo", "ShowBalloonTip")),
+                 # v0.4.51dsk: 后台已有实例时再点图标只叫回窗口(不许再开一个进程)
+                 ("shell_single", ("CreateMutexW", "ERROR_ALREADY_EXISTS",
+                                   "AllowSetForegroundWindow", "scope_of"))):
     if mod in pyz_mods:
         c = pyz.extract(mod)
         for kw in kws:
@@ -162,6 +198,19 @@ if hit:
     ok("归档 web/index.html 页脚已是 %s" % (VER or "(未知版本)"),
        bool(VER) and bool(foot) and all(v == VER for v in foot),
        "页脚 %s / exe %s" % (sorted(set(foot)), VER))
+    # v0.4.50dsk 常规设置里那两行(后台自启 / 关闭到托盘)必须真的在包里
+    for _id in ('id="autostartRow"', 'id="closeToTrayRow"',
+                'id="autostartFld" hidden', 'id="closeToTrayFld" hidden'):
+        ok("归档 index.html 含 " + _id, _id in html)
+_ajs_hit = [n for n in names if n.replace("\\", "/").endswith("web/app.js")]
+if _ajs_hit:
+    _ajs = (car.extract(_ajs_hit[0]) or b"").decode("utf-8", "replace")
+    ok("归档 app.js: 托盘回来即换一屏(__msxRefreshFeed)",
+       "window.__msxRefreshFeed = function" in _ajs)
+    ok("归档 app.js: 两行设置只在 info.tray 时显示",
+       "if (info && info.tray)" in _ajs)
+    ok("归档 app.js: 开机自启单独提示失败原因(不静默回滚)",
+       "ui_autostart: b.dataset.v" in _ajs)
 
 print("\nRESULT: %s" % ("PASS(%d)" % PASS if not FAILS else "FAIL(%d): %s" % (len(FAILS), " | ".join(FAILS))))
 sys.exit(1 if FAILS else 0)

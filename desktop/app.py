@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-洞鉴虚明 · 基础版 (v0.4.47dsk)
+洞鉴虚明 · 基础版 (v0.4.51dsk)
 ==========================
 本地运行的洞鉴虚明：读取 B站 内容 → 黑白名单/AI 分拣 → 推荐流 + 数据源状态 + AI 聊天。
 
@@ -56,6 +56,9 @@ except Exception:   # 运行时缺失时整层自动降级为 fastText / 规则
     bert_filter = None
 
 PORTS = (8000, 8010, 8020)
+# v0.4.50: 后台常驻(仅 Windows 桌面壳) —— ① 后台自启动(登录后自动起来, 直接缩托盘, 不弹窗);
+#          ② 关闭窗口只缩进托盘, 程序留在后台继续准备内容; ③ 关窗/缩托盘时换一批(重开不是同一屏)。
+#          动机: 每次打开都要十几秒到半分钟才凑够第一屏, 让它先抓好等着。
 # v0.3.1.34: 「信息以新窗口形式打开」(主题设置, 默认开) —— 点开信息弹**独立悬浮窗**,
 #           悬浮窗可塞回标签页, 标签页也能拖出成悬浮窗(控件实例跨窗迁移, 页面不重载)。
 # v0.3.1.33: 「弹幕列表一直是空的(有概率)」根治 —— 分段补取重写成"自愈看门狗 + 代次守卫",
@@ -70,7 +73,7 @@ if _PORT_ENV:
         PORTS = (int(_PORT_ENV),)
     except Exception:
         pass
-APP_VER = "v0.4.47dsk"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
+APP_VER = "v0.4.51dsk"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
 # 本机回环请求必须绕过系统代理: 用户开着 Clash/V2Ray/公司代理时, 环境里的 http_proxy 会把
 # 127.0.0.1 的请求转给代理服务器, 轻则 502, 重则心跳连续失败 -> 悬浮球探活 2 轮不过自我了断,
 # 表现为「球莫名消失/点定位没反应」。这里建一个禁用代理的 opener 专供本地调用; 外网 API 仍走
@@ -1016,6 +1019,14 @@ DEFAULTS = {
     "ui_search_engine": "bing",
     # 启动软件时自动打开一个浏览器标签页(搜索引擎首页); 默认关
     "ui_browser_on_start": "0",
+    # v0.4.50dsk 后台常驻(仅 Windows 桌面壳; 安卓/浏览器模式下这两行设置不显示):
+    # 软件每次打开都要十几秒到半分钟才凑够第一屏, 所以让它在后台先把内容抓好 ——
+    #   ui_autostart    = 登录系统后自动启动(带 --tray, 直接缩在托盘里, 不弹窗)
+    #   ui_close_to_tray= 点窗口关闭只缩进托盘, 程序不退出(后台继续准备内容)
+    # 两个默认都关: 用户不主动开, 关窗/启动的行为与旧版完全一致。
+    "ui_autostart": "0",
+    "ui_close_to_tray": "0",
+    "ui_tray_tipped": "0",     # 已经提示过"还在托盘里跑"; 只提示一次, 免得每次关窗都弹
     "m_max_age_months": "5",  # 机器筛选: 只显示最近N个月发布的内容(0=不限)
     "ser_max_age_months": "30",  # 严肃模式独立时间窗: 知识/教程内容历史长, 默认30个月(0=不限)
     "m_seen_hours": "6",      # 通用筛选: 已看信息N小时内不重复出现(0=不限)
@@ -14372,6 +14383,139 @@ def _cold_start_preheat():
     return True
 
 
+# ---------------------------------------------------------------- 后台常驻(托盘 / 开机自启)
+# 为什么要有这一组: 软件每次打开都要十几秒到半分钟才凑够第一屏(多源抓取 + 机器筛选 +
+# AI 评分)。让它开机就悄悄在托盘里跑、关窗只缩回托盘, 用户真正打开时内容已经抓好 ——
+# 这才是"打开就能用"。只有 Windows 桌面壳会用到; 安卓 / 浏览器模式 autostart_supported()
+# 为 False, 前端也不显示这两行设置。
+_AUTOSTART_RUN = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_AUTOSTART_NAME = "MirrorSorter"     # 只动自己这一项, 不碰别的程序写进 Run 的值
+
+
+def autostart_supported():
+    """这台机器能不能配开机自启(仅 Windows 桌面版)。"""
+    return os.name == "nt"
+
+
+def autostart_command():
+    """开机自启要执行的命令行 —— 一定带 --tray: 开机时直接缩在托盘里, 不弹窗。
+    打包态用 exe 自身; 源码态用同目录的 pythonw.exe 拉起 app_window.py(不带黑框)。"""
+    if getattr(sys, "frozen", False):
+        return '"%s" --tray' % sys.executable
+    pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    runner = pyw if os.path.isfile(pyw) else sys.executable
+    return '"%s" "%s" --tray' % (runner, os.path.join(APP_DIR, "app_window.py"))
+
+
+def _autostart_value():
+    """注册表里存的命令行(没有这一项返回 "")。"""
+    if not autostart_supported():
+        return ""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_RUN) as k:
+            v, _t = winreg.QueryValueEx(k, _AUTOSTART_NAME)
+            return str(v or "")
+    except Exception:
+        return ""
+
+
+def autostart_state():
+    """"1"/"0" —— 以**注册表**为准: 设置键只是用户的意愿, 系统里有没有这一项才是事实。"""
+    return "1" if _autostart_value() else "0"
+
+
+def autostart_apply(on):
+    """写/删开机自启项。返回 "ok" / "unsupported" / "err:<原因>"。
+
+    值内容永远是**当前** exe 的路径: 用户把 exe 挪了位置、或换了带版本号的新文件名,
+    下次启动 autostart_sync() 会把它纠回来。
+    """
+    if not autostart_supported():
+        return "unsupported"
+    try:
+        import winreg
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _AUTOSTART_RUN) as k:
+            if on:
+                winreg.SetValueEx(k, _AUTOSTART_NAME, 0, winreg.REG_SZ, autostart_command())
+            else:
+                try:
+                    winreg.DeleteValue(k, _AUTOSTART_NAME)
+                except FileNotFoundError:
+                    pass
+        return "ok"
+    except Exception as e:
+        return "err:%s: %s" % (type(e).__name__, str(e)[:120])
+
+
+def autostart_sync():
+    """启动时对齐一次: 设置说开着就确保注册表指向**当前** exe, 说关着就确保没有残留。
+    用户可能在旧路径上开着自启, 然后换了新版本 exe(文件名带版本号) —— 不对齐的话
+    开机拉起的会是那个已经被替换/删掉的旧文件。"""
+    if not autostart_supported():
+        return "unsupported"
+    want = sget("ui_autostart") == "1"
+    cur = _autostart_value()
+    if not want:
+        return "ok" if not cur else autostart_apply(False)
+    if cur.strip().lower() == autostart_command().strip().lower():
+        return "ok"
+    return autostart_apply(True)
+
+
+def feed_rotate(wait=0.0):
+    """关闭窗口 / 缩进托盘时调用: 换一批, 下次打开不该又是刚才那一屏。
+
+    三步(顺序有意义):
+      ① 作废旧推送套餐 —— 重开时重新规划顺序, 不会又从头念一遍同样几条;
+      ② 解掉补池退避 + 清指纹记忆, 立刻在后台抓一轮新的;
+      ③ wait>0(真退出) 时最多等这么久, 让这一轮的池子落进冷启动缓存 ——
+         窗口已经没了, 用户看不到等待, 进程在后台多留几秒而已; 不等的话(缩托盘)
+         进程本来就活着, 等构建跑完自己把新池存成冷启动缓存。
+
+    绝不在这里清空池子: 池清掉了而新内容又没抓到, 下次打开就是一片空白 + 干等,
+    正好是用户想避免的那件事。
+    """
+    global _uni_token
+    t0 = time.time()
+    with _uni_lock:
+        if not _universe["building"]:     # 构建在跑时换令牌会把它整轮作废(见 /api/feed)
+            _uni_token += 1
+    try:
+        _tb_allow_retry()    # 用户关窗也算"想换一批": 解掉贴吧 403 冷却(60s 内只放一次)
+    except Exception:
+        pass
+    try:
+        _fp_clear()
+    except Exception:
+        pass
+    started = kick_build(quick=True, pending=True)
+
+    def _idle():
+        with _uni_lock:
+            return not _universe["building"]
+
+    if wait and float(wait) > 0:
+        end = time.time() + float(wait)
+        while time.time() < end and not _idle():
+            time.sleep(0.1)
+        try:
+            persist_cold_cache(force=True)
+        except Exception:
+            pass
+    else:
+        def _after():
+            end = time.time() + 180
+            while time.time() < end and not _idle():
+                time.sleep(0.5)
+            try:
+                persist_cold_cache(force=True)
+            except Exception:
+                pass
+        threading.Thread(target=_after, daemon=True, name="msx-rotate-save").start()
+    return {"ok": True, "started": bool(started), "waited": round(time.time() - t0, 2)}
+
+
 def serve_chunk(offset=0, limit=30, q="", request_id="", plat=""):
     """取当前世代的 [offset:offset+limit]; 到底时自动触发新生代构建。"""
     with _uni_lock:
@@ -15685,7 +15829,8 @@ class Handler(BaseHTTPRequestHandler):
                                                         "ui_fg", "ui_sr_level", "ui_sr_scale",
                                                         "ui_ownui", "ui_new_window",
                                                         "ui_search_engine",
-                                                        "ui_browser_on_start")}
+                                                        "ui_browser_on_start",
+                                                        "ui_autostart", "ui_close_to_tray")}
                                   | {"ai_ok": ai_ok(), "ai_on": ai_on()})
         if path == "/api/floatball":
             env = float_ball_env()
@@ -16081,7 +16226,8 @@ class Handler(BaseHTTPRequestHandler):
                       "price_in", "price_out", "ai_full_scan", "ai_interest_min",
                       "ai_batch", "ai_cache_hours", "ai_enabled", "ui_bq", "ui_bq_level",
                       "ui_sr", "ui_fg", "ui_sr_level", "ui_sr_scale", "ui_ownui",
-                      "ui_new_window", "ui_search_engine", "ui_browser_on_start"):
+                      "ui_new_window", "ui_search_engine", "ui_browser_on_start",
+                      "ui_close_to_tray"):
                 if k in body and body[k] is not None:
                     if k in ("ai_base", "ai_model") and not str(body[k]).strip():
                         continue   # 地址/模型不允许空值覆盖(保留默认/原值)
@@ -16089,7 +16235,8 @@ class Handler(BaseHTTPRequestHandler):
                         continue   # 档位白名单: 防止乱码/非法值污染
                     if k == "ui_search_engine" and str(body[k]) not in SEARCH_ENGINES:
                         continue   # 搜索引擎白名单: google / baidu / bing
-                    if k == "ui_browser_on_start" and str(body[k]) not in ("0", "1"):
+                    if k in ("ui_browser_on_start", "ui_close_to_tray") and \
+                            str(body[k]) not in ("0", "1"):
                         continue   # 只管开/关两态
                     sset(k, body[k])
             if any(k in body for k in ("ai_full_scan", "ai_interest_min", "ai_batch",
@@ -16107,7 +16254,19 @@ class Handler(BaseHTTPRequestHandler):
                     db().execute("DELETE FROM shown")
                     db().commit()
                 force_rebuild()
-            return self.send_json({"ok": True, "ai_ok": ai_ok(), "ai_on": ai_on()})
+            # 开机自启要写注册表(不在 settings 表里"存一下"就算数), 所以单独一步:
+            # 注册表写失败就如实拒绝, 让前端把开关弹回去 —— 界面显示"已开启"而系统里
+            # 没有这一项, 是比不提供这个开关更糟的谎话。
+            if "ui_autostart" in body and body.get("ui_autostart") is not None:
+                want = str(body.get("ui_autostart")) == "1"
+                if str(body.get("ui_autostart")) in ("0", "1"):
+                    res = autostart_apply(want)
+                    if str(res).startswith("err"):
+                        return self.send_json(
+                            {"ok": False, "error": "开机自启没设上：" + str(res)[4:].strip()})
+                    sset("ui_autostart", "1" if want else "0")
+            return self.send_json({"ok": True, "ai_ok": ai_ok(), "ai_on": ai_on(),
+                                   "autostart": autostart_state()})
 
         if path == "/api/settings/export":
             payload = settings_export_payload(bool(body.get("credentials")))
