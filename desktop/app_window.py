@@ -316,6 +316,15 @@ class ShellApi:
         # 激活标签最近一次导航状态(收藏 ☆ 的「当前网页」); 0 号信息流永远为空
         self._live_id = self.HOME_ID
         self._live_url = ""
+        # 页面缩放(菜单 −/+): 全局一档, 落库给新标签用。别每标签各存一份 ——
+        # Chrome 也是"本站点记住", 而这里连站点都没有, 全局最不容易出意外。
+        try:
+            self._zoom = max(0.5, min(2.0, float(app.sget("ui_page_zoom") or "1")))
+        except Exception:
+            self._zoom = 1.0
+        # 浏览历史去抖: 一次导航会连发 HistoryChanged + SourceChanged, 同 url 只记一次
+        self._hist_last = ("", 0.0)
+        self._bm = None           # 收藏仓库(菜单里的"收藏此页"用)
 
     def attach(self, win, app_url):
         """主窗口创建后绑定窗口引用(供控件池 marshal 与窗口按钮使用)。"""
@@ -802,6 +811,9 @@ class ShellApi:
         if prev_id != tab["id"]:
             pages.hide(prev_id)
         pages.push_nav(tab["id"])   # 切标签后补推导航状态(防地址栏显示旧 URL)
+        if self._zoom != 1.0:
+            # 缩放是全局一档: 新开的标签也要跟上, 否则"设过 125% 之后新标签又变回 100%"
+            pages.set_zoom(tab["id"], self._zoom)
 
     def update_title(self, tab_key, title):
         """站点控件的 DocumentTitleChanged 回调 → 刷新标签标题(悬浮窗同步迷你标题栏)。"""
@@ -929,6 +941,131 @@ class ShellApi:
         self._push_ai_state(on)
         return "on" if on else "off"
 
+    # ---- 栏尾主菜单(v0.4.52): 历史记录 / 翻译 / 缩放 / 打印 / 收藏 ----
+    # 菜单项在这里组装(文字/图标/回调), shell_menu 只负责画与命中 —— 于是
+    # shell_menu / shell_history / shell_translate 都不需要 import 壳, 不成环。
+    def bind_bookmarks(self, store):
+        """注入收藏仓库(菜单里的「收藏此页」与收藏栏共用同一个 store)。"""
+        self._bm = store
+
+    def _scheme(self):
+        """页面推来的顶栏配色(菜单/历史面板/提示条都跟着它走)。"""
+        try:
+            raw = app.sget("ui_bg_scheme")
+            if raw and str(raw).strip().startswith("{"):
+                import json as _j
+                return _j.loads(raw)
+        except Exception:
+            pass
+        return {}
+
+    def _menu_anchor(self):
+        fn = self._navbar_update
+        getter = getattr(fn, "menu_anchor", None) if fn is not None else None
+        if getter is None:
+            return None
+        try:
+            return getter()
+        except Exception:
+            return None
+
+    def toast(self, text, ms=2200):
+        """右下角轻提示(不抢焦点)。"""
+        try:
+            import shell_menu
+            return shell_menu.Toast(self._win, text, ms=ms, scheme=self._scheme())
+        except Exception:
+            _log_exc("toast")
+            return None
+
+    def open_menu(self):
+        """导航栏栏尾 ☰ → Chrome 式主菜单。"""
+        import shell_menu
+        ap = self.active_page() or {}
+        url = str(ap.get("url") or "")
+        items = [
+            {"kind": "item", "label": "新建标签页", "glyph": "\uE710",
+             "fn": lambda: self.tab_new("browser")},
+            {"kind": "item", "label": "历史记录", "glyph": "\uE81C",
+             "fn": self.open_history},
+        ]
+        if self._bm is not None:
+            try:
+                on = bool(url) and bool(self._bm.has(url))
+            except Exception:
+                on = False
+            items.append({"kind": "item",
+                          "label": "取消收藏" if on else "收藏此页",
+                          "glyph": "\uE735" if on else "\uE734",
+                          "dim": not url,
+                          "fn": (lambda: self._toggle_bm(url)) if url else None})
+        items += [
+            {"kind": "sep"},
+            {"kind": "zoom", "label": "缩放",
+             "get": lambda: self._zoom, "set": self.zoom_step},
+            {"kind": "sep"},
+            {"kind": "item", "label": "打印…", "glyph": "\uE749",
+             "dim": not url, "fn": (lambda: self.print_page()) if url else None},
+            {"kind": "item", "label": "翻译此页面", "glyph": "\uE774",
+             "dim": not url, "fn": (lambda: self.translate_page()) if url else None},
+            {"kind": "sep"},
+            {"kind": "item", "label": "在系统浏览器中打开", "glyph": "\uE8A7",
+             "dim": not url, "fn": (lambda: self.open_external(url)) if url else None},
+        ]
+        return shell_menu.show_menu(self._win, anchor=self._menu_anchor(),
+                                    items=items, scheme=self._scheme())
+
+    def _toggle_bm(self, url):
+        try:
+            title = str((self.active_page() or {}).get("title") or "")
+            self._bm.toggle(url, title)
+        except Exception:
+            _log_exc("bookmark/toggle")
+
+    def open_history(self):
+        """菜单「历史记录」→ 历史面板(搜索/打开/单条删除/清空)。"""
+        import shell_history
+        try:
+            return shell_history.show_history(self._win, self, anchor=self._menu_anchor(),
+                                              scheme=self._scheme())
+        except Exception:
+            _log_exc("history/open")
+            return None
+
+    def translate_page(self):
+        """菜单「翻译此页面 / 显示原文」(后台线程跑, 立刻返回)。"""
+        if self._pages is None:
+            return "no-pages"
+        import shell_translate
+        try:
+            return shell_translate.translate_page(self._win, self, self._pages,
+                                                  scheme=self._scheme())
+        except Exception:
+            _log_exc("translate")
+            return "err"
+
+    def print_page(self):
+        if self._pages is None:
+            return "no-pages"
+        self._pages.print_page(self._active_id())
+        return "ok"
+
+    def zoom_step(self, delta):
+        """菜单缩放行的 −/+。返回新倍率(菜单立刻重画百分比)。"""
+        try:
+            cur = float(self._zoom or 1.0)
+        except Exception:
+            cur = 1.0
+        v = round(max(0.5, min(2.0, cur + (0.1 if delta > 0 else -0.1))), 2)
+        self._zoom = v
+        if self._pages is not None:
+            self._pages.set_zoom(self._active_id(), v)
+        try:
+            app.sset("ui_page_zoom", "%.2f" % v)
+        except Exception:
+            pass
+        return v
+
     def bind_strip(self, update_fn):
         """注入原生标签栏重绘回调(shell_tabstrip.install_strip 的返回值)。"""
         self._strip_update = update_fn
@@ -942,6 +1079,7 @@ class ShellApi:
     def _on_nav(self, tab_key, url, can_back, can_fwd):
         """控件池的导航状态回调(HistoryChanged/SourceChanged/push_nav)。
         只反映激活标签 —— 后台标签的导航不刷地址栏。"""
+        self._hist_note(tab_key, url)
         with self._lock:
             active = self._active
             pinned = next((x["pinned"] for x in self._tabs if x["id"] == active), True)
@@ -953,6 +1091,34 @@ class ShellApi:
             self._live_id = tab_key
             self._live_url = u
         self._push_nav(u, can_back, can_fwd)
+
+    def _hist_note(self, tab_key, url):
+        """记一条浏览历史。★ 所有标签都记(后台开的页也要进历史), 不只激活标签。
+
+        去抖: 一次导航会连发 HistoryChanged + SourceChanged(甚至多次), 同 url
+        30 秒内只落一次库 —— 否则列表里同一个视频会出现三四条, 还白写磁盘。
+        信息流(127.0.0.1)由 app.web_hist_add 自己拒掉。
+        """
+        u = str(url or "")
+        if not u.startswith(("http://", "https://")):
+            return
+        now = time.time()
+        last_u, last_t = self._hist_last
+        if u == last_u and now - last_t < 30:
+            return
+        self._hist_last = (u, now)
+        title = ""
+        with self._lock:
+            t = next((x for x in self._tabs if x["id"] == tab_key), None)
+            if t is not None:
+                title = str(t.get("title") or "")
+        try:
+            # 落库放到短线程里: 本函数是从 WebView2 的事件回调里进来的(UI 线程),
+            # 而 _db_lock 可能正被后台抓取占着 —— 在这里同步等会把整个界面卡住。
+            threading.Thread(target=app.web_hist_add, args=(u, title),
+                             daemon=True, name="msx-hist").start()
+        except Exception:
+            pass
 
     def _push_nav(self, url, can_back, can_fwd):
         fn = self._navbar_update
@@ -1022,6 +1188,7 @@ def main(argv=None):
             e2e_ai_url = None
     e2e_split = "--e2e-split" in argv   # 测试钩子: 量化拖动分栏时的布局/重绘次数
     e2e_chrome = "--e2e-chrome" in argv  # 测试钩子: 真窗口渲染顶栏成 PNG + 结构断言
+    e2e_menu = "--e2e-menu" in argv      # 测试钩子: 真窗口里点开栏尾 ⋮ 菜单并截图
     e2e_tray = "--e2e-tray" in argv      # 测试钩子: 托盘(隐藏启动/关窗拦截/托盘退出)
     e2e_float_resize_url = None
     if "--e2e-float-resize" in argv:  # 测试钩子: 真鼠标消息驱动悬浮窗八向缩放
@@ -1088,6 +1255,7 @@ def main(argv=None):
                       e2e_float_resize_url=e2e_float_resize_url,
                       e2e_ai_url=e2e_ai_url, e2e_split=e2e_split,
                       e2e_chrome=e2e_chrome, tray_start=tray_start,
+                      e2e_menu=e2e_menu,
                       e2e_tray=e2e_tray, single=single)
 
 
@@ -1628,6 +1796,159 @@ def _probe_dir():
         return os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "build", "probe")
     return os.path.join(HERE, "build", "probe")
 
+
+def _e2e_menu_shot(api):
+    """真机自测(v0.4.52): 在**真窗口**里点一次栏尾 ⋮, 把弹出的主菜单截下来。
+
+    为什么要点而不是直接调 `api.open_menu()`: 直接调只证明"菜单画得出来",
+    证明不了导航栏里那句 `if on_menu is not None: on_menu()` 是通的 —— 而"参数加了
+    没人传"在这个项目里已经栽过一次(`install_strip(favicons=)` 曾是死代码)。
+    所以这里走 `Panel.OnMouseClick` 的反射调用(protected), 让**真实的命中判定 +
+    真实的接线**跑一遍。
+
+    产物: build/probe/menu_real.png(打包态在 exe 同级)
+    """
+    import traceback
+    import System.Windows.Forms as WF
+    from System.Drawing import Bitmap, Rectangle
+    from System.Reflection import BindingFlags
+
+    lines, fails = [], [0]
+
+    def say(m):
+        lines.append(str(m))
+        # ★ 打包态(stdout 是 GBK)打印 "⋮" 这类字符会抛 UnicodeEncodeError,
+        #   而这里在 gui_ready 里 —— 一抛整个自测就断了(实测打包态直接跳过截图)。
+        s = "[e2e-menu] " + str(m)
+        try:
+            print(s, flush=True)
+        except Exception:
+            try:
+                enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+                print(s.encode(enc, "replace").decode(enc, "replace"), flush=True)
+            except Exception:
+                pass
+
+    def ok(name, cond, detail=""):
+        say(("PASS  " if cond else "FAIL  ") + name + (("  " + str(detail)) if detail else ""))
+        if not cond:
+            fails[0] += 1
+
+    nav = getattr(api, "_navbar_update", None)
+    bar = getattr(nav, "bar", None)
+    ok("0 拿到导航栏控件", bar is not None)
+    if bar is None:
+        return fails[0]
+
+    def click():
+        try:
+            cx, cy = nav.menu_center()
+            ev = WF.MouseEventArgs(WF.MouseButtons.Left, 1, int(cx), int(cy), 0)
+            m = bar.GetType().GetMethod(
+                "OnMouseClick",
+                BindingFlags.NonPublic | BindingFlags.Instance)
+            m.Invoke(bar, [ev])
+            return (int(cx), int(cy))
+        except Exception:
+            traceback.print_exc()
+            return None
+
+    def find_popup():
+        """菜单是独立的无边框 Form, 从 Application.OpenForms 里认出来。"""
+        try:
+            forms = [f for f in WF.Application.OpenForms]
+        except Exception:
+            return None
+        best = None
+        none_fs = getattr(WF.FormBorderStyle, "None")   # None 是关键字, 不能写点号
+        for f in forms:
+            try:
+                if f is bar or f is api._win.native:
+                    continue
+                if f.Width > 200 and f.Height > 120 and f.FormBorderStyle == none_fs:
+                    best = f
+            except Exception:
+                pass
+        return best
+
+    hit = click()
+    ok("1 点到了栏尾 ⋮(命中判定返回 menu)", hit is not None, hit)
+    time.sleep(0.6)
+    pop = find_popup()
+    ok("2 菜单真的弹出来了(说明 on_menu 接线是通的)", pop is not None)
+    if pop is None:
+        return fails[0]
+    try:
+        sc = float(getattr(api._win.native, "_scale", 1.0) or 1.0)
+        ok("3 菜单宽度是设计值", abs(pop.Width - int(268 * sc)) <= 2,
+           "%s vs %s" % (pop.Width, int(268 * sc)))
+        scr = WF.Screen.FromControl(api._win.native).WorkingArea
+        ok("4 菜单完整落在工作区内",
+           pop.Left >= scr.X and pop.Top >= scr.Y and
+           pop.Right <= scr.Right + 1 and pop.Bottom <= scr.Bottom + 1,
+           "%s,%s %sx%s" % (pop.Left, pop.Top, pop.Width, pop.Height))
+        bmp = Bitmap(pop.Width, pop.Height)
+        pop.DrawToBitmap(bmp, Rectangle(0, 0, pop.Width, pop.Height))
+        p = os.path.join(_probe_dir(), "menu_real.png")
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        bmp.Save(p)
+        say("shot -> " + p)
+        ok("5 菜单渲染不抛异常", True)
+    except Exception as e:
+        ok("5 菜单渲染不抛异常", False, repr(e))
+    finally:
+        try:
+            pop.Close()
+        except Exception:
+            pass
+
+    # ---- 历史记录面板(有原生子控件, 必须真 Show 才截得到内容) ----
+    made = []
+    try:
+        for i in range(3):
+            u = "https://example.com/msx-e2e/%d" % i
+            made.append(u)
+            app.web_hist_add(u, "示例页面 %d —— 这是一条足够长的标题, 用来看看省略号" % i)
+        hp = api.open_history()
+        ok("6 历史面板弹出来了", hp is not None)
+        time.sleep(0.5)
+        if hp is not None:
+            btns = []
+
+            def _walk(c):
+                try:
+                    for x in c.Controls:
+                        if isinstance(x, WF.Button) and str(getattr(x, "Tag", "") or ""):
+                            btns.append(x)
+                        _walk(x)
+                except Exception:
+                    pass
+            _walk(hp)
+            ok("7 每条记录一行(3 条)", len(btns) == 3, len(btns))
+            bmp = Bitmap(hp.Width, hp.Height)
+            hp.DrawToBitmap(bmp, Rectangle(0, 0, hp.Width, hp.Height))
+            p2 = os.path.join(_probe_dir(), "history_real.png")
+            bmp.Save(p2)
+            say("shot -> " + p2)
+            hp.Close()
+    except Exception as e:
+        ok("6 历史面板弹出来了", False, repr(e))
+    finally:
+        try:
+            for u in made:
+                app.web_hist_del(u)
+        except Exception:
+            pass
+
+    say("RESULT: %s" % ("PASS" if not fails[0] else "FAIL(%d)" % fails[0]))
+    try:
+        import io as _io
+        with _io.open(os.path.join(_probe_dir(), "menu_e2e.log"), "w",
+                      encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except Exception:
+        pass
+    return fails[0]
 
 def _e2e_chrome_shot(form, strip_update, nav_update):
     """真机自测: 把**真实窗口**里的标签条 + 导航栏渲染成 PNG, 并断言顶栏结构。
@@ -2238,7 +2559,7 @@ def _tray_warm():
 
 def shell_main(e2e_url=None, e2e_float_url=None, e2e_float_resize_url=None,
                e2e_ai_url=None, e2e_split=False, e2e_chrome=False, tray_start=False,
-               e2e_tray=False, single=None):
+               e2e_tray=False, single=None, e2e_menu=False):
     """窗口壳主流程: 起/复用服务 → WebView2 检测 → 主窗口(含标签页) → 全关后收尾。
 
     e2e_url 仅测试用(_e2e_shell.py): 主窗口就绪后自动走一次 open_in_app 桥调用,
@@ -2399,8 +2720,10 @@ def shell_main(e2e_url=None, e2e_float_url=None, e2e_float_resize_url=None,
                 bg_getter=lambda: app.sget("ui_bg_scheme"),
                 accent_getter=lambda: app.sget("float_ball_accent"),
                 bookmarks=bm_store,
+                on_menu=api.open_menu,
                 title_getter=lambda: (api.active_page() or {}).get("title") or "")
             api.bind_navbar(nav_update)
+            api.bind_bookmarks(bm_store)   # 菜单「收藏此页」与 ☆ 共用同一个仓库
             chrome["nav"] = getattr(nav_update, "bar", None)
         except Exception:
             _log_exc("shell_navbar/install")
@@ -2508,6 +2831,25 @@ def shell_main(e2e_url=None, e2e_float_url=None, e2e_float_resize_url=None,
             finally:
                 try:
                     time.sleep(1)
+                    win.destroy()
+                except Exception:
+                    pass
+                try:
+                    app.shutdown(server)
+                except Exception:
+                    pass
+                os._exit(0)
+        if e2e_menu:
+            # 栏尾菜单自测: 真窗口里点一次 ⋮, 截图 + 断言几何, 自己退出
+            try:
+                time.sleep(4)
+                _e2e_menu_shot(api)
+            except Exception:
+                import traceback
+                traceback.print_exc()
+            finally:
+                try:
+                    time.sleep(0.4)
                     win.destroy()
                 except Exception:
                     pass

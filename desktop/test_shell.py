@@ -1347,6 +1347,30 @@ check("单实例5 监听在抢到实例就开(冷启动几十秒, 用户随时�
       and '_RAISE_TARGET["api"] = api' in _aw_src
       and "single:late-raise" in _aw_src)
 
+# ---------- 栏尾主菜单 / 历史记录 / 整页翻译 (v0.4.52dsk) ----------
+# 这几条是"结构约定", 行为回归在 _test_menu452.js(node 沙盒跑注入页面的 JS)与
+# _test_menu452.py(存储层/翻译对齐/接线)里, 这里只挡"接线被改断"。
+_nav_src = io.open(os.path.join(PROJECT, "shell_navbar.py"), encoding="utf-8").read()
+_pg_src = io.open(os.path.join(PROJECT, "shell_pages.py"), encoding="utf-8").read()
+_theme_js = _pg_src[_pg_src.index('_THEME_DARK_JS = r"""'):_pg_src.index('_LIGHT_JS = r"""')]
+check("菜单1 导航栏栏尾有主菜单按钮, 且地址栏胶囊给它让位",
+      "def _menu_rect()" in _nav_src and "BTN_W - int(2 * scale)" in _nav_src)
+check("菜单2 菜单按钮走 on_menu 回调, 且窗口壳真的传了(参数加了没人传 = 死代码)",
+      "on_menu=None" in _nav_src and "on_menu()" in _nav_src
+      and "on_menu=api.open_menu" in _aw_src)
+check("菜单3 菜单里有「历史记录」和「翻译此页面」两项",
+      '"label": "历史记录"' in _aw_src and '"label": "翻译此页面"' in _aw_src)
+check("深色4 兜底深色不再整页 filter(否则视频/图片会被一起反色 —— 百度网盘实测)",
+      "var SAFE_CSS" in _theme_js
+      and "filter" not in _theme_js.split("var SAFE_CSS")[1].split(";")[0]
+      and "xiaoheihe" in _theme_js)
+check("深色5 逐元素改色要记原值(切回白天必须能还原, 只删 <style> 会留一页黑底)",
+      "getPropertyPriority" in _theme_js and "restoreAll" in _theme_js
+      and "__MSX_DK_ORIG" in _pg_src[_pg_src.index('_LIGHT_JS = r"""'):][:1500])
+check("翻译1 整页翻译复用设置里的 AI 接口, 不引外部翻译服务",
+      "app.translate_texts" in io.open(
+          os.path.join(PROJECT, "shell_translate.py"), encoding="utf-8").read())
+
 import glob
 # v0.3.1.66dsk 起构建产物统一进 desktop/build/dist/(可整目录删除)。
 # 这里两处都看: 老路径 dist/ 兼容历史检出, 新路径 build/dist/ 才是现在的产物位置

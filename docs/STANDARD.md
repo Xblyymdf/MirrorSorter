@@ -169,7 +169,9 @@ python test_rules.py       :: 规则引擎
 python test_chat.py        :: AI 聊天
 python test_ai_panel.py    :: 右侧 AI 面板（状态/桥/工具分派/宽度夹取/分栏修复）
 python _shot_chrome.py     :: 顶栏（标签条+导航栏）真渲染成 PNG：深/浅/悬停/窄窗四张
+python _shot_menu.py       :: 栏尾菜单/历史面板真渲染成 PNG
 node  _test_ai_page_js.js  :: 注入网页的助手脚本（vm + 假 DOM，断言真的发了哪些调用）
+node  _test_menu452.js     :: 注入网页的深色兜底/翻译脚本（vm + 假 DOM，断言改了哪些元素）
 node  _test_splitghost_zoom.js :: 分栏拖动预览线（抽真实代码 + 按 zoom 语义的假 DOM）
 ```
 
@@ -312,6 +314,72 @@ python _verify_exe_panel.py             :: 归档 app.js 里必须是新写法
   zoom 语义算几何的假 DOM 真跑；它有敏感性自检（旧实现必挂 15 项）。
 - `_verify_exe_panel.py` 现在对 `web/index.html` / `app.js` / `style.css` 做**逐字节比对**，
   堵「改完 web/ 没重新打包」这个老坑。
+
+### 本版专项（v0.4.52dsk 深色兜底不再反色 + 栏尾菜单/历史记录/整页翻译）
+
+```bat
+node  _test_menu452.js     :: 24 项: 注入页面的两段 JS 在假 DOM 里真跑(不反色/采集/回写/还原)
+python _test_menu452.py    :: 43 项: 历史存储 + 翻译对齐/降级 + 菜单接线(不建窗不联网)
+python _shot_menu.py       :: 主菜单/历史面板真渲染成 PNG(间距、缩放行折行看不出来)
+python test_shell.py       :: 「菜单1~3」「深色4~5」「翻译1」
+python app_window.py --e2e-menu   :: 真窗口里**点一次**栏尾 ⋮, 截图 + 断言几何, 自己退出
+python _verify_exe_panel.py       :: 归档层: 三个新模块真的进了 PYZ
+```
+
+**一、深色兜底不许反色媒体**（用户报修：百度网盘看视频，播放画面被整块反色）
+
+- 根因是给 `html` 挂 `filter:invert()`：filter 作用于**整棵子树**，再给
+  `img,video,canvas,iframe` 挂 `invert(1)` 反回来这条路根本堵不住 —— 影子 DOM 里的播放器
+  收不到文档级选择器，跨域 iframe / WebGL 画布 / 背景图各有各的漏点，而且 invert 会把
+  彩色变补色（浅蓝→土黄）。**结论：浅色站点的兜底深色不许用 filter。**
+- 现在改成"只压背景板 + 提亮文字"：注入
+  `html{color-scheme:dark;background:#0f1115}`，再用 JS 逐元素把**浅色不透明背景**压暗、
+  **深色文字**提亮（有彩度的混白保色相，中性色抬到 200~230），浅色边框跟着压暗。
+  媒体元素一个字节都不碰 —— 视频画面像素级原样。
+- ★ 逐元素改的是 **inline style**，所以必须**记原值**（`__MSX_DK_ORIG`）：
+  切回白天时只删 `<style>` 会留下"一页被压暗的底色"，而且再也回不去。
+- ★ 用 `WeakSet` 记"处理过"，**不要给 DOM 加 `data-` 属性** —— 几千个 setAttribute 会惊动
+  站点自己的 MutationObserver，也拖慢滚动。
+- 小黑盒（`xiaoheihe.cn`）按用户要求**保留**旧的整页反色，代码里单独一条分支。
+- 页面本身就是深色（测背景亮度 < 100）→ 一动不动。
+
+**二、栏尾主菜单（`shell_menu.py`）**
+
+- 导航栏右端新增 ⋮（三竖点自己画，MDL2 的 "More" 是横排），地址栏胶囊右端给它让位。
+- 菜单项：新建标签页 / 历史记录 / 收藏此页 · 缩放(− 100% +) · 打印… / 翻译此页面 /
+  在系统浏览器中打开。**当前标签没有网页时相应项进 `dim` 禁用态**，不给"点了没反应"的假按钮。
+- ★ 仍是自绘无边框 Form（理由同标签条「+」）：`ContextMenuStrip` 在深色主题下露白边，
+  也跟不上页面推来的 `ui_bg_scheme`。
+- ★★ **字体点值不许乘 `scale`**：`Font` 的单位是"点"，GDI+ 会按控件 DPI 再换算一次 ——
+  乘了就是双重放大（150% 下 9pt 变 20pt，缩放行的 "100%" 直接折成两行）。行高/宽度照旧乘。
+- 菜单项由 `app_window` 组装（`items` 列表），`shell_menu/history/translate` 都**不 import 壳**，
+  所以不会成环。
+
+**三、历史记录（`shell_history.py` + `web_hist` 表）**
+
+- 新表 `web_hist(url PRIMARY KEY, title, ts, visits)`：**按 url 去重**，同一页反复打开只更新
+  时间与次数（列表不会被同一个视频页刷屏，删除单条也只需要 url）。保留 400 天。
+- ★ 与老表 `history(key, ts)` **不是一回事**：那张是"信息流里看过哪些内容"。
+- 记录点在 `ShellApi._on_nav`，**所有标签都记**（后台开的页也要进历史），不只激活标签；
+  同 url 30 秒内只落一次库（一次导航会连发 HistoryChanged + SourceChanged）。
+- ★ 落库放**短线程**：`_on_nav` 是从 WebView2 事件回调里进来的（UI 线程），而 `_db_lock`
+  可能正被后台抓取占着，同步写会把界面卡住。
+- 面板：顶部搜索（250ms 防抖）→ 按最近访问倒序的列表 → 底部「清除全部」。
+  左键一行在当前标签打开，**右键删单条**（不额外挂控件，也不容易误触）。
+
+**四、整页翻译（`shell_translate.py` + `app.translate_texts`）**
+
+- 复用**设置里那套 AI 接口**（与聊天同一个 key），不引外部翻译服务 —— 后端是纯标准库，
+  也不想让用户为翻译再配一份凭据。
+- 流程：采集可见文本块（≤160 块 / 6000 字符）→ 批量（10 条一批）翻译 → 原地回写；
+  原文留在 `window.__MSX_TR_ORIG` 里，再点一次菜单项就是「显示原文」，**不重载页面**
+  （视频不会重头播）。
+- ★★ **宁可留空，不可错位**：一批译文长度对不上就整批降级为逐条重译，逐条还失败就留空
+  （那句保持原文）。把 A 段的译文贴到 B 段比不翻更糟。
+- ★ 采集口径（跳过 script/code/pre/svg/canvas/iframe/表单、跳过不可见、跳过纯中文段落）
+  在 `collect` 与 `apply` 两段 JS 里**必须完全一致** —— 回写是按"原文"查表替换的，
+  口径差一点就会有段落永远翻不到。
+- 纯中文页面点了不烧 token，直接提示"这一页没有需要翻译的外文"。
 
 ### 本版专项（v0.4.51dsk 单实例：再点图标只叫回已有窗口）
 

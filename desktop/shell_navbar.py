@@ -43,11 +43,12 @@ def set_cue(tb, text):
 
 
 def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
-                   title_getter=None, accent_getter=None):
+                   title_getter=None, accent_getter=None, on_menu=None):
     """在窗口 y=top 处安装导航工具栏(须在标签栏 install_strip 之后调用)。
 
     bookmarks: shell_bookmarks.BookmarkStore —— 给出时在刷新右侧多一个 ☆/★ 按钮
     (收藏当前网页; 网址为空的信息流固定页上禁用)。title_getter: 取当前标签标题。
+    on_menu: 栏尾 ☰ 被点击时调用(窗口壳打开主菜单, 见 shell_menu.py)。
     返回 update(url, can_back, can_fwd, loading=False) —— ShellApi 经它推送状态。
     """
     import clr
@@ -92,12 +93,13 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
         icon_font = Font("Segoe MDL2 Assets", ICON_PT)
         glyphs = {"back": "\uE72B", "fwd": "\uE72A", "reload": "\uE72C",
                   "lock": "\uE72E", "globe": "\uE774", "search": "\uE721",
-                  "star": "\uE734", "star_on": "\uE735"}
+                  "star": "\uE734", "star_on": "\uE735",
+                  "menu": "\uE712"}   # ⋮ Chrome 栏尾那颗三竖点
     except Exception:
         icon_font = Font("Microsoft YaHei", ICON_PT - 0.5)
         glyphs = {"back": "\u2190", "fwd": "\u2192", "reload": "\u21BB",
                   "lock": "", "globe": "\u25CB", "search": "\u2315",
-                  "star": "\u2606", "star_on": "\u2605"}
+                  "star": "\u2606", "star_on": "\u2605", "menu": "\u22EE"}
     # ★ 地址栏用 Segoe UI(缺中文时 GDI+ 自动 font-linking 到雅黑): 雅黑的拉丁字母
     #   又宽又钝, 一行网址里英文/数字占大头, 用雅黑一眼就廉价。
     tb_font = Font("Segoe UI", 9.0 * scale)
@@ -123,7 +125,7 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
 
     def _enabled(name):
         return {"back": st["back"], "fwd": st["fwd"], "reload": True,
-                "star": bool(st["url"])}[name]
+                "star": bool(st["url"]), "menu": True}[name]
 
     # ---- AI 入口: 收进胶囊右端, 不再在栏尾挂一颗孤立圆钮 ----
     # 位置本身就是提示("在这里提问"), 也顺带把顶栏还原成"导航组 + 胶囊"两段,
@@ -141,13 +143,18 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
         return {n: (x + i * (bw + gap), 0, bw, h)
                 for i, n in enumerate(_names())}
 
+    def _menu_rect():
+        """栏尾 ☰/⋮ 主菜单按钮(Chrome 那颗三竖点就在这个位置)。"""
+        return (max(0, bar.Width - MARGIN - BTN_W), 0, BTN_W, h)
+
     def _pill_rect():
-        """地址栏胶囊(Chrome/Edge 的 omnibox): 高度撑满工具栏减去上下内缩, 两端全圆。"""
+        """地址栏胶囊(Chrome/Edge 的 omnibox): 高度撑满工具栏减去上下内缩, 两端全圆。
+        右端要让出栏尾菜单按钮 —— 否则胶囊会顶到 ⋮ 底下, 两个控件叠在一起。"""
         rects = _btn_rects()
         last = _names()[-1]
         end = rects[last][0] + rects[last][2]
         tx = end + int(10 * scale)
-        right = bar.Width - MARGIN
+        right = bar.Width - MARGIN - BTN_W - int(2 * scale)
         ph = h - PILL_INSET * 2
         return (tx, (h - ph) // 2, max(int(60 * scale), right - tx), ph)
 
@@ -360,12 +367,32 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
         g.FillPath(SolidBrush(icon_c),
                    _sparkle_path(cr[0] + cr[2] / 2.0, cr[1] + cr[3] / 2.0,
                                  6.4 * scale))
+        # ---- 栏尾主菜单按钮(⋮): 与左侧导航组同一套悬停表现 ----
+        # 三竖点自己画(MDL2 的 "More" 是横排 ⋯, 而 Chrome 是竖排 ⋮; 画圆点还能保证
+        # 高 DPI 下不糊, 也不吃字体的 advance/bearing 那套坑)。
+        mr = _menu_rect()
+        if st["hover"] == "menu":
+            cx, cy, d = _circle(mr[0], mr[1], mr[2], mr[3])
+            g.FillEllipse(SolidBrush(st["hover_bg"]),
+                          float(cx), float(cy), float(d), float(d))
+        dot_c = st["fg"] if st["hover"] == "menu" else _blend(st["fg"], st["bar"], 0.88)
+        dcx = mr[0] + mr[2] / 2.0
+        dcy = mr[1] + mr[3] / 2.0
+        dr = max(1.2, 1.15 * scale)
+        gap = 4.6 * scale
+        for k in (-1, 0, 1):
+            g.FillEllipse(SolidBrush(dot_c),
+                          float(dcx - dr), float(dcy + k * gap - dr),
+                          float(dr * 2), float(dr * 2))
 
     # ---- 交互: 按钮悬停/点击(禁用态不响应) ----
     def _btn_at(x, y):
         for name, (bx, by, bw, bh) in _btn_rects().items():
             if bx <= x <= bx + bw and 0 <= y <= bh:
                 return name
+        mx, my, mw, mh = _menu_rect()
+        if mx <= x <= mx + mw and my <= y <= my + mh:
+            return "menu"
         return None
 
     def _in_chip(x, y, r=None):
@@ -414,6 +441,13 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
                 pass
             return
         name = _btn_at(args.X, args.Y)
+        if name == "menu":
+            try:
+                if on_menu is not None:
+                    on_menu()
+            except Exception:
+                pass
+            return
         if name == "back" and st["back"]:
             api.nav_back()
         elif name == "fwd" and st["fwd"]:
@@ -712,6 +746,28 @@ def install_navbar(win, api, top=0, bg_getter=None, bookmarks=None,
     update.set_ai = set_ai
     update.set_ai_ok = set_ai_ok
     update.set_accent = set_accent
+
+    def menu_anchor():
+        """栏尾菜单按钮的屏幕坐标(右下角) —— 弹出菜单/历史记录面板贴着它展开。
+        取不到返回 None, 调用方退化成"居中弹"。"""
+        try:
+            mx, my, mw, mh = _menu_rect()
+            p = bar.PointToScreen(Point(int(mx + mw), int(my + mh)))
+            return (int(p.X), int(p.Y))
+        except Exception:
+            return None
+
+    update.menu_anchor = menu_anchor
+
+    def menu_center():
+        """栏尾按钮中心(工具栏坐标)。真机验收用它合成一次点击。"""
+        try:
+            mx, my, mw, mh = _menu_rect()
+            return (int(mx + mw // 2), int(my + mh // 2))
+        except Exception:
+            return None
+
+    update.menu_center = menu_center
 
     update.bar = bar      # bug6: 网页全屏时窗口壳要整条隐藏导航栏(按钮+地址栏)
     update.set_fullscreen = set_fullscreen   # bug6: 窗口壳按网页全屏状态显隐导航栏

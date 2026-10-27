@@ -212,5 +212,31 @@ if _ajs_hit:
     ok("归档 app.js: 开机自启单独提示失败原因(不静默回滚)",
        "ui_autostart: b.dataset.v" in _ajs)
 
+# ---------- v0.4.52dsk: 栏尾主菜单 / 历史记录 / 整页翻译 ----------
+# 三个新模块都是 app_window 里**函数内 import**(与 shell_ai/shell_tray 同一模式,
+# modulegraph 照样会收进 PYZ), 但"函数内 import 漏打包"是这套壳最容易翻车的地方 ——
+# 打包后必须逐个确认真的在包里。
+def _vtuple(v):
+    try:
+        parts = re.findall(r"\d+", str(v))
+        return tuple(int(x) for x in parts[:3])
+    except Exception:
+        return (0, 0, 0)
+
+
+if _vtuple(VER) >= (0, 4, 52):
+    for mod, kws in (
+            ("shell_menu", ("show_menu", "Toast", "MENU_W")),
+            ("shell_history", ("show_history", "web_hist_list", "web_hist_del")),
+            ("shell_translate", ("translate_page", "_TR_COLLECT_JS", "translate_texts")),
+            ("shell_navbar", ("_menu_rect", "menu_anchor", "on_menu")),
+            ("app", ("web_hist_add", "web_hist_list", "translate_texts", "web_hist"))):
+        if mod in pyz_mods:
+            c = pyz.extract(mod)
+            for kw in kws:
+                ok("%s 字节码含 %s" % (mod, kw), has(c, kw))
+        else:
+            ok("PYZ 含 " + mod, False)
+
 print("\nRESULT: %s" % ("PASS(%d)" % PASS if not FAILS else "FAIL(%d): %s" % (len(FAILS), " | ".join(FAILS))))
 sys.exit(1 if FAILS else 0)

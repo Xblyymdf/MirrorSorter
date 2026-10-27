@@ -160,3 +160,10 @@ desktop/_vis/fasttext_demo/*.json
 # v0.4.51dsk: 单实例验收(单元 + 真两进程: 第二个必须自己退出并把第一个的窗口叫出来)。
 # 加 --exe 可跑打包态 —— onefile 是父子两个进程, 查窗口要按进程树。
 !desktop/_test_single451.py
+
+# v0.4.52dsk: 栏尾菜单/历史记录/整页翻译。_test_menu452.js 用 node 沙盒跑**注入页面的**
+# 那两段 JS(深色兜底有没有碰媒体、翻译采集/回写/还原是否对得上); _shot_menu.py 把自绘菜单
+# 渲染成 PNG(间距/缩放行折行这类问题读代码看不出来); _test_menu452.py 是存储层+接线。
+!desktop/_test_menu452.js
+!desktop/_test_menu452.py
+!desktop/_shot_menu.py

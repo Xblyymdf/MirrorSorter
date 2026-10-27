@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-洞鉴虚明 · 基础版 (v0.4.51dsk)
+洞鉴虚明 · 基础版 (v0.4.52dsk)
 ==========================
 本地运行的洞鉴虚明：读取 B站 内容 → 黑白名单/AI 分拣 → 推荐流 + 数据源状态 + AI 聊天。
 
@@ -73,7 +73,7 @@ if _PORT_ENV:
         PORTS = (int(_PORT_ENV),)
     except Exception:
         pass
-APP_VER = "v0.4.51dsk"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
+APP_VER = "v0.4.52dsk"   # 与 web/index.html 页脚保持一致; 窗口壳(app_window.py)标题也用它
 # 本机回环请求必须绕过系统代理: 用户开着 Clash/V2Ray/公司代理时, 环境里的 http_proxy 会把
 # 127.0.0.1 的请求转给代理服务器, 轻则 502, 重则心跳连续失败 -> 悬浮球探活 2 轮不过自我了断,
 # 表现为「球莫名消失/点定位没反应」。这里建一个禁用代理的 opener 专供本地调用; 外网 API 仍走
@@ -869,6 +869,11 @@ def db():
         CREATE TABLE IF NOT EXISTS blacklist(kind TEXT, value TEXT, PRIMARY KEY(kind, value));
         CREATE TABLE IF NOT EXISTS saved(key TEXT, kind TEXT, ts INTEGER, PRIMARY KEY(key, kind));
         CREATE TABLE IF NOT EXISTS history(key TEXT, ts INTEGER, PRIMARY KEY(key));
+        /* 内置浏览器的浏览历史(与上面那张 history 无关, 那张是"看过哪些内容")。
+           按 url 去重: 同一页反复打开只更新 ts 与 visits, 列表不会被同一个视频页刷屏。 */
+        CREATE TABLE IF NOT EXISTS web_hist(url TEXT PRIMARY KEY, title TEXT, ts INTEGER,
+                                           visits INTEGER DEFAULT 1);
+        CREATE INDEX IF NOT EXISTS idx_web_hist_ts ON web_hist(ts);
         CREATE TABLE IF NOT EXISTS chat(id INTEGER PRIMARY KEY AUTOINCREMENT, role TEXT, content TEXT, ts INTEGER, cid INTEGER DEFAULT 0);
         CREATE TABLE IF NOT EXISTS conv(id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, ts INTEGER, updated INTEGER);
         CREATE TABLE IF NOT EXISTS stats(day TEXT PRIMARY KEY, in_tokens INTEGER, out_tokens INTEGER,
@@ -5138,6 +5143,162 @@ def record_usage(usage):
             db().commit()
     except Exception:
         pass   # 统计失败不影响聊天; 下次调用继续累计
+
+
+# ---------------------------------------------------------------- 内置浏览器: 浏览历史
+# 与上面那张 history(key,ts) 不是一回事: 那张是"信息流里看过哪些内容", 这张是
+# "内置浏览器访问过哪些网址"。按 url 去重(同一页反复打开只更新时间与次数), 这样
+# 列表不会被同一个视频页刷屏, 删除单条也只需要 url。
+def web_hist_add(url, title=""):
+    """记一次网页访问。非 http(s)/本地服务一律不记(信息流不是"浏览历史")。"""
+    u = str(url or "").strip()
+    low = u.lower()
+    if not (low.startswith("http://") or low.startswith("https://")):
+        return False
+    if low.startswith(("http://127.0.0.1", "https://127.0.0.1",
+                       "http://localhost", "https://localhost")):
+        return False
+    u = u[:2000]
+    t = str(title or "").strip()[:200]
+    now = int(time.time())
+    try:
+        with _db_lock:
+            conn = db()
+            # 标题留空时不要把已有的标题冲掉(导航早期拿到的往往还是旧页标题)
+            conn.execute(
+                "INSERT INTO web_hist(url,title,ts,visits) VALUES(?,?,?,1) "
+                "ON CONFLICT(url) DO UPDATE SET ts=excluded.ts, visits=IFNULL(visits,0)+1,"
+                " title=CASE WHEN excluded.title<>'' THEN excluded.title ELSE title END",
+                (u, t, now))
+            conn.execute("DELETE FROM web_hist WHERE ts<?", (now - 400 * 86400,))
+            _commit()
+        return True
+    except Exception:
+        return False
+
+
+def web_hist_list(q="", limit=200):
+    """按最近访问倒序。q 同时匹配标题与网址(不区分大小写)。"""
+    limit = max(1, min(1000, int(limit or 200)))
+    q = str(q or "").strip()
+    sql = "SELECT url,IFNULL(title,''),IFNULL(ts,0),IFNULL(visits,1) FROM web_hist"
+    args = []
+    if q:
+        sql += " WHERE url LIKE ? OR title LIKE ?"
+        like = "%" + q.replace("%", "").replace("_", "") + "%"
+        args = [like, like]
+    sql += " ORDER BY ts DESC LIMIT %d" % limit
+    try:
+        with _db_lock:
+            rows = db().execute(sql, args).fetchall()
+    except Exception:
+        return []
+    return [{"url": r[0], "title": r[1], "ts": int(r[2]), "visits": int(r[3])}
+            for r in rows]
+
+
+def web_hist_del(url):
+    try:
+        with _db_lock:
+            db().execute("DELETE FROM web_hist WHERE url=?", (str(url or ""),))
+            _commit()
+        return True
+    except Exception:
+        return False
+
+
+def web_hist_clear():
+    try:
+        with _db_lock:
+            db().execute("DELETE FROM web_hist")
+            _commit()
+        return True
+    except Exception:
+        return False
+
+
+# ---------------------------------------------------------------- 内置浏览器: 整页翻译
+# 走设置里那套 OpenAI 兼容接口(与聊天同一个 key), 不引入外部翻译服务 —— 项目
+# 后端是纯标准库, 也不想让用户为了翻译再配一次凭据。
+def _tr_system(to):
+    return ("你是网页翻译引擎。把用户给的 JSON 数组里每一条文本翻译成" + to + "。"
+            "要求: 保持原文语气; 专有名词/人名/产品名保留原文; 不解释、不加注、不合并"
+            "也不拆分条目; 原文里的标签(<b>/<a> 等)、占位符(%s/{0}/{{name}})原样保留。"
+            "只输出一个 JSON 数组, 元素个数与输入完全相同, 每个元素是对应条目的译文字符串。")
+
+
+def _tr_parse(content, n):
+    """从模型输出里抠出 JSON 数组。长度必须等于 n, 否则视为失败(错位比不翻更糟)。"""
+    s = str(content or "").strip()
+    if s.startswith("```"):
+        s = s.strip("`")
+        i = s.find("\n")
+        if i > 0:
+            s = s[i + 1:]
+    a, b = s.find("["), s.rfind("]")
+    if a < 0 or b <= a:
+        return None
+    try:
+        arr = json.loads(s[a:b + 1])
+    except Exception:
+        return None
+    if not isinstance(arr, list) or len(arr) != n:
+        return None
+    return [("" if x is None else str(x)) for x in arr]
+
+
+def translate_texts(texts, to="简体中文", batch=10, progress=None):
+    """批量翻译网页文本块。返回 (译文列表, 错误串) —— 列表与输入等长, 失败位为空串。
+
+    对齐原则: **宁可留空, 不可错位**。一批长度对不上就整批降级成逐条翻, 逐条还失败
+    就留空(页面上那句保持原文), 绝不会把 A 段的译文贴到 B 段。
+    """
+    items = [str(t or "") for t in (texts or [])]
+    if not items:
+        return [], ""
+    if not str(sget("ai_key") or "").strip():
+        return [""] * len(items), "未配置 AI 接口(设置 → AI)"
+    out = [""] * len(items)
+    err = ""
+    step = max(1, int(batch or 10))
+    total = len(items)
+    done = 0
+    for i in range(0, total, step):
+        chunk = items[i:i + step]
+        got = None
+        try:
+            # 预算按"字符数×3"给, 中文译文的 token 通常不会超过原文的 3 倍
+            mx = min(4000, 160 + sum(len(x) for x in chunk) * 3)
+            content, _u = call_llm(
+                [{"role": "system", "content": _tr_system(to)},
+                 {"role": "user", "content": json.dumps(chunk, ensure_ascii=False)}],
+                max_tokens=mx, temperature=0.1, think=False)
+            got = _tr_parse(content, len(chunk))
+        except Exception as e:
+            err = "翻译接口失败: %s" % str(e)[:120]
+        if got is None:
+            # 降级: 逐条重试(整批失败常常是模型多吐/少吐了一条)
+            got = []
+            for one in chunk:
+                try:
+                    content, _u = call_llm(
+                        [{"role": "system", "content": _tr_system(to)},
+                         {"role": "user", "content": json.dumps([one], ensure_ascii=False)}],
+                        max_tokens=min(2000, 200 + len(one) * 3),
+                        temperature=0.1, think=False)
+                    g2 = _tr_parse(content, 1)
+                    got.append(g2[0] if g2 else "")
+                except Exception:
+                    got.append("")
+        for j, v in enumerate(got[:len(chunk)]):
+            out[i + j] = v
+        done = min(total, i + step)
+        if progress is not None:
+            try:
+                progress(done, total)
+            except Exception:
+                pass
+    return out, err
 
 
 def llm_body(messages, max_tokens, temperature=0.3, think=None):
