@@ -235,14 +235,14 @@ check("接线6 缩放落到控件池(ZoomFactor), 且换标签会补上",
       "c.ZoomFactor = f" in pg and "pages.set_zoom(tab[\"id\"], self._zoom)" in aw)
 check("接线7 打印走 WebView2 自己的打印对话框",
       "ShowPrintUI" in pg and "CoreWebView2PrintDialogKind" in pg)
-check("接线8 兜底样式里没有整页 filter(只有小黑盒那段保留反色)",
-      "var SAFE_CSS" in theme
-      and "filter" not in theme.split("var SAFE_CSS")[1].split(";")[0]
-      and "xiaoheihe" in theme and "var OLD_CSS" in theme
-      and "filter:invert" in theme.split("var OLD_CSS")[1].split("var ")[0])
-check("接线9 深色兜底逐元素改色且记原值(切白天能还原)",
-      "background-color" in theme and "border-color" in theme
-      and "getPropertyPriority" in theme and "restoreAll" in theme)
+check("接线8 无深色主题的站点一律不处理(小黑盒除外): 其余站点分支里不许注入样式/改 inline",
+      "xiaoheihe" in theme and "var OLD_CSS" in theme
+      and "filter:invert" in theme.split("var OLD_CSS")[1].split("var ")[0]
+      and "ensureCss" not in theme.split("/* ---- 其余站点")[1].split("if (!window.__msx_theme_timer")[0]
+      and ".style." not in theme.split("/* ---- 其余站点")[1].split("if (!window.__msx_theme_timer")[0])
+check("接线9 不处理的站点要停掉自愈定时器(否则压暗→测成已深色→还原→再压暗, 黑白闪烁)",
+      "function stopTimer()" in theme and "clearInterval" in theme
+      and "stopTimer();" in theme.split("/* ---- 其余站点")[1])
 check("接线10 翻译面板/菜单/历史三个模块都不 import 壳(不成环)",
       "import app_window" not in menu and "import app_window" not in hist
       and "import app_window" not in tr)

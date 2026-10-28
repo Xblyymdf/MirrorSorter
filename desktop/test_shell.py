@@ -1360,16 +1360,32 @@ check("菜单2 菜单按钮走 on_menu 回调, 且窗口壳真的传了(参数�
       and "on_menu=api.open_menu" in _aw_src)
 check("菜单3 菜单里有「历史记录」和「翻译此页面」两项",
       '"label": "历史记录"' in _aw_src and '"label": "翻译此页面"' in _aw_src)
-check("深色4 兜底深色不再整页 filter(否则视频/图片会被一起反色 —— 百度网盘实测)",
-      "var SAFE_CSS" in _theme_js
-      and "filter" not in _theme_js.split("var SAFE_CSS")[1].split(";")[0]
-      and "xiaoheihe" in _theme_js)
-check("深色5 逐元素改色要记原值(切回白天必须能还原, 只删 <style> 会留一页黑底)",
-      "getPropertyPriority" in _theme_js and "restoreAll" in _theme_js
-      and "__MSX_DK_ORIG" in _pg_src[_pg_src.index('_LIGHT_JS = r"""'):][:1500])
+_theme_rest = _theme_js.split("/* ---- 其余站点")[1].split("if (!window.__msx_theme_timer")[0]
+check("深色4 没有深色主题的站点一律不处理(小黑盒除外): 只剩 B站原生 cookie + 小黑盒 invert",
+      "xiaoheihe" in _theme_js and "theme_style=dark" in _theme_js
+      # 其余站点分支里不许再出现"注入样式 / 改 inline" —— 那正是反色与闪烁的来源
+      and "ensureCss" not in _theme_rest and ".style." not in _theme_rest
+      and "cleanup()" in _theme_rest)
+check("深色5 其余站点分支必须停掉自愈定时器(否则压暗→测成已深色→还原→再压暗, 黑白每1.5s闪一次)",
+      "function stopTimer()" in _theme_js and "clearInterval" in _theme_js
+      and _theme_js.index("/* ---- 其余站点") < _theme_js.index("stopTimer();", _theme_js.index("/* ---- 其余站点")))
 check("翻译1 整页翻译复用设置里的 AI 接口, 不引外部翻译服务",
       "app.translate_texts" in io.open(
           os.path.join(PROJECT, "shell_translate.py"), encoding="utf-8").read())
+# v0.4.53: 历史记录按 Chrome 重排(图标/日期分组/悬停 ×)
+_hist_src = io.open(os.path.join(PROJECT, "shell_history.py"), encoding="utf-8").read()
+check("历史1 面板按日期分组(今天/昨天/具体日期), 不再是一整条平铺列表",
+      "def _bucket(" in _hist_src and '"今天"' in _hist_src and '"昨天"' in _hist_src
+      and '"kind": "head"' in _hist_src)
+check("历史2 每行有站点图标 + 悬停行尾 × 删除(上一版只有右键, 用户看不出能删)",
+      "favicons.image(" in _hist_src and "CLOSE_W" in _hist_src
+      and "_in_close(" in _hist_src)
+# ★ 参数加了没人传 = 死代码: 必须同时锁"壳把同一份 favicon 缓存注进来"
+check("历史3 favicon 缓存由壳注入且与标签栏/收藏栏共用一份(各自 new 会抓两遍)",
+      "favicons=None" in _hist_src and "favicons=self._fav" in _aw_src
+      and "def bind_favicons(" in _aw_src and "api.bind_favicons(fav_cache)" in _aw_src)
+check("历史4 列表自绘(不给每行建控件) + 滚轮装了消息过滤器(焦点在搜索框也能滚)",
+      "canvas.Paint" in _hist_src and "AddMessageFilter" in _hist_src)
 
 import glob
 # v0.3.1.66dsk 起构建产物统一进 desktop/build/dist/(可整目录删除)。

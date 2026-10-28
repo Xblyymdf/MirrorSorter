@@ -125,10 +125,18 @@ def main():
 
     try:
         hp = shell_history_show(win, _Api(), sch=SCHEMES["dark"], sc=sc)
-        rows = [c for c in hp.Controls]
-        btns = [b for b in _all_buttons(hp) if str(getattr(b, "Tag", "") or "")]
+        rows = list(getattr(hp, "_msx_rows", []) or [])
+        heads = [r for r in rows if r.get("kind") == "head"]
+        items = [r for r in rows if r.get("kind") == "row"]
         check("历史面板 建得起来", hp is not None)
-        check("历史面板 每一条记录都有一行按钮", len(btns) == 3, len(btns))
+        check("历史面板 三条记录各一行", len(items) == 3, len(items))
+        # 分组是 v0.4.53 照 Chrome 加的: 同一天只出现一个"今天"标题, 且排在所有行之前
+        check("历史面板 按日期分组(同一天只一个「今天」标题)",
+              len(heads) == 1 and heads[0]["label"] == "今天" and rows[0] is heads[0],
+              [h["label"] for h in heads])
+        check("历史面板 每行带「域名 · 时间」次要行",
+              all("example.com \u00b7 " in r["sub"] for r in items),
+              items[0]["sub"] if items else "")
         check("历史面板 有搜索框", any(isinstance(c, WF.TextBox) for c in _all(hp)))
         check("历史面板 有「清除全部」", any("清除全部" in str(getattr(c, "Text", ""))
                                         for c in _all(hp)))
@@ -145,6 +153,18 @@ def main():
             bmp.Save(p)
             print("saved %s  (%dx%d)" % (p, hp.Width, hp.Height))
             check("历史面板 渲染不抛异常", True)
+            # 悬停态(行高亮 + 行尾 ×)只能靠出图核对 —— 没有真鼠标也能截,
+            # 走的是面板暴露的 _msx_hot(与 MouseMove 同一条赋值路径)。
+            try:
+                hp._msx_hot(1, True)
+                hp.Refresh()
+                bmp2 = Bitmap(hp.Width, hp.Height)
+                hp.DrawToBitmap(bmp2, Rectangle(0, 0, hp.Width, hp.Height))
+                p2 = os.path.join(OUT, "history_hover.png")
+                bmp2.Save(p2)
+                print("saved %s  (悬停第 2 行 + × 变红)" % p2)
+            except Exception as e:
+                check("历史面板 悬停态出图", False, repr(e))
         except Exception as e:
             check("历史面板 渲染不抛异常", False, repr(e))
         try:

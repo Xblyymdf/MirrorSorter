@@ -138,6 +138,9 @@ function mkCtx(dom, host) {
   g.sessionStorage = { getItem() { return null; }, setItem() {} };
   g.fetch = function () { return Promise.resolve({ ok: true }); };
   g.setInterval = function () { return 1; };
+  // stopTimer() 会 clearInterval(window.__msx_theme_timer) —— 记次数, 用来证明
+  // "不处理的站点真的退场了", 而不是留个定时器在那儿每 1.5s 再判定一遍。
+  g.clearInterval = function () { g.__cleared = (g.__cleared || 0) + 1; };
   g.setTimeout = function () { return 1; };
   g.NodeFilter = { SHOW_TEXT: 4, FILTER_ACCEPT: 1, FILTER_REJECT: 2 };
   g.getComputedStyle = function (el) {
@@ -157,66 +160,74 @@ function lum(rgb) {
 }
 
 // ---------------------------------------------------------------- 深色兜底
+// ★ v0.4.53: 站点自己没有深色主题时**一律不处理**(小黑盒除外)。
+//   所以这里全部是"什么都不许发生"的断言 —— 上一版(T1~T8)测的是"压暗得对不对",
+//   现在测"有没有碰过它"。T9~T12 随兜底深色一起删除; 翻译用例保持原编号, 免得历史日志对不上。
 const THEME_DARK = grab('shell_pages.py', '_THEME_DARK_JS');
 const THEME_LIGHT = grab('shell_pages.py', '_LIGHT_JS');
 
-// T1 百度网盘这类浅色站: 只压背景板/提亮文字, 一个 filter 都不许出现
+function untouched(dom) {
+  return !dom.doc.getElementById('__msx_dark')
+    && dom.card.style.cssText === '{}' && dom.link.style.cssText === '{}'
+    && dom.video.style.cssText === '{}' && dom.html.style.cssText === '{}';
+}
+
+// T1~T4 百度网盘这类浅色站(用户实测视频被反色/页面黑白闪的那两个站)
+['pan.baidu.com', 'tieba.baidu.com', 'example.com'].forEach(function (host, i) {
+  const dom = mkDom({});
+  const ctx = mkCtx(dom, host);
+  vm.runInContext(THEME_DARK, ctx);
+  ok('T' + (i + 1) + ' ' + host + ': 不注入任何样式、不改任何 inline',
+     untouched(dom), dom.doc.getElementById('__msx_dark') && 'style 注入');
+});
+
+// T4 自愈定时器必须当场停掉 —— 不停就会"下一拍再判定一次", 而判定的输入正是它自己的输出
 (function () {
   const dom = mkDom({});
   const ctx = mkCtx(dom, 'pan.baidu.com');
   vm.runInContext(THEME_DARK, ctx);
-  const st = dom.doc.getElementById('__msx_dark');
-  ok('T1 浅色站: 注入了兜底样式', !!st);
-  ok('T2 兜底样式里没有任何 filter(媒体就不会被反色)',
-     !!st && !/filter/i.test(st.textContent), st && st.textContent);
-  ok('T3 <video> 一个 inline 样式都没被改(播放画面像素级原样)',
-     !dom.video.style.has('filter') && dom.video.style.cssText === '{}',
-     dom.video.style.cssText);
-  const bg = dom.card.style.getPropertyValue('background-color');
-  ok('T4 白色卡片被压成深色', !!bg && lum(bg) < 90, bg);
-  const fg = dom.link.style.getPropertyValue('color');
-  ok('T5 深色链接文字被提亮', !!fg && lum(fg) > 140, fg);
-  ok('T6 提亮保留色相(蓝色仍然偏蓝)',
-     !!fg && /^rgb\((\d+),(\d+),(\d+)\)$/.test(fg) &&
-     (function () {
-       const m = fg.match(/\d+/g);
-       return +m[2] > +m[0] && +m[2] >= +m[1];
-     })(), fg);
-  // T7 切回白天: 逐元素还原, 一点 inline 都不剩
-  vm.runInContext(THEME_LIGHT, ctx);
-  ok('T7 切回白天: 样式元素被移除', !dom.doc.getElementById('__msx_dark'));
-  ok('T8 切回白天: 逐元素还原(卡片/链接都没留下 inline 样式)',
-     dom.card.style.cssText === '{}' && dom.link.style.cssText === '{}',
-     dom.card.style.cssText + ' | ' + dom.link.style.cssText);
+  ok('T4 不处理的站点要立刻停掉定时器(留着一个 1.5s 的判定循环迟早再动手)',
+     ctx.__cleared === 1, String(ctx.__cleared));
 })();
 
-// T9 页面本来就是深色 → 一动不动(不能给原生深色的站再压一层)
+// T5 页面本来就是深色 → 与浅色站**完全等价**的"不处理"(说明已经不测量背景亮度了)
 (function () {
   const dom = mkDom({ bodyBg: 'rgb(16, 16, 16)', htmlBg: 'rgb(16, 16, 16)' });
   const ctx = mkCtx(dom, 'example.com');
   vm.runInContext(THEME_DARK, ctx);
-  ok('T9 已深色的页面: 不注入兜底样式、不改任何元素',
-     !dom.doc.getElementById('__msx_dark') && dom.card.style.cssText === '{}');
+  ok('T5 深色页面: 一样不碰(不再"测亮度再决定")', untouched(dom));
 })();
 
-// T10 小黑盒: 用户明确要求保留整页反色
+// T6 深→浅→深 来回切: 全程都不许留下任何东西, 更不许出现"上一拍压暗、这一拍还原"
+(function () {
+  const dom = mkDom({});
+  const ctx = mkCtx(dom, 'pan.baidu.com');
+  vm.runInContext(THEME_DARK, ctx);
+  vm.runInContext(THEME_LIGHT, ctx);
+  vm.runInContext(THEME_DARK, ctx);
+  ok('T6 主题来回切: 始终干净(黑白闪烁的根源就是这来回两下)', untouched(dom));
+  ok('T7 切回白天: 不留样式元素、也不留 html 内联底色',
+     !dom.doc.getElementById('__msx_dark')
+     && !dom.html.style.getPropertyValue('background'));
+})();
+
+// T8 小黑盒: 用户明确要求保留整页反色
 (function () {
   const dom = mkDom({});
   const ctx = mkCtx(dom, 'www.xiaoheihe.cn');
   vm.runInContext(THEME_DARK, ctx);
   const st = dom.doc.getElementById('__msx_dark');
-  ok('T10 小黑盒保留整页反色(invert)',
+  ok('T8 小黑盒保留整页反色(invert)',
      !!st && /invert/.test(st.textContent), st && st.textContent);
 })();
 
-// T11 B站: 走原生深色 cookie, 不做任何反色
+// T9 B站: 走原生深色 cookie, 不做任何反色
 (function () {
   const dom = mkDom({});
   const ctx = mkCtx(dom, 'www.bilibili.com');
   vm.runInContext(THEME_DARK, ctx);
-  const st = dom.doc.getElementById('__msx_dark');
-  ok('T11 B站不注入反色样式', !st);
-  ok('T12 B站仍先压深色底(防白闪)',
+  ok('T9 B站不注入反色样式', !dom.doc.getElementById('__msx_dark'));
+  ok('T10 B站仍先压深色底(防白闪)',
      /0f0f0f/i.test(dom.html.style.getPropertyValue('background') || ''),
      dom.html.style.getPropertyValue('background'));
 })();

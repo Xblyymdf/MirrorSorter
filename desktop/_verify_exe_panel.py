@@ -238,5 +238,25 @@ if _vtuple(VER) >= (0, 4, 52):
         else:
             ok("PYZ 含 " + mod, False)
 
+if _vtuple(VER) >= (0, 4, 53):
+    # v0.4.53: 历史面板重排(分组/图标/悬停 ×) + 撤销兜底深色
+    if "shell_history" in pyz_mods:
+        c = pyz.extract("shell_history")
+        for kw in ("_bucket", "_msx_hot", "_in_close", "favicons", "AddMessageFilter"):
+            ok("shell_history 字节码含 " + kw, has(c, kw))
+    else:
+        ok("PYZ 含 shell_history", False)
+    if "shell_pages" in pyz_mods:
+        c = pyz.extract("shell_pages")
+        # 兜底深色已撤销: 只剩 B站 cookie 与小黑盒 invert, 不该再有逐元素压暗
+        ok("shell_pages 不再逐元素压暗(__MSX_DK_ORIG 已删)", not has(c, "__MSX_DK_ORIG"))
+        ok("shell_pages 仍有 stopTimer(不处理的站点要退场)", has(c, "stopTimer"))
+    else:
+        ok("PYZ 含 shell_pages", False)
+    if "app_window" in pyz_mods:
+        c = pyz.extract("app_window")
+        ok("app_window 字节码含 bind_favicons(历史面板共用图标缓存)",
+           has(c, "bind_favicons"))
+
 print("\nRESULT: %s" % ("PASS(%d)" % PASS if not FAILS else "FAIL(%d): %s" % (len(FAILS), " | ".join(FAILS))))
 sys.exit(1 if FAILS else 0)

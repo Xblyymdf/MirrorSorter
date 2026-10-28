@@ -325,6 +325,7 @@ class ShellApi:
         # 浏览历史去抖: 一次导航会连发 HistoryChanged + SourceChanged, 同 url 只记一次
         self._hist_last = ("", 0.0)
         self._bm = None           # 收藏仓库(菜单里的"收藏此页"用)
+        self._fav = None          # 站点图标缓存(与标签栏/收藏栏共用一份)
 
     def attach(self, win, app_url):
         """主窗口创建后绑定窗口引用(供控件池 marshal 与窗口按钮使用)。"""
@@ -948,6 +949,13 @@ class ShellApi:
         """注入收藏仓库(菜单里的「收藏此页」与收藏栏共用同一个 store)。"""
         self._bm = store
 
+    def bind_favicons(self, cache):
+        """注入站点图标缓存(历史面板每行要画 favicon)。
+
+        ★ 必须传**同一份** cache: 各自 new 一个会把同一站点抓两遍, 两处命中还不同步。
+        """
+        self._fav = cache
+
     def _scheme(self):
         """页面推来的顶栏配色(菜单/历史面板/提示条都跟着它走)。"""
         try:
@@ -1027,7 +1035,7 @@ class ShellApi:
         import shell_history
         try:
             return shell_history.show_history(self._win, self, anchor=self._menu_anchor(),
-                                              scheme=self._scheme())
+                                              scheme=self._scheme(), favicons=self._fav)
         except Exception:
             _log_exc("history/open")
             return None
@@ -1913,18 +1921,22 @@ def _e2e_menu_shot(api):
         ok("6 历史面板弹出来了", hp is not None)
         time.sleep(0.5)
         if hp is not None:
-            btns = []
-
-            def _walk(c):
-                try:
-                    for x in c.Controls:
-                        if isinstance(x, WF.Button) and str(getattr(x, "Tag", "") or ""):
-                            btns.append(x)
-                        _walk(x)
-                except Exception:
-                    pass
-            _walk(hp)
-            ok("7 每条记录一行(3 条)", len(btns) == 3, len(btns))
+            rows = list(getattr(hp, "_msx_rows", []) or [])
+            items = [r for r in rows if r.get("kind") == "row"]
+            heads = [r for r in rows if r.get("kind") == "head"]
+            # 不断言"总数 == 3": 面板里还有用户自己的真实历史, 清了就是毁数据。
+            # 只要求刚写进去的三条都在, 且都在某个日期分组下面。
+            urls = [str(r.get("url") or "") for r in items]
+            ok("7 刚写进去的三条都在列表里", all(u in urls for u in made),
+               "%d 行 / 命中 %d" % (len(items), sum(u in urls for u in made)))
+            ok("8 按日期分组(今天)", any(h.get("label") == "今天" for h in heads),
+               [h.get("label") for h in heads])
+            ok("9 面板用的是壳注入的那份 favicon 缓存(与标签栏共用)",
+               getattr(api, "_fav", None) is not None)
+            try:
+                hp._msx_hot(1, True)      # 顺手把悬停态也截进去(行高亮 + 行尾 ×)
+            except Exception:
+                pass
             bmp = Bitmap(hp.Width, hp.Height)
             hp.DrawToBitmap(bmp, Rectangle(0, 0, hp.Width, hp.Height))
             p2 = os.path.join(_probe_dir(), "history_real.png")
@@ -2685,6 +2697,7 @@ def shell_main(e2e_url=None, e2e_float_url=None, e2e_float_resize_url=None,
             fav_cache = FaviconCache()
         except Exception:
             _log_exc("shell_bookmarks/favicon-cache")
+        api.bind_favicons(fav_cache)   # 历史面板画 favicon 用同一份(别在那边自己 new)
         try:
             from shell_tabstrip import install_strip
             strip_update = install_strip(

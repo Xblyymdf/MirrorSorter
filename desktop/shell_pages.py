@@ -33,16 +33,14 @@ MSX_WV2_CAPTURE_FLAG = (
 # 且看上去像一条独立边框。「播放页左侧宽一点」改在页面内部留(bilibili-ownui.user.js)。
 
 
-# 自愈式智能深色: 脚本在页面内常驻定时器, 每1.5s重测背景亮度 ——
-# 页面已深色(原生夜间/PreferredColorScheme生效) → 保持不动;
-# 浅色页面(贴吧/网盘等不跟随系统的站) → **只压背景板 + 提亮文字**, 不碰任何媒体内容;
-# 主题晚于首次测量才应用(SPA懒应用)也会被自动追上; 白天模式由 mode 变量直接关断
-# 统一主题脚本(自愈: 页面内定时器重测/重设):
+# 统一主题脚本(页面内定时器判定, 只做有确定性依据的两处):
 # - B站: 用它自己的原生深色主题(cookie theme_style=dark, 官方顶栏开关写的就是这个),
 #   效果是真正的原生深色; 白天模式清除该 cookie
 # - 小黑盒: 保留旧的整页反色(filter invert), 用户已认可那边的效果
-# - 其他站点: 测量背景亮度, 浅色页面走"零 filter"的兜底暗化, 已深色不动
-#   ★ v0.4.52 起不再整页 filter:invert —— 那会把 <video> 画面一起反色(百度网盘实测)。
+# - ★ 其他站点: **什么都不做**(不注入样式、不改 inline、不测量后动手)。
+#   v0.4.51 整页 filter:invert 会把 <video> 画面一起反色(百度网盘实测);
+#   v0.4.52 改成逐元素压暗后, 自愈定时器测到自己的压暗结果 → 还原 → 再压暗,
+#   页面**黑白每 1.5 秒翻转一次**。详见 _THEME_DARK_JS 里的注释。
 # 页面诊断钩子: JS异常/资源加载失败经 window.open(msx-debug:...) 回传(不产生真实新窗)
 _DEBUG_HOOK_JS = r"""
 (function(){
@@ -90,19 +88,24 @@ _DEBUG_HOOK_JS = r"""
 _THEME_DARK_JS = r"""
 window.__msx_theme_mode = 'dark';
 (function(){
-  /* 站点自己没有深色主题时的兜底。★ v0.4.52 换掉了整页反色:
-     旧实现给 html 挂 filter:invert(), 再给 img/video/canvas/iframe 挂 invert(1) 反回来。
-     用户实测(百度网盘看视频)播放画面被整块反色 —— 这条路根本堵不住: 影子 DOM 里的
-     播放器收不到文档级选择器, 跨域 iframe、WebGL 画布、背景图也各有各的漏点,
-     而且 invert 会把彩色变补色(浅蓝→土黄)。
-     现在**一个 filter 都不用**: 只把"背景板"压暗 + 把深色文字提亮, 媒体元素像素级原样。
-     小黑盒(xiaoheihe.cn)按用户要求保留旧的整页反色, 不动。 */
-  var SKIP = /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|HEAD|META|LINK|TITLE|BR|HR|WBR|IMG|VIDEO|AUDIO|CANVAS|SVG|IFRAME|EMBED|OBJECT|PICTURE|SOURCE|TRACK|MAP|AREA)$/;
-  var BG = [15, 17, 21];      // 背景板基色(与窗口底衬同色系)
-  var SAFE_CSS = 'html{color-scheme:dark;background:#0f1115 !important}'
-    + 'html,body{background-color:#0f1115 !important}'
-    + 'body{color:#e6e8ee}'
-    + '::selection{background:#3a5f8f;color:#fff}';
+  /* ★ v0.4.53: 站点自己没有深色主题时 **一律不做任何处理**(小黑盒除外)。
+     这条兜底走过两个版本, 两次都被用户打回:
+       v0.4.51  整页 html{filter:invert()} —— 百度网盘看视频, 播放画面被整块反色;
+                这条路根本堵不住(影子 DOM 的播放器收不到文档级选择器、跨域 iframe /
+                WebGL 画布 / 背景图各有各的漏点), 而且 invert 把彩色变补色。
+       v0.4.52  改成"零 filter"的逐元素压暗(只压背景板 + 提亮文字) —— 视频是保住了,
+                但页面 **黑白一直闪**。根因是自愈定时器自己喂自己:
+                  兜底样式把 html,body 压成 #0f1115
+                  → 下一拍 tick() 测 getComputedStyle(body).backgroundColor
+                  → 测出"这页本来就是深色" → 走 cleanup() 还原
+                  → 又变浅 → 再压暗 …… 每 1.5 秒翻转一次。
+     结论: 在别人的页面上猜配色, 猜不准就是闪烁 + 漏点 + 补色, 收益远小于代价。
+     现在只保留两处 **有确定性依据** 的:
+       - B站: 用它自己的原生深色(官方顶栏开关写的就是 cookie theme_style=dark);
+       - 小黑盒: 用户明确要求保留旧的整页反色(那边效果已认可)。
+     其余站点: 清掉可能的历史残留就收工, 并 **立刻停掉定时器** ——
+     不测量、不注入、不改 inline, 从结构上消除上面那个反馈环。 */
+
   var OLD_CSS = 'html{filter:invert(0.90) hue-rotate(180deg);background:#fff}'
     + 'img,video,picture,canvas,svg,iframe,embed,object'
     + '{filter:invert(1) hue-rotate(180deg)}';
@@ -110,95 +113,10 @@ window.__msx_theme_mode = 'dark';
   function report(s){
     try { fetch("/api/shell_debug?s=" + encodeURIComponent(s), {cache:"no-store"}); } catch(e) {}
   }
-  function nums(rgb){
-    var m = String(rgb).match(/[\d.]+/g);
-    if (!m) return null;
-    return [parseFloat(m[0]), parseFloat(m[1]), parseFloat(m[2]),
-            m.length > 3 ? parseFloat(m[3]) : 1];
-  }
-  function lum(c){
-    if (!c) return 255;
-    if (c[3] === 0) return -1;
-    return 0.299*c[0] + 0.587*c[1] + 0.114*c[2];
-  }
-  function css(c){
-    return 'rgb(' + Math.round(c[0]) + ',' + Math.round(c[1]) + ','
-      + Math.round(c[2]) + ')';
-  }
-  /* 背景板压暗: 保留明暗差异(白→#2c 左右, 浅灰→#29), 整体落进深色区间。
-     不用 invert: invert 会把彩色背景变补色, 一眼就知道被处理过。 */
-  function darker(c){
-    return [BG[0] + c[0]*0.11, BG[1] + c[1]*0.11, BG[2] + c[2]*0.11];
-  }
-  /* 文字提亮: 有彩度的(链接/强调色)混白保色相, 中性色统一抬到 200~230。 */
-  function lighter(c){
-    var mx = Math.max(c[0], c[1], c[2]), mn = Math.min(c[0], c[1], c[2]);
-    if (mx - mn >= 40) {
-      return [c[0] + (255-c[0])*0.45, c[1] + (255-c[1])*0.45,
-              c[2] + (255-c[2])*0.45];
-    }
-    return [200 + c[0]*0.18, 200 + c[1]*0.18, 200 + c[2]*0.18];
-  }
-  function setP(el, prop, val, orig){
-    try {
-      orig.push({el: el, p: prop, v: el.style.getPropertyValue(prop),
-                 pr: el.style.getPropertyPriority(prop)});
-      el.style.setProperty(prop, val, 'important');
-    } catch(e) {}
-  }
-  /* 逐元素改色。用 WeakSet 记"处理过"(不给 DOM 加属性 —— 几千个 setAttribute
-     会惊动站点自己的 MutationObserver, 也拖慢滚动)。 */
-  function pass(cap){
-    if (!document.body) return 0;
-    var seen = window.__MSX_DK_SEEN;
-    if (!seen) { try { seen = window.__MSX_DK_SEEN = new WeakSet(); } catch(e) { return 0; } }
-    var orig = window.__MSX_DK_ORIG || (window.__MSX_DK_ORIG = []);
-    var all, capN = cap || 2600, done = 0, changed = 0;
-    try { all = document.body.getElementsByTagName('*'); } catch(e) { return 0; }
-    for (var i = 0; i < all.length && done < capN; i++) {
-      var el = all[i];
-      if (seen.has(el)) continue;
-      seen.add(el); done++;
-      if (SKIP.test(el.tagName)) continue;
-      var cs;
-      try { cs = getComputedStyle(el); } catch(e) { continue; }
-      if (!cs || cs.display === 'none' || cs.visibility === 'hidden') continue;
-      /* 背景: 只压"不透明的浅色"。透明说明它靠祖先的底板露出来, 不重复处理。 */
-      var bg = nums(cs.backgroundColor);
-      if (bg && bg[3] >= 0.5 && lum(bg) >= 170) {
-        setP(el, 'background-color', css(darker(bg)), orig); changed++;
-      }
-      /* 前景: 只提"深色文字"; 半透明字(阴影/描边技巧)跳过。 */
-      var fg = nums(cs.color);
-      if (fg && fg[3] >= 0.3 && lum(fg) >= 0 && lum(fg) <= 120) {
-        setP(el, 'color', css(lighter(fg)), orig); changed++;
-      }
-      /* 边框: 浅色细线在深色底上会变成刺眼的亮框; 只处理"真的画出来的"上边框。 */
-      try {
-        if (parseFloat(cs.borderTopWidth) > 0 && lum(nums(cs.borderTopColor)) >= 170) {
-          setP(el, 'border-color', css(darker(nums(cs.borderTopColor))), orig);
-        }
-      } catch(e) {}
-    }
-    return changed;
-  }
-  function restoreAll(){
-    var arr = window.__MSX_DK_ORIG || [];
-    for (var i = arr.length - 1; i >= 0; i--) {
-      var r = arr[i];
-      try {
-        if (r.v) r.el.style.setProperty(r.p, r.v, r.pr || '');
-        else r.el.style.removeProperty(r.p);
-      } catch(e) {}
-    }
-    window.__MSX_DK_ORIG = [];
-    try { window.__MSX_DK_SEEN = new WeakSet(); } catch(e) { window.__MSX_DK_SEEN = null; }
-  }
   function cleanup(){
     var o = document.getElementById('__msx_dark');
     if (o) o.remove();
     document.documentElement.style.removeProperty('filter');
-    restoreAll();
   }
   function ensureCss(text){
     var o = document.getElementById('__msx_dark');
@@ -211,10 +129,19 @@ window.__msx_theme_mode = 'dark';
     o.textContent = text;
     return o;
   }
-  var ticks = 0;
+  /* 一次性脚本: 判定完就退场。定时器只在"还要反复确认"的两个站点(B站等 cookie
+     落地后 reload / 小黑盒的 style 节点可能被站点自己清掉)才保留。 */
+  function stopTimer(){
+    if (window.__msx_theme_timer) {
+      try { clearInterval(window.__msx_theme_timer); } catch(e) {}
+      window.__msx_theme_timer = null;
+    }
+  }
+  function veilOff(){
+    if (document.readyState !== 'loading' && window.__msx_veil_off) window.__msx_veil_off();
+  }
   function tick(){
-    if (window.__msx_theme_mode !== 'dark') { cleanup(); return; }
-    ticks++;
+    if (window.__msx_theme_mode !== 'dark') { cleanup(); stopTimer(); return; }
     var host = location.hostname || '';
     if (/(^|\.)bilibili\.com$/.test(host)) {
       /* 夜间模式防白闪: B站自己的深色CSS要等页面加载才生效, document-start 先把
@@ -228,33 +155,19 @@ window.__msx_theme_mode = 'dark';
         if (n < 2) { sessionStorage.setItem('__msx_rl', String(n + 1)); location.reload(); return; }
       }
       cleanup();   // B站原生深色, 不做反色
-      // 主题已定时撤下防白闪幕布(DOM 已解析才撤, 避免页面尚在解析就露白)
-      if (document.readyState !== 'loading' && window.__msx_veil_off) window.__msx_veil_off();
+      veilOff();
       return;
     }
     if (/(^|\.)xiaoheihe\.cn$/.test(host)) {
       /* 小黑盒: 用户明确要求保留整页反色(那边效果已认可)。 */
       ensureCss(OLD_CSS);
-      if (document.readyState !== 'loading' && window.__msx_veil_off) window.__msx_veil_off();
+      veilOff();
       return;
     }
-    /* ---- 其他站点: 智能兜底(已深色则一动不动) ---- */
-    var b = -1, h = -1;
-    try { if (document.body) b = lum(nums(getComputedStyle(document.body).backgroundColor)); } catch(e) {}
-    try { h = lum(nums(getComputedStyle(document.documentElement).backgroundColor)); } catch(e) {}
-    var base = (b >= 0 ? b : (h >= 0 ? h : 255));
-    if (base < 100) {
-      cleanup();   // 页面本来就是深色(原生夜间/跟随系统), 不插手
-    } else {
-      ensureCss(SAFE_CSS);
-      /* 前 10 拍(≈15 秒)每拍扫一遍, 追上 SPA 懒渲染; 之后每 20 拍补一次,
-         兜住滚动/翻页后新长出来的节点。单次最多 2600 个元素。 */
-      if (ticks <= 10 || ticks % 20 === 0) {
-        var n2 = pass(2600);
-        if (n2) report('dark-safe ' + host + ' +' + n2);
-      }
-    }
-    if (document.readyState !== 'loading' && window.__msx_veil_off) window.__msx_veil_off();
+    /* ---- 其余站点: 什么都不做 ---- */
+    cleanup();
+    stopTimer();
+    veilOff();
   }
   if (!window.__msx_theme_timer) window.__msx_theme_timer = setInterval(tick, 1500);
   tick();
@@ -267,19 +180,9 @@ window.__msx_theme_mode = 'light';
   if (old) old.remove();
   document.documentElement.style.removeProperty('filter');
   document.documentElement.style.removeProperty('background');   // 撤掉夜间防白闪的深色底
-  /* ★ 兜底暗化是逐元素改 inline style 的, 切回白天必须**逐个还原** ——
-     只删 <style> 会留下一整页被压暗的背景板(而且再也回不去)。
-     还原顺序倒着来: 后写的覆盖先写的, 反过来才回到原始值。 */
-  var arr = window.__MSX_DK_ORIG || [];
-  for (var i = arr.length - 1; i >= 0; i--) {
-    var r = arr[i];
-    try {
-      if (r.v) r.el.style.setProperty(r.p, r.v, r.pr || '');
-      else r.el.style.removeProperty(r.p);
-    } catch(e) {}
-  }
-  window.__MSX_DK_ORIG = [];
-  try { window.__MSX_DK_SEEN = new WeakSet(); } catch(e) { window.__MSX_DK_SEEN = null; }
+  /* v0.4.52 的兜底暗化是逐元素改 inline style 的, 切回白天必须逐个还原;
+     v0.4.53 起不再产生任何这类改动(见 _THEME_DARK_JS 顶部注释), 还原逻辑一并删掉 ——
+     留着会让人以为"现在还在改 inline", 下次改样式时误判。 */
   if (/(^|\.)bilibili\.com$/.test(location.hostname) &&
       document.cookie.indexOf('theme_style=dark') !== -1) {
     document.cookie = 'theme_style=; path=/; domain=.bilibili.com; max-age=0';

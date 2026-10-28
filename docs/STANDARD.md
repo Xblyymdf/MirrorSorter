@@ -315,33 +315,34 @@ python _verify_exe_panel.py             :: 归档 app.js 里必须是新写法
 - `_verify_exe_panel.py` 现在对 `web/index.html` / `app.js` / `style.css` 做**逐字节比对**，
   堵「改完 web/ 没重新打包」这个老坑。
 
-### 本版专项（v0.4.52dsk 深色兜底不再反色 + 栏尾菜单/历史记录/整页翻译）
+### 本版专项（v0.4.53dsk 撤销兜底深色 + 历史记录按 Chrome 重排）
 
 ```bat
-node  _test_menu452.js     :: 24 项: 注入页面的两段 JS 在假 DOM 里真跑(不反色/采集/回写/还原)
+node  _test_menu452.js     :: 22 项: 注入页面的两段 JS 在假 DOM 里真跑(不处理/采集/回写/还原)
 python _test_menu452.py    :: 43 项: 历史存储 + 翻译对齐/降级 + 菜单接线(不建窗不联网)
-python _shot_menu.py       :: 主菜单/历史面板真渲染成 PNG(间距、缩放行折行看不出来)
-python test_shell.py       :: 「菜单1~3」「深色4~5」「翻译1」
+python _shot_menu.py       :: 主菜单/历史面板(含悬停态)真渲染成 PNG
+python test_shell.py       :: 「菜单1~3」「深色4~5」「翻译1」「历史1~4」
 python app_window.py --e2e-menu   :: 真窗口里**点一次**栏尾 ⋮, 截图 + 断言几何, 自己退出
 python _verify_exe_panel.py       :: 归档层: 三个新模块真的进了 PYZ
 ```
 
-**一、深色兜底不许反色媒体**（用户报修：百度网盘看视频，播放画面被整块反色）
+**一、没有深色主题的站点：一律不做处理**（用户报修两次，两次都回滚）
 
-- 根因是给 `html` 挂 `filter:invert()`：filter 作用于**整棵子树**，再给
-  `img,video,canvas,iframe` 挂 `invert(1)` 反回来这条路根本堵不住 —— 影子 DOM 里的播放器
-  收不到文档级选择器，跨域 iframe / WebGL 画布 / 背景图各有各的漏点，而且 invert 会把
-  彩色变补色（浅蓝→土黄）。**结论：浅色站点的兜底深色不许用 filter。**
-- 现在改成"只压背景板 + 提亮文字"：注入
-  `html{color-scheme:dark;background:#0f1115}`，再用 JS 逐元素把**浅色不透明背景**压暗、
-  **深色文字**提亮（有彩度的混白保色相，中性色抬到 200~230），浅色边框跟着压暗。
-  媒体元素一个字节都不碰 —— 视频画面像素级原样。
-- ★ 逐元素改的是 **inline style**，所以必须**记原值**（`__MSX_DK_ORIG`）：
-  切回白天时只删 `<style>` 会留下"一页被压暗的底色"，而且再也回不去。
-- ★ 用 `WeakSet` 记"处理过"，**不要给 DOM 加 `data-` 属性** —— 几千个 setAttribute 会惊动
-  站点自己的 MutationObserver，也拖慢滚动。
-- 小黑盒（`xiaoheihe.cn`）按用户要求**保留**旧的整页反色，代码里单独一条分支。
-- 页面本身就是深色（测背景亮度 < 100）→ 一动不动。
+- v0.4.51 整页 `html{filter:invert()}`：百度网盘看视频，**播放画面被整块反色**。
+  filter 作用于整棵子树，再给 `img,video,canvas,iframe` 挂 `invert(1)` 反回来这条路根本
+  堵不住 —— 影子 DOM 里的播放器收不到文档级选择器，跨域 iframe / WebGL 画布 / 背景图
+  各有各的漏点，而且 invert 会把彩色变补色（浅蓝→土黄）。
+- v0.4.52 改成"只压背景板 + 提亮文字"的逐元素压暗：视频是保住了，但页面**黑白一直闪**。
+- ★★ **闪烁的根因是自愈定时器自己喂自己**：兜底样式把 `html,body` 压成 `#0f1115`
+  → 下一拍 `tick()` 用 `getComputedStyle(body).backgroundColor` 测亮度
+  → 测出"这页本来就是深色" → 走 `cleanup()` 还原 → 又变浅 → 再压暗，
+  **每 1.5 秒翻转一次**。凡是"先测量、再动手、下拍再测量"的自愈循环都有这个隐患。
+- 现在的口径：**只保留两处有确定性依据的** —— B站用它自己的原生深色
+  （cookie `theme_style=dark`，官方顶栏开关写的就是这个）、小黑盒保留整页反色（用户认可）。
+  其余站点 `cleanup()` 之后**立刻 `clearInterval` 退场**：不测量、不注入、不改 inline。
+- ★ 判据：**在别人的页面上猜配色，猜不准就是闪烁 + 漏点 + 补色**，收益远小于代价。
+  逐元素压暗还连带删掉了 `__MSX_DK_ORIG` 原值记账与 `_LIGHT_JS` 的还原逻辑 ——
+  留着会让人以为"现在还在改 inline"，下次改样式时误判。
 
 **二、栏尾主菜单（`shell_menu.py`）**
 
@@ -364,8 +365,18 @@ python _verify_exe_panel.py       :: 归档层: 三个新模块真的进了 PYZ
   同 url 30 秒内只落一次库（一次导航会连发 HistoryChanged + SourceChanged）。
 - ★ 落库放**短线程**：`_on_nav` 是从 WebView2 事件回调里进来的（UI 线程），而 `_db_lock`
   可能正被后台抓取占着，同步写会把界面卡住。
-- 面板：顶部搜索（250ms 防抖）→ 按最近访问倒序的列表 → 底部「清除全部」。
-  左键一行在当前标签打开，**右键删单条**（不额外挂控件，也不容易误触）。
+- 面板按 Chrome 的历史记录页排版：**每行站点图标 + 标题 + 「域名 · 时间」次要行**，
+  悬停整行高亮并在行尾浮出 **×**（左键就能删，右键也仍然可以）；按**日期分组**
+  （今天 / 昨天 / 10月24日 …）。上一版只有两行纯文字、删除要靠右键，用户看不出能删。
+- ★★ 列表**自绘**（一块画布 + `Paint`），不给每行建控件：上一版用 80 个 Button 拼行，
+  想加图标和分组就得跟 Button 的内边距、双行文本对齐、`FlatAppearance` 颜色一直打架。
+  命中测试退化成"y → 行号"一次线性扫描。
+- ★ 滚轮必须装 `Application.AddMessageFilter`：WinForms 把 `WM_MOUSEWHEEL` 发给**焦点
+  控件**（这里是搜索框），而搜索框不可滚动 → 消息就断了，光标在列表上滚滚轮毫无反应。
+- ★ favicon 用 `FaviconCache` 且**与标签栏/收藏栏共用同一份**（`api.bind_favicons`）；
+  拿不到才退化成"域名首字母 + 中性底色"，不冒充站点 logo。
+- 验收留了两道缝：`_msx_rows`（布局快照：行数/分组/次要行）与 `_msx_hot(i, close)`
+  （伪造悬停）—— 没有真鼠标也能断言悬停态并出图。
 
 **四、整页翻译（`shell_translate.py` + `app.translate_texts`）**
 
